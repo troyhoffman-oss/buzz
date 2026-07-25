@@ -29,7 +29,7 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::acp::{
-    extract_model_config_options, extract_model_state, model_in_catalog,
+    config_option_label, extract_model_config_options, extract_model_state, model_in_catalog,
     resolve_model_switch_method, AcpClient, AcpError, McpServer, ModelSwitchMethod, StopReason,
 };
 use crate::config::{DedupMode, PermissionMode};
@@ -76,6 +76,48 @@ pub struct AgentModelCapabilities {
     pub config_options_raw: Vec<serde_json::Value>,
     /// Unstable: SessionModelState from session/new.
     pub available_models_raw: Option<serde_json::Value>,
+}
+
+impl AgentModelCapabilities {
+    /// Selectable `(id, label)` pairs across both catalog halves, in the order
+    /// [`resolve_model_switch_method`] searches them and deduplicated by id —
+    /// the halves overlap on some adapters and disagree on others.
+    pub fn models(&self) -> Vec<(&str, Option<&str>)> {
+        let config_options = self
+            .config_options_raw
+            .iter()
+            .filter_map(|opt| opt.get("options")?.as_array())
+            .flatten()
+            .filter_map(|opt| Some((opt.get("value")?.as_str()?, config_option_label(opt))));
+        let available_models = self
+            .available_models_raw
+            .iter()
+            .filter_map(|models| models.get("availableModels")?.as_array())
+            .flatten()
+            .filter_map(|model| {
+                Some((
+                    model.get("modelId")?.as_str()?,
+                    model.get("name").and_then(|name| name.as_str()),
+                ))
+            });
+
+        let mut models: Vec<(&str, Option<&str>)> = Vec::new();
+        for (id, label) in config_options.chain(available_models) {
+            if !models.iter().any(|(seen, _)| *seen == id) {
+                models.push((id, label));
+            }
+        }
+        models
+    }
+
+    /// Whether `model_id` is selectable. Mirrors [`model_in_catalog`].
+    pub fn contains(&self, model_id: &str) -> bool {
+        model_in_catalog(
+            &self.config_options_raw,
+            self.available_models_raw.as_ref(),
+            model_id,
+        )
+    }
 }
 
 /// Per-channel session IDs and turn counters.
@@ -716,6 +758,30 @@ impl AgentPool {
         count
     }
 
+    /// Model catalog and current pick for `channel_id`.
+    ///
+    /// Prefers the idle agent holding the channel's session — with `--agents
+    /// N > 1`, `desired_model` is per-agent-process, so only that agent's pick
+    /// is the channel's. The catalog itself is identical across agents (all run
+    /// the same command), so any idle agent serves it. `None` while every agent
+    /// is mid-turn (each is moved out of its slot by [`Self::try_claim`]) or
+    /// before a first session exists.
+    pub fn model_catalog(
+        &self,
+        channel_id: Uuid,
+    ) -> Option<(&AgentModelCapabilities, Option<&str>)> {
+        let agents = self.agents.iter().flatten();
+        let owning = agents
+            .clone()
+            .find(|agent| agent.state.sessions.contains_key(&channel_id));
+        owning.into_iter().chain(agents).find_map(|agent| {
+            Some((
+                agent.model_capabilities.as_ref()?,
+                agent.desired_model.as_deref(),
+            ))
+        })
+    }
+
     /// Idle-path model switch: set `desired_model` on the idle agent for
     /// `channel_id` and invalidate its session so the next turn re-creates the
     /// session under the new model.
@@ -745,14 +811,12 @@ impl AgentPool {
 
         // Pre-cancel guard against the cached catalog. None = catalog not yet
         // populated (no session ever created); defer validation to apply time.
-        if let Some(caps) = agent.model_capabilities.as_ref() {
-            if !model_in_catalog(
-                &caps.config_options_raw,
-                caps.available_models_raw.as_ref(),
-                model_id,
-            ) {
-                return IdleSwitchResult::UnsupportedModel;
-            }
+        if agent
+            .model_capabilities
+            .as_ref()
+            .is_some_and(|caps| !caps.contains(model_id))
+        {
+            return IdleSwitchResult::UnsupportedModel;
         }
 
         agent.desired_model = Some(model_id.to_string());
@@ -3488,11 +3552,11 @@ pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str
     }
 }
 
-/// Best-effort: post a visible failure notice (kind:9) to a channel after a
-/// batch is dead-lettered. Replies into the thread of `thread_tags` when the
-/// triggering event was threaded. Errors are logged and swallowed — the
-/// notice must never take down the main loop.
-pub(crate) async fn post_failure_notice(
+/// Best-effort: post a visible notice (kind:9) to a channel — a dead-letter
+/// warning or an owner-command reply. Replies into the thread of `thread_tags`
+/// when the triggering event was threaded. Errors are logged and swallowed —
+/// the notice must never take down the main loop.
+pub(crate) async fn post_notice(
     rest: &crate::relay::RestClient,
     channel_id: Uuid,
     thread_tags: &ThreadTags,
@@ -3514,21 +3578,21 @@ pub(crate) async fn post_failure_notice(
         match buzz_sdk::build_message(channel_id, content, thread_ref.as_ref(), &[], false, &[]) {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!(channel = %channel_id, "failure notice: build failed: {e}");
+                tracing::warn!(channel = %channel_id, "notice: build failed: {e}");
                 return;
             }
         };
     let event = match builder.sign_with_keys(&rest.keys) {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(channel = %channel_id, "failure notice: sign failed: {e}");
+            tracing::warn!(channel = %channel_id, "notice: sign failed: {e}");
             return;
         }
     };
     match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
         Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "failure notice failed: {e}"),
-        Err(_) => tracing::warn!(channel = %channel_id, "failure notice timed out"),
+        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "notice failed: {e}"),
+        Err(_) => tracing::warn!(channel = %channel_id, "notice timed out"),
     }
 }
 
@@ -3652,6 +3716,60 @@ mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use serde_json::json;
+
+    #[test]
+    fn model_capabilities_list_both_halves_deduplicated() {
+        let caps = AgentModelCapabilities {
+            config_options_raw: vec![json!({
+                "id": "model",
+                "category": "model",
+                "options": [
+                    { "value": "haiku", "name": "Haiku" },
+                    { "value": "opus[1m]" }
+                ]
+            })],
+            available_models_raw: Some(json!({
+                "availableModels": [
+                    { "modelId": "haiku", "name": "Haiku (unstable half)" },
+                    { "modelId": "claude-opus-5", "name": "Opus 5" }
+                ]
+            })),
+        };
+
+        // configOptions first (the resolve precedence), then the unstable half;
+        // `haiku` keeps its stable-half label rather than being listed twice.
+        assert_eq!(
+            caps.models(),
+            vec![
+                ("haiku", Some("Haiku")),
+                ("opus[1m]", None),
+                ("claude-opus-5", Some("Opus 5")),
+            ]
+        );
+        assert!(caps.contains("opus[1m]"));
+        assert!(!caps.contains("opus"));
+    }
+
+    #[test]
+    fn model_capabilities_list_tolerates_missing_halves() {
+        let empty = AgentModelCapabilities {
+            config_options_raw: vec![],
+            available_models_raw: None,
+        };
+        assert!(empty.models().is_empty());
+
+        let unstable_only = AgentModelCapabilities {
+            config_options_raw: vec![],
+            available_models_raw: Some(json!({ "availableModels": [{ "modelId": "gpt-5.4" }] })),
+        };
+        assert_eq!(unstable_only.models(), vec![("gpt-5.4", None)]);
+
+        let stable_only = AgentModelCapabilities {
+            config_options_raw: vec![json!({ "options": [{ "value": "gpt-5.4" }] })],
+            available_models_raw: None,
+        };
+        assert_eq!(stable_only.models(), vec![("gpt-5.4", None)]);
+    }
 
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):
     // a legacy agent WITH a base_prompt must get [Base] prepended to the user

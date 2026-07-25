@@ -926,7 +926,36 @@ fn handle_cancel_turn_control(
     }
 }
 
-/// Handle a `switch_model` control frame (Phase 3a, Option ii).
+/// Outcome of [`switch_model_for_channel`].
+#[derive(Debug, PartialEq, Eq)]
+enum SwitchOutcome {
+    /// Delivered over the in-flight turn's control oneshot.
+    Sent,
+    /// The in-flight turn is already ending — the switch could not land on it.
+    TurnEnding,
+    /// Applied to an idle agent; takes effect on its next turn.
+    Switched,
+    /// Not in the idle agent's cached catalog — pick rejected, session untouched.
+    UnsupportedModel,
+    /// No turn in flight and no idle agent holds a session for the channel.
+    NoActiveTurn,
+}
+
+impl SwitchOutcome {
+    /// `control_result` status string. Consumed by the desktop's
+    /// `awaitLiveSwitchOutcome` — do not change these without updating it.
+    fn status(&self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::TurnEnding => "turn_ending",
+            Self::Switched => "switched",
+            Self::UnsupportedModel => "unsupported_model",
+            Self::NoActiveTurn => "no_active_turn",
+        }
+    }
+}
+
+/// Switch the model backing `channel_id` (Phase 3a, Option ii).
 ///
 /// Busy path: deliver `SwitchModel` over the in-flight task's oneshot — the
 /// task cancels the turn, sets `desired_model`, and requeues the batch so it
@@ -937,6 +966,44 @@ fn handle_cancel_turn_control(
 /// Idle path: validate against the cached catalog *before* invalidating
 /// (pre-cancel guard), then set `desired_model` + invalidate. The override
 /// takes visible effect on the agent's next turn.
+fn switch_model_for_channel(
+    pool: &mut AgentPool,
+    channel_id: Uuid,
+    model_id: &str,
+) -> SwitchOutcome {
+    // A turn is in flight for this channel iff a task_map entry exists. The
+    // agent is moved out of the pool during a turn, so the control oneshot is
+    // the only reachable lever; an idle channel has no such entry.
+    let turn_in_flight = pool
+        .task_map()
+        .values()
+        .any(|m| m.channel_id == Some(channel_id));
+
+    if turn_in_flight {
+        // Busy path: deliver over the oneshot. `false` means the oneshot was
+        // already consumed this turn (a prior cancel/interrupt) — the turn is
+        // already ending, so the switch cannot land on it.
+        if signal_in_flight_task(
+            pool,
+            channel_id,
+            ControlSignal::SwitchModel(model_id.to_string()),
+        ) {
+            SwitchOutcome::Sent
+        } else {
+            SwitchOutcome::TurnEnding
+        }
+    } else {
+        // Idle path: validate against the cached catalog before invalidating.
+        match pool.switch_idle_agent_model(channel_id, model_id) {
+            IdleSwitchResult::Switched => SwitchOutcome::Switched,
+            IdleSwitchResult::UnsupportedModel => SwitchOutcome::UnsupportedModel,
+            IdleSwitchResult::NoIdleAgent => SwitchOutcome::NoActiveTurn,
+        }
+    }
+}
+
+/// Handle a `switch_model` control frame: the kind:24200 front door onto
+/// [`switch_model_for_channel`] (`!model` is the chat one).
 fn handle_switch_model_control(
     payload: &serde_json::Value,
     pool: &mut AgentPool,
@@ -955,35 +1022,7 @@ fn handle_switch_model_control(
         return;
     };
 
-    // A turn is in flight for this channel iff a task_map entry exists. The
-    // agent is moved out of the pool during a turn, so the control oneshot is
-    // the only reachable lever; an idle channel has no such entry.
-    let turn_in_flight = pool
-        .task_map()
-        .values()
-        .any(|m| m.channel_id == Some(channel_id));
-
-    let status = if turn_in_flight {
-        // Busy path: deliver over the oneshot. `false` means the oneshot was
-        // already consumed this turn (a prior cancel/interrupt) — the turn is
-        // already ending, so the switch cannot land on it.
-        if signal_in_flight_task(
-            pool,
-            channel_id,
-            ControlSignal::SwitchModel(model_id.to_string()),
-        ) {
-            "sent"
-        } else {
-            "turn_ending"
-        }
-    } else {
-        // Idle path: validate against the cached catalog before invalidating.
-        match pool.switch_idle_agent_model(channel_id, model_id) {
-            IdleSwitchResult::Switched => "switched",
-            IdleSwitchResult::UnsupportedModel => "unsupported_model",
-            IdleSwitchResult::NoIdleAgent => "no_active_turn",
-        }
-    };
+    let status = switch_model_for_channel(pool, channel_id, model_id).status();
 
     if let Some(observer) = observer {
         observer.emit(
@@ -1002,6 +1041,84 @@ fn handle_switch_model_control(
             }),
         );
     }
+}
+
+/// Handle the owner's `!model [id]` chat command: the chat front door onto
+/// [`switch_model_for_channel`] (kind:24200 `switch_model` is the other).
+///
+/// Returns the reply to post back into the channel. With no argument — or on a
+/// miss — it renders the catalog, so the "helpful list" is also the entire
+/// error-recovery story. Matching is on exact IDs: adapters ship near-identical
+/// pairs (`opus[1m]` vs `claude-opus-5`, `gpt-5.3-codex` vs
+/// `gpt-5.3-codex/low`), so any prefix rule would silently pick a different
+/// context lane and price point.
+fn handle_model_command(pool: &mut AgentPool, channel_id: Uuid, model_id: &str) -> String {
+    // Rendered eagerly: `model_catalog` borrows the pool that the switch below
+    // needs mutably. `None` while every agent is mid-turn (each is moved out of
+    // its slot for the duration) — switching still works from there, it goes
+    // through the in-flight task rather than the pool.
+    let catalog = pool.model_catalog(channel_id).and_then(|(caps, current)| {
+        Some((
+            render_model_catalog(caps, current)?,
+            caps.contains(model_id),
+        ))
+    });
+
+    if model_id.is_empty() {
+        return catalog.map_or_else(
+            || "I don't know my model list yet — ask again in a moment.".to_string(),
+            |(listing, _)| listing,
+        );
+    }
+    // Pre-validate so a typo never cancels a live turn. With no catalog, defer
+    // to the existing apply-time `unsupported_model` path.
+    if let Some((listing, false)) = catalog {
+        return format!("`{model_id}` isn't one of my models.\n\n{listing}");
+    }
+
+    match switch_model_for_channel(pool, channel_id, model_id) {
+        SwitchOutcome::Sent => {
+            format!("Switching to `{model_id}` — restarting the current turn on the new model.")
+        }
+        SwitchOutcome::Switched => {
+            format!("Model set to `{model_id}`. Takes effect on my next turn.")
+        }
+        SwitchOutcome::TurnEnding => {
+            "The current turn is already ending — re-send once it finishes.".to_string()
+        }
+        SwitchOutcome::UnsupportedModel => format!("`{model_id}` isn't one of my models."),
+        // No agent holds a session for this channel, so there is nothing to
+        // switch. Say so rather than claiming a switch that never happened.
+        SwitchOutcome::NoActiveTurn => {
+            "I have no session for this channel yet — message me first, then `!model`.".to_string()
+        }
+    }
+}
+
+/// Render an agent's model catalog as chat markdown, marking `current`.
+/// `None` when the agent exposes no selectable models.
+fn render_model_catalog(
+    caps: &pool::AgentModelCapabilities,
+    current: Option<&str>,
+) -> Option<String> {
+    let models = caps.models();
+    if models.is_empty() {
+        return None;
+    }
+    let mut listing = String::from("My models:");
+    for (id, label) in models {
+        let label = match label.filter(|label| *label != id) {
+            Some(label) => format!(" — {label}"),
+            None => String::new(),
+        };
+        let marker = if Some(id) == current {
+            " ← current"
+        } else {
+            ""
+        };
+        listing.push_str(&format!("\n- `{id}`{label}{marker}"));
+    }
+    Some(listing)
 }
 
 /// Maximum crashes in a 60-second window before a slot's circuit opens.
@@ -2029,107 +2146,89 @@ async fn tokio_main() -> Result<()> {
                                 continue;
                             }
 
-                            // Check: kind:9, content "!shutdown", from owner, mentions THIS agent.
-                            let is_shutdown = is_owner_control_command(
-                                &buzz_event.event,
-                                kind_u32,
-                                "!shutdown",
-                                &pubkey_hex,
-                            );
-                            if is_shutdown {
-                                let owner = owner_cache.get();
-                                if let Some(owner) = owner {
-                                    if buzz_event.event.pubkey.to_hex() == *owner {
-                                        tracing::info!(
-                                            channel_id = %buzz_event.channel_id,
-                                            sender = %buzz_event.event.pubkey.to_hex(),
-                                            "shutdown command from owner — exiting gracefully"
-                                        );
-                                        let _ = shutdown_tx.send(());
-                                        continue;
-                                    }
-                                }
-                                // Not from owner — fall through to normal prompt handling.
-                                // Don't drop it — it's a regular message that happens to
-                                // contain "!shutdown" from a non-owner.
-                            }
-
-                            // Mirrors !shutdown: kind:9, content "!cancel", from
-                            // owner, mentions THIS agent. Must be BEFORE
+                            // Owner control commands: kind:9 mentioning THIS
+                            // agent, from the owner. Consumed by the harness
+                            // and never forwarded to the agent. Must be BEFORE
                             // queue.push() — the event content is moved by push.
                             //
-                            // Mode-independent: !cancel fires regardless of
-                            // --multiple-event-handling. It is explicit user
+                            // Mode-independent: they fire regardless of
+                            // --multiple-event-handling. They are explicit user
                             // intent, not an automatic policy decision.
-                            let is_cancel = is_owner_control_command(
-                                &buzz_event.event,
-                                kind_u32,
-                                "!cancel",
-                                &pubkey_hex,
-                            );
-                            if is_cancel {
-                                if let Some(owner) = owner_cache.get() {
-                                    if buzz_event.event.pubkey.to_hex() == *owner {
-                                        let fired = signal_in_flight_task(
-                                            &mut pool,
-                                            buzz_event.channel_id,
-                                            ControlSignal::Cancel,
-                                        );
-                                        if !fired {
-                                            tracing::warn!(
-                                                channel_id = %buzz_event.channel_id,
-                                                "!cancel received but no in-flight task — no-op"
-                                            );
-                                        }
-                                        continue; // consume event — do NOT push to queue
-                                    }
-                                }
-                                // Not from owner — fall through to normal prompt handling.
-                            }
-
-                            // Mirrors !shutdown / !cancel: kind:9, content
-                            // "!rotate", from owner, mentions THIS agent.
                             //
-                            // Rotation is explicit owner intent to start the
-                            // next turn in this channel with a fresh ACP
-                            // session. It is consumed by the harness and never
-                            // forwarded to the agent. If a turn is in-flight,
-                            // cancel it, drop its triggering batch, and
-                            // invalidate the channel session when the task
-                            // returns. If idle, invalidate the cached channel
-                            // session immediately. Queued future events remain
-                            // queued and will create a fresh session on dispatch.
-                            let is_rotate = is_owner_control_command(
-                                &buzz_event.event,
-                                kind_u32,
-                                "!rotate",
-                                &pubkey_hex,
-                            );
-                            if is_rotate {
-                                if let Some(owner) = owner_cache.get() {
-                                    if buzz_event.event.pubkey.to_hex() == *owner {
-                                        let fired = signal_in_flight_task(
-                                            &mut pool,
-                                            buzz_event.channel_id,
-                                            ControlSignal::Rotate,
-                                        );
-                                        if fired {
-                                            tracing::info!(
-                                                channel_id = %buzz_event.channel_id,
-                                                "!rotate received — cancelling in-flight turn and rotating session"
-                                            );
-                                        } else {
-                                            let invalidated = pool.invalidate_channel_sessions(buzz_event.channel_id);
-                                            tracing::info!(
-                                                channel_id = %buzz_event.channel_id,
-                                                invalidated,
-                                                "!rotate received — invalidated idle channel session(s)"
-                                            );
-                                        }
-                                        continue; // consume event — do NOT push to queue
-                                    }
+                            // An unrecognized command, an arity mismatch, or a
+                            // non-owner author all fall through to normal prompt
+                            // handling — a stranger typing "!cancel" is still
+                            // sending the agent a message.
+                            let command = owner_control_command(&buzz_event.event, kind_u32, &pubkey_hex)
+                                .filter(|_| owner_cache.get() == Some(buzz_event.event.pubkey.to_hex().as_str()));
+                            match command {
+                                Some(("!shutdown", "")) => {
+                                    tracing::info!(
+                                        channel_id = %buzz_event.channel_id,
+                                        sender = %buzz_event.event.pubkey.to_hex(),
+                                        "shutdown command from owner — exiting gracefully"
+                                    );
+                                    let _ = shutdown_tx.send(());
+                                    continue;
                                 }
-                                // Not from owner — fall through to normal prompt handling.
+                                Some(("!cancel", "")) => {
+                                    let fired = signal_in_flight_task(
+                                        &mut pool,
+                                        buzz_event.channel_id,
+                                        ControlSignal::Cancel,
+                                    );
+                                    if !fired {
+                                        tracing::warn!(
+                                            channel_id = %buzz_event.channel_id,
+                                            "!cancel received but no in-flight task — no-op"
+                                        );
+                                    }
+                                    continue; // consume event — do NOT push to queue
+                                }
+                                // Rotation is explicit owner intent to start the
+                                // next turn in this channel with a fresh ACP
+                                // session. If a turn is in-flight, cancel it, drop
+                                // its triggering batch, and invalidate the channel
+                                // session when the task returns. If idle,
+                                // invalidate the cached channel session
+                                // immediately. Queued future events remain queued
+                                // and will create a fresh session on dispatch.
+                                Some(("!rotate", "")) => {
+                                    let fired = signal_in_flight_task(
+                                        &mut pool,
+                                        buzz_event.channel_id,
+                                        ControlSignal::Rotate,
+                                    );
+                                    if fired {
+                                        tracing::info!(
+                                            channel_id = %buzz_event.channel_id,
+                                            "!rotate received — cancelling in-flight turn and rotating session"
+                                        );
+                                    } else {
+                                        let invalidated = pool.invalidate_channel_sessions(buzz_event.channel_id);
+                                        tracing::info!(
+                                            channel_id = %buzz_event.channel_id,
+                                            invalidated,
+                                            "!rotate received — invalidated idle channel session(s)"
+                                        );
+                                    }
+                                    continue; // consume event — do NOT push to queue
+                                }
+                                Some(("!model", model_id)) => {
+                                    let reply = handle_model_command(
+                                        &mut pool,
+                                        buzz_event.channel_id,
+                                        model_id,
+                                    );
+                                    spawn_notice(
+                                        Some(&ctx.rest_client),
+                                        buzz_event.channel_id,
+                                        queue::parse_thread_tags(&buzz_event.event),
+                                        reply,
+                                    );
+                                    continue; // consume event — do NOT push to queue
+                                }
+                                _ => {}
                             }
 
                             // Coarse security policy: drop events from disallowed
@@ -2715,15 +2814,24 @@ fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
     })
 }
 
-fn is_owner_control_command(
-    event: &nostr::Event,
+/// Split a kind:9 mention of this agent into `(command, args)` when its content
+/// starts with a `!token`. Ownership is NOT checked here — callers re-check the
+/// author so a non-owner's `!cancel` still reaches the agent as a prompt.
+fn owner_control_command<'a>(
+    event: &'a nostr::Event,
     kind_u32: u32,
-    command: &str,
     agent_pubkey_hex: &str,
-) -> bool {
-    kind_u32 == KIND_STREAM_MESSAGE
-        && event.content.trim() == command
-        && event_mentions_agent(event, agent_pubkey_hex)
+) -> Option<(&'a str, &'a str)> {
+    if kind_u32 != KIND_STREAM_MESSAGE || !event_mentions_agent(event, agent_pubkey_hex) {
+        return None;
+    }
+    let content = event.content.trim();
+    if !content.starts_with('!') {
+        return None;
+    }
+    let (command, args) =
+        content.split_at(content.find(char::is_whitespace).unwrap_or(content.len()));
+    Some((command, args.trim()))
 }
 
 // ── signal_in_flight_task ─────────────────────────────────────────────────────
@@ -3007,27 +3115,36 @@ fn is_auth_error(error: &acp::AcpError) -> bool {
     message.contains("Re-authenticate") || message.contains("API Error: 401")
 }
 
-/// Spawn a task that posts a user-visible failure notice to the relay.
+/// Spawn a task that posts a user-visible notice to the relay.
+fn spawn_notice(
+    rest_client: Option<&relay::RestClient>,
+    channel_id: Uuid,
+    thread_tags: ThreadTags,
+    content: String,
+) {
+    if let Some(rest) = rest_client {
+        let rest = rest.clone();
+        tokio::spawn(async move {
+            pool::post_notice(&rest, channel_id, &thread_tags, &content).await;
+        });
+    }
+}
+
+/// Spawn a task that posts a user-visible failure notice for a dead-lettered batch.
 ///
 /// Shared by the hard-cap immediate dead-letter path and the retries-exhausted
-/// dead-letter path so neither duplicates the tokio::spawn block.
+/// dead-letter path so neither duplicates the thread-tag extraction.
 fn spawn_failure_notice(
     rest_client: Option<&relay::RestClient>,
     batch: &FlushBatch,
     content: String,
 ) {
-    if let Some(rest) = rest_client {
-        let thread_tags = batch
-            .events
-            .last()
-            .map(|be| queue::parse_thread_tags(&be.event))
-            .unwrap_or_default();
-        let rest = rest.clone();
-        let channel_id = batch.channel_id;
-        tokio::spawn(async move {
-            pool::post_failure_notice(&rest, channel_id, &thread_tags, &content).await;
-        });
-    }
+    let thread_tags = batch
+        .events
+        .last()
+        .map(|be| queue::parse_thread_tags(&be.event))
+        .unwrap_or_default();
+    spawn_notice(rest_client, batch.channel_id, thread_tags, content);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4089,16 +4206,13 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
         if !config_options.is_empty() {
             println!("Models (stable configOptions):");
             for opt in &config_options {
-                let config_id = opt.get("configId").and_then(|v| v.as_str()).unwrap_or("?");
-                let display = opt
-                    .get("displayName")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(config_id);
+                let config_id = acp::config_option_id(opt).unwrap_or("?");
+                let display = acp::config_option_label(opt).unwrap_or(config_id);
                 println!("  {display} (configId: {config_id})");
                 if let Some(options) = opt.get("options").and_then(|v| v.as_array()) {
                     for o in options {
                         let val = o.get("value").and_then(|v| v.as_str()).unwrap_or("?");
-                        let name = o.get("displayName").and_then(|v| v.as_str()).unwrap_or(val);
+                        let name = acp::config_option_label(o).unwrap_or(val);
                         println!("    - {name} (value: {val})");
                     }
                 }
@@ -4233,35 +4347,43 @@ mod owner_control_command_tests {
     }
 
     #[test]
-    fn owner_control_command_requires_kind_content_and_agent_mention() {
+    fn owner_control_command_splits_command_and_args() {
+        let agent = "ab".repeat(32);
+        for (content, expected) in [
+            (" !rotate ", Some(("!rotate", ""))),
+            ("!shutdown", Some(("!shutdown", ""))),
+            ("!cancel", Some(("!cancel", ""))),
+            ("!model", Some(("!model", ""))),
+            ("!model haiku", Some(("!model", "haiku"))),
+            ("!model\tclaude-opus-5\n", Some(("!model", "claude-opus-5"))),
+            // Arity is enforced by the caller's match arms, not the parser:
+            // `("!shutdown", "please")` matches no arm and falls through.
+            ("!shutdown please", Some(("!shutdown", "please"))),
+            ("!bogus", Some(("!bogus", ""))),
+            ("hello !model haiku", None),
+            ("", None),
+        ] {
+            let event = make_event(KIND_STREAM_MESSAGE, content, Some(&agent));
+            assert_eq!(
+                owner_control_command(&event, KIND_STREAM_MESSAGE, &agent),
+                expected,
+                "content {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_control_command_requires_kind_and_agent_mention() {
         let agent = "ab".repeat(32);
 
-        let event = make_event(KIND_STREAM_MESSAGE, " !rotate ", Some(&agent));
-        assert!(is_owner_control_command(
-            &event,
-            KIND_STREAM_MESSAGE,
-            "!rotate",
-            &agent
-        ));
-
         let wrong_kind = make_event(1, "!rotate", Some(&agent));
-        assert!(!is_owner_control_command(&wrong_kind, 1, "!rotate", &agent));
-
-        let wrong_content = make_event(KIND_STREAM_MESSAGE, "!cancel", Some(&agent));
-        assert!(!is_owner_control_command(
-            &wrong_content,
-            KIND_STREAM_MESSAGE,
-            "!rotate",
-            &agent
-        ));
+        assert!(owner_control_command(&wrong_kind, 1, &agent).is_none());
 
         let no_mention = make_event(KIND_STREAM_MESSAGE, "!rotate", None);
-        assert!(!is_owner_control_command(
-            &no_mention,
-            KIND_STREAM_MESSAGE,
-            "!rotate",
-            &agent
-        ));
+        assert!(owner_control_command(&no_mention, KIND_STREAM_MESSAGE, &agent).is_none());
+
+        let other_agent = make_event(KIND_STREAM_MESSAGE, "!rotate", Some(&"cd".repeat(32)));
+        assert!(owner_control_command(&other_agent, KIND_STREAM_MESSAGE, &agent).is_none());
     }
 
     #[test]
@@ -4340,6 +4462,164 @@ mod owner_control_command_tests {
             channel_id,
             ControlSignal::Rotate
         ));
+    }
+
+    /// An idle agent holding a session for `channel_id`, with a two-half
+    /// catalog whose ids mirror the ambiguous pairs real adapters ship.
+    async fn idle_agent(index: usize, channel_id: Uuid) -> OwnedAgent {
+        let mut state = SessionState::default();
+        state.sessions.insert(channel_id, "sess-1".to_string());
+        OwnedAgent {
+            index,
+            acp: AcpClient::spawn("cat", &[], &[], false)
+                .await
+                .expect("spawn cat as inert agent"),
+            state,
+            model_capabilities: Some(pool::AgentModelCapabilities {
+                config_options_raw: vec![serde_json::json!({
+                    "id": "model",
+                    "category": "model",
+                    "options": [
+                        { "value": "haiku", "name": "Haiku" },
+                        { "value": "opus[1m]", "name": "Opus (1M context)" }
+                    ]
+                })],
+                available_models_raw: Some(serde_json::json!({
+                    "availableModels": [{ "modelId": "claude-opus-5" }]
+                })),
+            }),
+            desired_model: Some("haiku".to_string()),
+            model_overridden: false,
+            agent_name: "unknown".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        }
+    }
+
+    async fn pool_with_idle_agent(channel_id: Uuid) -> AgentPool {
+        AgentPool::from_slots(vec![Some(idle_agent(0, channel_id).await)])
+    }
+
+    #[tokio::test]
+    async fn model_command_without_args_lists_catalog() {
+        let channel_id = Uuid::new_v4();
+        let mut pool = pool_with_idle_agent(channel_id).await;
+
+        assert_eq!(
+            handle_model_command(&mut pool, channel_id, ""),
+            "My models:\n- `haiku` — Haiku ← current\n- `opus[1m]` — Opus (1M context)\n- `claude-opus-5`"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_command_marks_the_pick_of_the_agent_serving_the_channel() {
+        // `desired_model` is per-agent-process, so with --agents N > 1 only the
+        // agent holding the channel's session knows the channel's model.
+        let channel_id = Uuid::new_v4();
+        let mut other = idle_agent(0, Uuid::new_v4()).await;
+        other.desired_model = Some("claude-opus-5".to_string());
+        let mut pool =
+            AgentPool::from_slots(vec![Some(other), Some(idle_agent(1, channel_id).await)]);
+
+        let listing = handle_model_command(&mut pool, channel_id, "");
+        assert!(listing.contains("`haiku` — Haiku ← current"), "{listing}");
+        assert!(!listing.contains("`claude-opus-5` ←"), "{listing}");
+    }
+
+    #[tokio::test]
+    async fn model_command_switches_idle_agent_on_exact_id() {
+        let channel_id = Uuid::new_v4();
+        let mut pool = pool_with_idle_agent(channel_id).await;
+
+        assert_eq!(
+            handle_model_command(&mut pool, channel_id, "claude-opus-5"),
+            "Model set to `claude-opus-5`. Takes effect on my next turn."
+        );
+        let (_, current) = pool.model_catalog(channel_id).expect("catalog");
+        assert_eq!(current, Some("claude-opus-5"));
+    }
+
+    #[tokio::test]
+    async fn model_command_rejects_ambiguous_prefix_with_the_listing() {
+        let channel_id = Uuid::new_v4();
+        let mut pool = pool_with_idle_agent(channel_id).await;
+
+        // `opus` prefixes both `opus[1m]` and `claude-opus-5` — matching is
+        // exact, so it is a miss, and the miss renders the list.
+        let reply = handle_model_command(&mut pool, channel_id, "opus");
+        assert!(
+            reply.starts_with("`opus` isn't one of my models.\n\nMy models:"),
+            "{reply}"
+        );
+        let (_, current) = pool.model_catalog(channel_id).expect("catalog");
+        assert_eq!(current, Some("haiku"), "a miss must not change the model");
+    }
+
+    #[tokio::test]
+    async fn model_command_pre_validates_before_cancelling_a_live_turn() {
+        let channel_id = Uuid::new_v4();
+        let mut pool = pool_with_idle_agent(channel_id).await;
+        let (control_tx, mut control_rx) = tokio::sync::oneshot::channel();
+        let abort_handle = pool.join_set.spawn(async {});
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: Some(control_tx),
+                steer_tx: None,
+            },
+        );
+
+        assert_eq!(
+            handle_model_command(&mut pool, channel_id, "bogus-model"),
+            "`bogus-model` isn't one of my models.\n\nMy models:\n- `haiku` — Haiku ← current\n- `opus[1m]` — Opus (1M context)\n- `claude-opus-5`"
+        );
+        assert!(
+            control_rx.try_recv().is_err(),
+            "a typo must not cancel the in-flight turn"
+        );
+
+        assert_eq!(
+            handle_model_command(&mut pool, channel_id, "opus[1m]"),
+            "Switching to `opus[1m]` — restarting the current turn on the new model."
+        );
+        assert_eq!(
+            control_rx.await.unwrap(),
+            ControlSignal::SwitchModel("opus[1m]".to_string())
+        );
+    }
+
+    #[test]
+    fn model_command_defers_when_no_catalog_is_reachable() {
+        let channel_id = Uuid::new_v4();
+        let mut pool = AgentPool::from_slots(vec![]);
+
+        assert_eq!(
+            handle_model_command(&mut pool, channel_id, ""),
+            "I don't know my model list yet — ask again in a moment."
+        );
+        // No catalog and no session: nothing to switch, and the reply must not
+        // claim otherwise.
+        assert_eq!(
+            handle_model_command(&mut pool, channel_id, "haiku"),
+            "I have no session for this channel yet — message me first, then `!model`."
+        );
+    }
+
+    #[test]
+    fn switch_outcome_statuses_match_the_desktop_contract() {
+        // Consumed by `awaitLiveSwitchOutcome` in the desktop.
+        assert_eq!(SwitchOutcome::Sent.status(), "sent");
+        assert_eq!(SwitchOutcome::TurnEnding.status(), "turn_ending");
+        assert_eq!(SwitchOutcome::Switched.status(), "switched");
+        assert_eq!(
+            SwitchOutcome::UnsupportedModel.status(),
+            "unsupported_model"
+        );
+        assert_eq!(SwitchOutcome::NoActiveTurn.status(), "no_active_turn");
     }
 }
 

@@ -1846,8 +1846,8 @@ pub enum ModelSwitchMethod {
 
 /// Extract `configOptions` entries with `category == "model"` from a `session/new` result.
 ///
-/// Returns the raw JSON array entries. Each entry has `configId`, `displayName`,
-/// `options: [{ value, displayName }]`, etc.
+/// Returns the raw JSON array entries. Each entry has `id`, `name`,
+/// `options: [{ value, name }]`, etc.
 pub fn extract_model_config_options(result: &serde_json::Value) -> Vec<serde_json::Value> {
     result["configOptions"]
         .as_array()
@@ -1858,6 +1858,29 @@ pub fn extract_model_config_options(result: &serde_json::Value) -> Vec<serde_jso
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Identifier of a `configOptions` entry.
+///
+/// Responses carry `id` (`SessionConfigOption.id`); `configId` is request-only
+/// (`SetSessionConfigOptionRequest.configId`). Tolerate the latter for adapters
+/// that echo the request shape back.
+pub fn config_option_id(config_opt: &serde_json::Value) -> Option<&str> {
+    config_opt
+        .get("id")
+        .or_else(|| config_opt.get("configId"))
+        .and_then(|v| v.as_str())
+}
+
+/// Human-readable label of a `configOptions` entry or one of its options.
+///
+/// The schema field is `name`; `displayName` is a pre-standardization spelling
+/// still emitted by some adapters.
+pub fn config_option_label(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("name")
+        .or_else(|| value.get("displayName"))
+        .and_then(|v| v.as_str())
 }
 
 /// Extract `SessionModelState` (unstable path) from a `session/new` result.
@@ -1880,7 +1903,7 @@ pub fn resolve_model_switch_method(
     // 1. Search stable configOptions for a "model"-category entry whose
     //    options contain a value matching desired_model.
     for config_opt in extract_model_config_options(session_new_result) {
-        let config_id = match config_opt.get("configId").and_then(|v| v.as_str()) {
+        let config_id = match config_option_id(&config_opt) {
             Some(id) => id,
             None => continue,
         };
@@ -2369,25 +2392,25 @@ mod tests {
             "sessionId": "sess-1",
             "configOptions": [
                 {
-                    "configId": "model",
+                    "id": "model",
                     "category": "model",
-                    "displayName": "Model",
+                    "name": "Model",
                     "options": [
-                        { "value": "claude-sonnet-4-20250514", "displayName": "Claude Sonnet 4" },
-                        { "value": "claude-opus-4-20250514", "displayName": "Claude Opus 4" }
+                        { "value": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4" },
+                        { "value": "claude-opus-4-20250514", "name": "Claude Opus 4" }
                     ]
                 },
                 {
-                    "configId": "theme",
+                    "id": "theme",
                     "category": "appearance",
-                    "displayName": "Theme",
-                    "options": [{ "value": "dark", "displayName": "Dark" }]
+                    "name": "Theme",
+                    "options": [{ "value": "dark", "name": "Dark" }]
                 }
             ]
         });
         let opts = super::extract_model_config_options(&result);
         assert_eq!(opts.len(), 1);
-        assert_eq!(opts[0]["configId"].as_str(), Some("model"));
+        assert_eq!(super::config_option_id(&opts[0]), Some("model"));
     }
 
     #[test]
@@ -2400,7 +2423,7 @@ mod tests {
     fn extract_model_config_options_empty_when_no_model_category() {
         let result = serde_json::json!({
             "configOptions": [
-                { "configId": "theme", "category": "appearance" }
+                { "id": "theme", "category": "appearance" }
             ]
         });
         assert!(super::extract_model_config_options(&result).is_empty());
@@ -2433,10 +2456,10 @@ mod tests {
     fn resolve_prefers_stable_over_unstable() {
         let result = serde_json::json!({
             "configOptions": [{
-                "configId": "model",
+                "id": "model",
                 "category": "model",
                 "options": [
-                    { "value": "claude-sonnet-4-20250514", "displayName": "Sonnet 4" }
+                    { "value": "claude-sonnet-4-20250514", "name": "Sonnet 4" }
                 ]
             }],
             "models": {
@@ -2480,7 +2503,7 @@ mod tests {
     fn resolve_returns_none_when_no_match() {
         let result = serde_json::json!({
             "configOptions": [{
-                "configId": "model",
+                "id": "model",
                 "category": "model",
                 "options": [{ "value": "claude-sonnet-4-20250514" }]
             }],
@@ -2504,12 +2527,12 @@ mod tests {
         let result = serde_json::json!({
             "configOptions": [
                 {
-                    "configId": "primary-model",
+                    "id": "primary-model",
                     "category": "model",
                     "options": [{ "value": "model-a" }]
                 },
                 {
-                    "configId": "fallback-model",
+                    "id": "fallback-model",
                     "category": "model",
                     "options": [{ "value": "model-b" }]
                 }
@@ -2525,12 +2548,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_reads_request_only_config_id_spelling() {
+        // Some adapters echo the request-side `configId` back on the response.
+        let result = serde_json::json!({
+            "configOptions": [{
+                "configId": "model",
+                "category": "model",
+                "options": [{ "value": "haiku" }]
+            }]
+        });
+        assert_eq!(
+            super::resolve_model_switch_method(&result, "haiku"),
+            Some(super::ModelSwitchMethod::ConfigOption {
+                config_id: "model".to_string(),
+                option_value: "haiku".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_finds_config_options_only_model() {
+        // codex-acp shape: the halves disagree — configOptions offers clean ids
+        // while availableModels offers reasoning-suffixed ones. Only the stable
+        // half can serve `gpt-5.4`.
+        let result = serde_json::json!({
+            "configOptions": [{
+                "id": "model",
+                "category": "model",
+                "currentValue": "gpt-5.4",
+                "options": [{ "value": "gpt-5.4", "name": "GPT-5.4" }]
+            }],
+            "models": {
+                "currentModelId": "gpt-5.3-codex/medium",
+                "availableModels": [{ "modelId": "gpt-5.3-codex/medium" }]
+            }
+        });
+        assert_eq!(
+            super::resolve_model_switch_method(&result, "gpt-5.4"),
+            Some(super::ModelSwitchMethod::ConfigOption {
+                config_id: "model".to_string(),
+                option_value: "gpt-5.4".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn config_option_label_prefers_schema_name() {
+        let schema = serde_json::json!({ "name": "Haiku", "displayName": "stale" });
+        assert_eq!(super::config_option_label(&schema), Some("Haiku"));
+
+        let legacy = serde_json::json!({ "displayName": "Haiku" });
+        assert_eq!(super::config_option_label(&legacy), Some("Haiku"));
+
+        assert_eq!(super::config_option_label(&serde_json::json!({})), None);
+    }
+
     // ── model_in_catalog tests ────────────────────────────────────────────
 
     #[test]
     fn model_in_catalog_true_when_in_config_options() {
         let config_options = vec![serde_json::json!({
-            "configId": "model",
+            "id": "model",
             "category": "model",
             "options": [
                 { "value": "claude-sonnet-4-20250514" },
@@ -2559,7 +2638,7 @@ mod tests {
     #[test]
     fn model_in_catalog_false_when_absent_from_both_halves() {
         let config_options = vec![serde_json::json!({
-            "configId": "model",
+            "id": "model",
             "options": [{ "value": "claude-sonnet-4-20250514" }]
         })];
         let available = serde_json::json!({
