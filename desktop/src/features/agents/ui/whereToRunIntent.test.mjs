@@ -5,8 +5,10 @@ import {
   canSubmitWhereToRun,
   emptyWhereToRunDraft,
   providerConfigComplete,
+  remoteHarnessSummaryLabel,
   remoteModelDiscoveryView,
   resolveBackendIntent,
+  runTargetOptions,
   selectedRemoteHarness,
 } from "./whereToRunIntent.ts";
 
@@ -225,4 +227,85 @@ test("a harness that reports no models warns about the host, not this machine", 
   assert.equal(view.modelDiscoveryStatus.tone, "warning");
   assert.match(view.modelDiscoveryStatus.message, /Goose reported no models/);
   assert.match(view.modelDiscoveryStatus.message, /on the host/);
+});
+
+// ── The run-target question (first step of the create flow) ───────────────
+
+const providers = [
+  { id: "blox", binaryPath: "/usr/local/bin/buzz-backend-blox" },
+  { id: "ssh", binaryPath: "/home/u/.local/bin/buzz-backend-ssh" },
+];
+
+test("this computer always leads the run-target list", () => {
+  assert.deepEqual(runTargetOptions([], emptyWhereToRunDraft), [
+    { label: "This computer", value: "local" },
+  ]);
+});
+
+test("unprobed providers are labelled by id", () => {
+  assert.deepEqual(runTargetOptions(providers, emptyWhereToRunDraft), [
+    { label: "This computer", value: "local" },
+    { label: "blox", value: "blox" },
+    { label: "ssh", value: "ssh" },
+  ]);
+});
+
+// info is a subprocess round-trip and only the SELECTED provider has paid for
+// one, so the friendlier name decorates that entry alone rather than spawning
+// every discovered binary on dialog open.
+test("the probed provider's own name labels the selected entry only", () => {
+  const draft = {
+    ...emptyWhereToRunDraft,
+    runOn: "ssh",
+    probedProvider: { ok: true, name: "SSH" },
+  };
+  assert.deepEqual(runTargetOptions(providers, draft), [
+    { label: "This computer", value: "local" },
+    { label: "blox", value: "blox" },
+    { label: "SSH", value: "ssh" },
+  ]);
+});
+
+test("a blank probed name falls back to the id", () => {
+  const draft = {
+    ...emptyWhereToRunDraft,
+    runOn: "ssh",
+    probedProvider: { ok: true, name: "   " },
+  };
+  assert.equal(runTargetOptions(providers, draft)[2].label, "ssh");
+});
+
+// ── The harness summary label ─────────────────────────────────────────────
+
+test("the summary label is the host's harness, versioned when known", () => {
+  assert.equal(remoteHarnessSummaryLabel(providerDraft()), "Goose (1.2.0)");
+  assert.equal(
+    remoteHarnessSummaryLabel(
+      providerDraft({
+        remoteHarnesses: [{ ...gooseHarness, version: null }],
+      }),
+    ),
+    "Goose",
+  );
+});
+
+// null hands the label back to the local catalog — the same contract
+// remoteModelDiscoveryView uses for the Model control.
+test("the summary label defers to the local catalog with no remote pick", () => {
+  assert.equal(remoteHarnessSummaryLabel(emptyWhereToRunDraft), null);
+  assert.equal(
+    remoteHarnessSummaryLabel(
+      providerDraft({ remoteHarnesses: null, remoteHarnessId: null }),
+    ),
+    null,
+  );
+  assert.equal(
+    remoteHarnessSummaryLabel(
+      providerDraft({
+        remoteHarnesses: [{ ...gooseHarness, available: false }],
+      }),
+    ),
+    null,
+    "an unavailable entry is not the pin, so it must not name the summary",
+  );
 });

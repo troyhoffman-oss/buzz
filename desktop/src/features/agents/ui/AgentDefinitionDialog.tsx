@@ -122,6 +122,12 @@ type AgentDefinitionDialogProps = {
    * the agent is not going to run here.
    */
   createRemoteModelDiscovery?: RemoteModelDiscoveryView | null;
+  /**
+   * Display label of the harness picked from the HOST's catalog. The summary
+   * would otherwise name the local default runtime, which for a remote create
+   * is a harness on the wrong computer that the deploy will never run.
+   */
+  createRemoteHarnessLabel?: string | null;
 };
 
 const ADVANCED_FIELDS_MOTION_TRANSITION = {
@@ -145,6 +151,7 @@ export function AgentDefinitionDialog({
   createSubmitBlocked = false,
   createRunsRemotely = false,
   createRemoteModelDiscovery = null,
+  createRemoteHarnessLabel = null,
 }: AgentDefinitionDialogProps) {
   const [displayName, setDisplayName] = React.useState("");
   const [aiDefaultsOpen, setAiDefaultsOpen] = React.useState(false);
@@ -430,6 +437,12 @@ export function AgentDefinitionDialog({
         globalEnvVars: globalConfig.env_vars,
         globalProvider: inheritedProviderDefault.value,
         globalModel: inheritedModelDefault.value,
+        // Deliberately false even for a remote create. The credential keys this
+        // gate demands are the ones the agent's env carries, and a remote
+        // deploy writes that env to the host verbatim — so a missing key is
+        // just as fatal there, and silencing the gate would ship an agent that
+        // deploys and then cannot authenticate. The keys are derived from the
+        // LOCAL runtime id, which is the known limitation, not the gate.
         isProviderMode: false,
         model,
         provider: trimmedProvider,
@@ -587,9 +600,14 @@ export function AgentDefinitionDialog({
     runtimes,
     runtimesLoading,
   });
-  const runtimeSummaryLabel = selectedRuntime
-    ? formatRuntimeOptionLabel(selectedRuntime)
-    : runtime.trim() || "Not configured";
+  // The host's pick wins outright for a remote create: `runtime` still holds
+  // whatever the local seeding effects resolved, and naming that harness in
+  // the summary would describe a machine this agent will never run on.
+  const runtimeSummaryLabel =
+    createRemoteHarnessLabel ??
+    (selectedRuntime
+      ? formatRuntimeOptionLabel(selectedRuntime)
+      : runtime.trim() || "Not configured");
   const providerDropdownOptions: PersonaDropdownOption[] = [
     ...providerOptions
       .filter((option) => option.id.trim().length > 0)
@@ -776,6 +794,13 @@ export function AgentDefinitionDialog({
           />
 
           <div className="space-y-5">
+            {/* First, not last: every field below is scoped by the answer. The
+                harness comes from the chosen machine's catalog and the models
+                come from that harness, so asking this at the end would mean
+                answering the dependent questions against the wrong computer
+                and then silently re-scoping them. */}
+            {isCreateMode ? createRunSection?.({ envVars }) : null}
+
             <div className="space-y-1.5">
               <label
                 className="text-sm font-medium text-foreground"
@@ -838,7 +863,13 @@ export function AgentDefinitionDialog({
               className="space-y-5"
               data-testid={`agent-${aiConfigurationMode}-configuration-section`}
             >
-              {aiConfigurationMode === "custom" ? (
+              {/* A remote create has exactly one harness question, and the
+                  host's catalog owns it. This picker lists what is installed
+                  on THIS computer, so offering it too would present two
+                  harness controls of which only the other one reaches the
+                  deploy — and its "not installed, visit Settings" warning
+                  describes the wrong machine. */}
+              {aiConfigurationMode === "custom" && !createRunsRemotely ? (
                 <AgentHarnessField
                   disabled={isPending || runtimesLoading}
                   onValueChange={handleRuntimeDropdownChange}
@@ -961,8 +992,6 @@ export function AgentDefinitionDialog({
               open={runtimeCanChooseLlmProvider && aiDefaultsOpen}
               returnFocusRef={aiDefaultsTriggerRef}
             />
-
-            {isCreateMode ? createRunSection?.({ envVars }) : null}
 
             <div className="space-y-3">
               <button

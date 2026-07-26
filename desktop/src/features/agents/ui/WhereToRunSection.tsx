@@ -12,17 +12,29 @@ import type { RemoteHarness } from "@/shared/api/types";
 import { Button } from "@/shared/ui/button";
 
 import type { EnvVarsValue } from "./EnvVarsEditor";
+import { PersonaDropdownField } from "./PersonaDropdownField";
 import {
   coerceConfigValues,
   ProviderConfigFields,
 } from "./ProviderConfigFields";
 import {
   emptyWhereToRunDraft,
+  LOCAL_RUN_TARGET_VALUE,
   providerConfigComplete,
+  runTargetOptions,
   type WhereToRunDraft,
 } from "./whereToRunIntent";
 
-/** Optional remote-backend selector. Buzz shared compute is an LLM provider, not a run destination. */
+/**
+ * The create flow's first question: which computer this agent runs on, and —
+ * once that answer is a backend provider — everything about that host.
+ *
+ * It leads the dialog because it is the one answer the rest of the form
+ * depends on: the harness comes from the host's catalog and the models come
+ * from the host's harness, so asking it last means answering the dependent
+ * questions against the wrong machine first. Buzz shared compute is an LLM
+ * provider, not a run destination, so it is not a choice here.
+ */
 export function WhereToRunSection({
   draft,
   envVars,
@@ -48,7 +60,7 @@ export function WhereToRunSection({
   const [harnessError, setHarnessError] = React.useState<string | null>(null);
   const [isDiscoveringHarnesses, setIsDiscoveringHarnesses] =
     React.useState(false);
-  const isProviderMode = draft.runOn !== "local";
+  const isProviderMode = draft.runOn !== LOCAL_RUN_TARGET_VALUE;
   const selectedBackendProvider = React.useMemo(
     () =>
       backendProviders.find((provider) => provider.id === draft.runOn) ?? null,
@@ -260,34 +272,38 @@ export function WhereToRunSection({
     void probeModels(harness, next);
   }
 
-  if (backendProviders.length === 0) return null;
+  // No provider installed is a legitimate answer to this question, not a
+  // reason to skip it. As the LAST step the section could vanish silently; as
+  // the FIRST one, vanishing would leave the user with no evidence that
+  // running elsewhere is even a thing Buzz does — so the control stays and
+  // explains why it has only one entry.
+  const hasProviders = backendProviders.length > 0;
 
   return (
     <div className="space-y-4">
       <div className="space-y-1.5">
-        <label className="text-sm font-medium" htmlFor="agent-run-on">
-          Run on
-        </label>
-        <select
-          className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-xs"
-          disabled={isPending}
-          id="agent-run-on"
-          onChange={(event) => {
-            discardHostRequests();
-            onDraftChange({
-              ...emptyWhereToRunDraft,
-              runOn: event.target.value,
-            });
-          }}
-          value={draft.runOn}
+        <label
+          className="text-sm font-medium text-foreground"
+          htmlFor="agent-run-on"
         >
-          <option value="local">This computer</option>
-          {backendProviders.map((provider) => (
-            <option key={provider.id} value={provider.id}>
-              {provider.id}
-            </option>
-          ))}
-        </select>
+          Where does this agent run?
+        </label>
+        <PersonaDropdownField
+          disabled={isPending || !hasProviders}
+          id="agent-run-on"
+          onValueChange={(runOn) => {
+            discardHostRequests();
+            onDraftChange({ ...emptyWhereToRunDraft, runOn });
+          }}
+          options={runTargetOptions(backendProviders, draft)}
+          placeholder="This computer"
+          value={draft.runOn}
+        />
+        {!hasProviders ? (
+          <p className="text-xs text-muted-foreground">
+            Install a backend provider to run agents on another machine.
+          </p>
+        ) : null}
       </div>
 
       {isProviderMode && selectedBackendProvider ? (

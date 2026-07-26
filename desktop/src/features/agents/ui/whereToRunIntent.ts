@@ -1,9 +1,11 @@
 import type { BackendIntent } from "../lib/instanceInputForDefinition";
 import type {
   AgentModelsResponse,
+  BackendProviderCandidate,
   BackendProviderProbeResult,
   RemoteHarness,
 } from "@/shared/api/types";
+import type { PersonaDropdownOption } from "./agentConfigOptions";
 import { coerceConfigValues } from "./ProviderConfigFields";
 import type { ModelDiscoveryView } from "./useRemoteAwareModelDiscovery";
 import { getDiscoveredPersonaModelOptions } from "./usePersonaModelDiscovery";
@@ -23,9 +25,13 @@ export type RemoteModelProbe =
   | { status: "loaded"; models: AgentModelsResponse }
   | { status: "failed"; error: string };
 
+/** Dropdown value of the "runs on this computer" choice. */
+export const LOCAL_RUN_TARGET_VALUE = "local";
+
 /** Draft state of the optional remote-backend selector. */
 export type WhereToRunDraft = {
-  runOn: "local" | string;
+  /** `LOCAL_RUN_TARGET_VALUE`, or the id of a discovered backend provider. */
+  runOn: string;
   providerConfig: Record<string, string>;
   probedProvider: BackendProviderProbeResult | null;
   /**
@@ -40,7 +46,7 @@ export type WhereToRunDraft = {
 };
 
 export const emptyWhereToRunDraft: WhereToRunDraft = {
-  runOn: "local",
+  runOn: LOCAL_RUN_TARGET_VALUE,
   providerConfig: {},
   probedProvider: null,
   remoteHarnesses: null,
@@ -48,8 +54,37 @@ export const emptyWhereToRunDraft: WhereToRunDraft = {
   remoteModelProbe: { status: "idle" },
 };
 
+/**
+ * The run-target choices: this computer, then every discovered backend
+ * provider.
+ *
+ * A provider's own `info.name` ("SSH") is friendlier than its binary-derived id
+ * ("ssh"), but only the SELECTED provider has been probed — `info` is a
+ * subprocess round-trip, and this list is rendered before the user has asked
+ * for anything. So the name is used where it has already been paid for and the
+ * id stands in everywhere else, rather than spawning every discovered provider
+ * on dialog open to decorate a label.
+ */
+export function runTargetOptions(
+  providers: readonly BackendProviderCandidate[],
+  draft: WhereToRunDraft,
+): PersonaDropdownOption[] {
+  const probedName =
+    draft.runOn !== LOCAL_RUN_TARGET_VALUE
+      ? draft.probedProvider?.name?.trim()
+      : "";
+  return [
+    { label: "This computer", value: LOCAL_RUN_TARGET_VALUE },
+    ...providers.map((provider) => ({
+      label:
+        provider.id === draft.runOn && probedName ? probedName : provider.id,
+      value: provider.id,
+    })),
+  ];
+}
+
 export function providerConfigComplete(draft: WhereToRunDraft): boolean {
-  if (draft.runOn === "local") return true;
+  if (draft.runOn === LOCAL_RUN_TARGET_VALUE) return true;
   if (!draft.probedProvider) return false;
   const schema = draft.probedProvider.config_schema as
     | Record<string, unknown>
@@ -73,12 +108,30 @@ export function providerConfigComplete(draft: WhereToRunDraft): boolean {
 export function selectedRemoteHarness(
   draft: WhereToRunDraft,
 ): RemoteHarness | null {
-  if (draft.runOn === "local" || !draft.remoteHarnessId) return null;
+  if (draft.runOn === LOCAL_RUN_TARGET_VALUE || !draft.remoteHarnessId)
+    return null;
   return (
     draft.remoteHarnesses?.find(
       (harness) => harness.available && harness.id === draft.remoteHarnessId,
     ) ?? null
   );
+}
+
+/**
+ * How the dialog's summary names the harness for a provider-backed create.
+ *
+ * `null` means "the local path owns this label", exactly as
+ * `remoteModelDiscoveryView` does for the Model control — a local create, or a
+ * remote one with nothing picked yet, still reads from the local catalog.
+ */
+export function remoteHarnessSummaryLabel(
+  draft: WhereToRunDraft,
+): string | null {
+  const harness = selectedRemoteHarness(draft);
+  if (!harness) return null;
+  return harness.version
+    ? `${harness.label} (${harness.version})`
+    : harness.label;
 }
 
 /**
@@ -167,14 +220,14 @@ export function remoteModelDiscoveryView(
  */
 export function canSubmitWhereToRun(draft: WhereToRunDraft): boolean {
   if (!providerConfigComplete(draft)) return false;
-  if (draft.runOn === "local") return true;
+  if (draft.runOn === LOCAL_RUN_TARGET_VALUE) return true;
   return selectedRemoteHarness(draft) !== null;
 }
 
 export function resolveBackendIntent(
   draft: WhereToRunDraft,
 ): BackendIntent | null {
-  if (draft.runOn === "local") return null;
+  if (draft.runOn === LOCAL_RUN_TARGET_VALUE) return null;
   const harness = selectedRemoteHarness(draft);
   return {
     type: "provider",

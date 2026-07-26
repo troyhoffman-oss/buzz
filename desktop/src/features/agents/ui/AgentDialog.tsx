@@ -16,6 +16,8 @@ import { WhereToRunSection } from "./WhereToRunSection";
 import {
   canSubmitWhereToRun,
   emptyWhereToRunDraft,
+  LOCAL_RUN_TARGET_VALUE,
+  remoteHarnessSummaryLabel,
   remoteModelDiscoveryView,
   resolveBackendIntent,
 } from "./whereToRunIntent";
@@ -121,6 +123,7 @@ function AgentCreateDialogRouter({
 
   return (
     <AgentDefinitionDialog
+      createRemoteHarnessLabel={remoteHarnessSummaryLabel(runDraft)}
       createRemoteModelDiscovery={remoteModelDiscoveryView(runDraft)}
       createRunSection={({ envVars }) => (
         <WhereToRunSection
@@ -130,7 +133,7 @@ function AgentCreateDialogRouter({
           onDraftChange={setRunDraft}
         />
       )}
-      createRunsRemotely={runDraft.runOn !== "local"}
+      createRunsRemotely={runDraft.runOn !== LOCAL_RUN_TARGET_VALUE}
       createSubmitBlocked={!canSubmitWhereToRun(runDraft)}
       description={copy.description}
       error={definitionError}
