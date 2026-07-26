@@ -17,6 +17,15 @@
 //! detail that keeps the heredoc safe) no `_`, so no encoded line can collide
 //! with the `BUZZ_ACP_B64_EOF` delimiter.
 //!
+//! **Resolution is `PATH` *or* `~/.local/bin/buzz-acp`,** never `PATH` alone.
+//! A non-interactive SSH command reads no profile, so the install destination
+//! is not on the ambient `PATH` — which is precisely why the unit's env file
+//! pins `PATH="$HOME/.local/bin:$PATH"` itself. A `command -v`-only rule would
+//! therefore never find the copy a previous deploy installed, and because
+//! deploy is the start path, every start would re-stream the binary and swap it
+//! underneath a running fleet. `resolve` is that rule, and the probe asks the
+//! same question so the two can never disagree.
+//!
 //! **Staleness rule: push-when-missing only.** A host that already resolves
 //! `buzz-acp` keeps the binary it has, whatever its version. Deploy is also the
 //! start path — `start_managed_agent` re-enters it — so a version-comparing
@@ -44,6 +53,21 @@ const LINE_WIDTH: usize = 76;
 /// in the base64 alphabet, so no data line can ever terminate the heredoc
 /// early. `delimiter_cannot_appear_in_encoded_data` pins that.
 const DELIMITER: &str = "BUZZ_ACP_B64_EOF";
+
+/// Where an installed `buzz-acp` lands. Unexpanded on purpose: it is emitted
+/// into the script and expanded by the *host's* shell, whose `$HOME` is the
+/// only one that matters.
+const INSTALL_DIR: &str = "$HOME/.local/bin";
+
+/// The installed binary itself — and the reason resolution cannot be a bare
+/// `command -v`. `~/.local/bin` is the documented convention and the
+/// destination below, but it is **not** on a non-interactive SSH `PATH`: the
+/// remote shell reads no profile, which is exactly why the unit's env file has
+/// to pin `PATH="$HOME/.local/bin:$PATH"` itself. Resolving by `PATH` alone
+/// would therefore never see the copy the previous deploy installed, and since
+/// deploy is the start path, every agent start would re-stream tens of
+/// megabytes and swap the binary underneath a running fleet.
+const INSTALL_PATH: &str = "$HOME/.local/bin/buzz-acp";
 
 /// A `buzz-acp` binary read from the desktop's filesystem, encoded for the
 /// script and fingerprinted for the host to check.
@@ -157,30 +181,53 @@ fn wrap(encoded: &str) -> String {
 /// start, to a host that has had the binary since the first one. The probe is
 /// one cheap round trip that keeps the payload off the wire in that case.
 ///
-/// It is an optimization and never the decision: [`resolve_or_install`] still
+/// It answers with exactly the rule [`resolve_or_install`] applies on the host
+/// ([`resolve`]) — `PATH` *or* [`INSTALL_PATH`] — because a probe that only
+/// consulted `PATH` would answer "missing" forever for a binary this crate
+/// itself installed, and the payload would ride along on every start.
+///
+/// It remains an optimization and never the decision: the deploy script
 /// re-checks on the host and installs only into an empty `$acp`, so a host that
 /// gains or loses the binary between the two round trips still ends up correct.
 pub fn probe_script(acp: &str) -> String {
-    format!("command -v {acp} >/dev/null 2>&1\n")
+    format!("command -v {acp} >/dev/null 2>&1 || [ -x \"{INSTALL_PATH}\" ]\n")
+}
+
+/// The host-side resolution rule, shared by every caller so the probe, the
+/// push path and the un-pushed path can never disagree.
+///
+/// Leaves `$acp` holding an absolute path, or empty when the host has none.
+/// `command -v` covers a `PATH` install and an absolute `buzz_acp_path`;
+/// [`INSTALL_PATH`] covers the documented `~/.local/bin` convention, which a
+/// non-interactive SSH `PATH` does not contain.
+fn resolve(acp: &str) -> String {
+    format!(
+        r#"acp=$(command -v {acp} 2>/dev/null || true)
+if [ -z "$acp" ] && [ -x "{INSTALL_PATH}" ]; then acp="{INSTALL_PATH}"; fi"#
+    )
 }
 
 /// The deploy script's `buzz-acp` resolution block.
 ///
-/// `acp` is the already-`quote()`d command or path to resolve. With no payload
-/// this is byte-for-byte the line the crate has always emitted, so a deploy
-/// that carries no binary behaves exactly as it did before this module existed.
+/// `acp` is the already-`quote()`d command or path to resolve. Resolution is
+/// [`resolve`] in both cases — `PATH`, then the `~/.local/bin` convention — so
+/// a deploy that carries no binary still finds one an earlier deploy (or the
+/// operator, following the documented convention) put there.
 ///
 /// With a payload it becomes resolve-or-install, in that order: an installed
 /// `buzz-acp` is never replaced, and a host that had none ends the block with
 /// `$acp` holding the absolute path of the copy just installed — which is what
 /// the unit's `ExecStart` is substituted from later in the same pass.
 pub fn resolve_or_install(acp: &str, push: Option<&Payload>) -> String {
-    const MISSING: &str = "buzz-acp not found on the server's PATH — install it, or set 'buzz-acp \
-                           path on the server'";
+    const MISSING: &str = "buzz-acp not found on the server's PATH or in ~/.local/bin — install \
+                           it, or set 'buzz-acp path on the server'";
+
+    let resolve = resolve(acp);
 
     let Some(payload) = push else {
         return format!(
-            r#"acp=$(command -v {acp} 2>/dev/null) || {{ echo "{MISSING}" >&2; exit 90; }}"#
+            r#"{resolve}
+if [ -z "$acp" ]; then echo "{MISSING}" >&2; exit 90; fi"#
         );
     };
 
@@ -193,11 +240,11 @@ pub fn resolve_or_install(acp: &str, push: Option<&Payload>) -> String {
     // decode is guarded rather than left to `set -e`, which would exit before
     // the temp file could be removed.
     format!(
-        r#"acp=$(command -v {acp} 2>/dev/null || true)
+        r#"{resolve}
 if [ -z "$acp" ]; then
 command -v base64 >/dev/null 2>&1 || {{ echo "the server has no 'base64' (coreutils), so the desktop cannot install buzz-acp on it" >&2; exit 92; }}
 command -v sha256sum >/dev/null 2>&1 || {{ echo "the server has no 'sha256sum' (coreutils), and buzz-acp is never installed unverified" >&2; exit 92; }}
-acp_dir="$HOME/.local/bin"
+acp_dir="{INSTALL_DIR}"
 mkdir -p "$acp_dir"
 acp_tmp="$acp_dir/.buzz-acp.tmp.$$"
 base64 -d > "$acp_tmp" <<'{DELIMITER}' || {{ rm -f "$acp_tmp"; echo "the pushed buzz-acp did not decode on the server" >&2; exit 93; }}
@@ -325,12 +372,62 @@ mod tests {
     }
 
     #[test]
-    fn no_payload_emits_exactly_the_line_the_crate_always_emitted() {
+    fn no_payload_still_resolves_the_install_destination_and_then_fails_with_exit_90() {
         let resolved = resolve_or_install("'buzz-acp'", None);
         assert_eq!(
             resolved,
-            r#"acp=$(command -v 'buzz-acp' 2>/dev/null) || { echo "buzz-acp not found on the server's PATH — install it, or set 'buzz-acp path on the server'" >&2; exit 90; }"#
+            r#"acp=$(command -v 'buzz-acp' 2>/dev/null || true)
+if [ -z "$acp" ] && [ -x "$HOME/.local/bin/buzz-acp" ]; then acp="$HOME/.local/bin/buzz-acp"; fi
+if [ -z "$acp" ]; then echo "buzz-acp not found on the server's PATH or in ~/.local/bin — install it, or set 'buzz-acp path on the server'" >&2; exit 90; fi"#
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolution_finds_the_install_destination_that_is_not_on_a_non_interactive_path() {
+        // The bug this pins: `~/.local/bin` is where every install lands and is
+        // NOT on a non-interactive SSH PATH, so a `command -v`-only rule
+        // reported "missing" for a binary this crate itself installed — and
+        // since deploy is the start path, re-streamed and re-installed it on
+        // every single agent start.
+        let home = std::env::temp_dir().join(format!("buzz-resolve-{}", std::process::id()));
+        let local_bin = home.join(".local/bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        let installed = local_bin.join("buzz-acp");
+        std::fs::write(&installed, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // `sh -c` with an EMPTY PATH: nothing but the explicit check can find
+        // it, which is exactly the remote shell's situation.
+        let run = |script: &str| {
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("{script}\nprintf '%s' \"$acp\"\n"))
+                .env("HOME", &home)
+                .env("PATH", "/nonexistent")
+                .output()
+                .unwrap();
+            (
+                output.status.success(),
+                String::from_utf8_lossy(&output.stdout).to_string(),
+            )
+        };
+
+        // Both the un-pushed path and the shared rule land on the installed
+        // copy rather than exiting 90.
+        let (ok, acp) = run(&resolve_or_install("'buzz-acp'", None));
+        assert!(ok, "resolution failed on a host that has the binary");
+        assert_eq!(acp, installed.display().to_string());
+        let (ok, acp) = run(&resolve("'buzz-acp'"));
+        assert!(ok);
+        assert_eq!(acp, installed.display().to_string());
+
+        // And it is still a real answer, not an unconditional one: remove the
+        // file and the same block exits 90.
+        std::fs::remove_file(&installed).unwrap();
+        let (ok, _) = run(&resolve_or_install("'buzz-acp'", None));
+        assert!(!ok, "resolution succeeded on a host with no binary at all");
     }
 
     #[cfg(unix)]
@@ -339,11 +436,18 @@ mod tests {
         // The probe is what keeps a megabytes-large payload off the wire on
         // every start of every agent, so its answer has to be right in both
         // directions. Run against a real `/bin/sh`, since the whole content of
-        // the script is one `command -v`.
+        // the script is one shell expression.
+        //
+        // `$HOME` is pinned to an empty sandbox: the probe now also consults
+        // `$HOME/.local/bin/buzz-acp`, and the developer running these tests
+        // may well have one there.
+        let home = std::env::temp_dir().join(format!("buzz-probe-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
         let run = |script: &str, path: &str| {
             std::process::Command::new("/bin/sh")
                 .arg("-c")
                 .arg(script)
+                .env("HOME", &home)
                 .env("PATH", path)
                 .status()
                 .unwrap()
@@ -355,6 +459,22 @@ mod tests {
         assert!(!run(&probe_script("'buzz-acp'"), "/nonexistent"));
         // An absolute `buzz_acp_path` is answered by existence, not by PATH.
         assert!(run(&probe_script("'/bin/sh'"), "/nonexistent"));
+
+        // The install destination answers too, with nothing on PATH — the case
+        // every host is in after its first deploy, and the one a `command -v`
+        // probe got wrong forever.
+        let local_bin = home.join(".local/bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        let installed = local_bin.join("buzz-acp");
+        std::fs::write(&installed, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(run(&probe_script("'buzz-acp'"), "/nonexistent"));
+        // A non-executable leftover is not an install: `-x`, not `-e`.
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!run(&probe_script("'buzz-acp'"), "/nonexistent"));
+        std::fs::remove_file(&installed).unwrap();
+
         // The argument is interpolated already-quoted, so a hostile configured
         // path is inert rather than executed.
         let canary = std::env::temp_dir().join(format!("buzz-probe-{}", std::process::id()));
@@ -391,6 +511,13 @@ mod tests {
         // Missing coreutils is a clear message, never a silent skip.
         assert!(script.contains("command -v base64"));
         assert!(script.contains("command -v sha256sum"));
+
+        // Where the install lands and where resolution looks are two constants,
+        // so they can drift apart — and if they ever do, every deploy silently
+        // re-installs forever. Pin them together.
+        assert_eq!(INSTALL_PATH, format!("{INSTALL_DIR}/buzz-acp"));
+        assert!(script.contains(&format!(r#"acp_dir="{INSTALL_DIR}""#)));
+        assert!(script.contains(&format!(r#"[ -x "{INSTALL_PATH}" ]"#)));
 
         // The heredoc delimiter is QUOTED, so the remote shell performs no
         // expansion on the body. The base64 alphabet already contains nothing

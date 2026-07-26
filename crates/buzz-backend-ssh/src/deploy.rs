@@ -1255,6 +1255,103 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_second_deploy_keeps_the_binary_the_first_one_installed() {
+        // The install destination — `~/.local/bin` — is NOT on a
+        // non-interactive SSH PATH, which is exactly why the env file below
+        // pins `PATH="$HOME/.local/bin:$PATH"` itself. Resolution has to say so
+        // too: with a bare `command -v`, the probe answered "missing" forever
+        // and every deploy re-streamed and replaced the binary. Deploy is the
+        // start path, so that is every agent start, underneath a running fleet.
+        //
+        // `an_existing_host_binary_is_never_replaced_by_the_pushed_one` cannot
+        // see this: it seeds the stub into the sandbox's `bin`, which IS on the
+        // sandbox PATH.
+        use std::os::unix::fs::MetadataExt;
+
+        let canary = std::env::temp_dir().join("buzz-never");
+        let payload = push_payload("twice", &canary_binary(&canary));
+        let root = sandbox_host("twice", HostAcp::Missing);
+        let agent = Agent::from_request(&request()).unwrap();
+        let installed = root.join(".local/bin/buzz-acp");
+
+        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, Some(&payload)).unwrap();
+        let first = run_in_sandbox(&root, &script);
+        assert!(
+            first.status.success(),
+            "first deploy failed: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let inode = std::fs::metadata(&installed).unwrap().ino();
+
+        // What the desktop asks before deploy #2. It must now answer "the host
+        // has it", which is what keeps the payload off the wire — the file is
+        // not even read, let alone encoded and streamed.
+        let acp = quote(config().buzz_acp_path.as_deref().unwrap_or("buzz-acp"));
+        let probe = run_in_sandbox(&root, &install::probe_script(&acp));
+        assert!(
+            probe.status.success(),
+            "the probe did not see the binary the previous deploy installed"
+        );
+
+        // And even the worst case — a script that still carries the payload —
+        // resolves to the installed copy instead of replacing it.
+        let second = run_in_sandbox(&root, &script);
+        assert!(
+            second.status.success(),
+            "second deploy failed: {}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        assert_eq!(
+            std::fs::metadata(&installed).unwrap().ino(),
+            inode,
+            "the second deploy replaced the binary the first one installed"
+        );
+
+        // The unit still names it, so idempotence is real and not just quiet.
+        let unit =
+            std::fs::read_to_string(root.join(".config/systemd/user/buzz-acp@.service")).unwrap();
+        assert!(
+            unit.contains(&format!("ExecStart={}", installed.display())),
+            "{unit}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_configured_absolute_path_still_resolves_the_copy_deploy_installed() {
+        // `buzz_acp_path` is an absolute path the operator picked, but an
+        // install always lands in `~/.local/bin`. Resolving only what was
+        // configured would never find it, so the host would re-install on every
+        // single start, forever.
+        use std::os::unix::fs::MetadataExt;
+
+        let canary = std::env::temp_dir().join("buzz-never");
+        let payload = push_payload("configured", &canary_binary(&canary));
+        let root = sandbox_host("configured", HostAcp::Missing);
+        let config = SshConfig {
+            buzz_acp_path: Some("/opt/buzz-acp".into()),
+            ..config()
+        };
+        let agent = Agent::from_request(&request()).unwrap();
+        let installed = root.join(".local/bin/buzz-acp");
+
+        let script = deploy_script(&agent, &config, UNIT_TEMPLATE, Some(&payload)).unwrap();
+        assert!(run_in_sandbox(&root, &script).status.success());
+        let inode = std::fs::metadata(&installed).unwrap().ino();
+
+        let acp = quote(config.buzz_acp_path.as_deref().unwrap_or("buzz-acp"));
+        assert!(
+            run_in_sandbox(&root, &install::probe_script(&acp))
+                .status
+                .success(),
+            "the probe missed the install because the configured path is elsewhere"
+        );
+        assert!(run_in_sandbox(&root, &script).status.success());
+        assert_eq!(std::fs::metadata(&installed).unwrap().ino(), inode);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_payload_that_decodes_to_garbage_aborts_before_anything_is_installed() {
         let canary = std::env::temp_dir().join("buzz-never");
         let payload = push_payload("decode", &canary_binary(&canary));

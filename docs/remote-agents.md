@@ -107,6 +107,14 @@ before anything else is written. When the field is absent, `deploy` resolves `bu
 fails with exit 90 exactly as it always has: the field is a seam, not a mode, and there is no second
 op, no provisioning step, and no new UI state.
 
+**Resolution is `PATH` *or* `~/.local/bin/buzz-acp`, never `PATH` alone.** A non-interactive SSH
+command reads no profile, so `~/.local/bin` — the documented convention and the install destination —
+is not on the ambient `PATH`. That is exactly why the unit's env file pins
+`PATH="$HOME/.local/bin:$PATH"` itself. A `command -v`-only rule would therefore never see the copy a
+previous deploy installed: since deploy is the start path, every agent start would re-stream tens of
+megabytes and swap the binary underneath a running fleet. The probe and the deploy script apply the
+same two-part rule, so they cannot disagree.
+
 **Staleness rule: push-when-missing only.** A host that already resolves `buzz-acp` keeps the binary
 it has, whatever its version. Deploy is the start path, so a version-comparing rule would reinstall
 underneath a running fleet on every start, and a desktop pinned to an older artifact would
@@ -115,9 +123,9 @@ underneath a running fleet on every start, and a desktop pinned to an older arti
 **Setting `buzz_acp_binary` costs one extra round trip, and only when it is set.** Deploy is the
 start path, so embedding the binary unconditionally would stream tens of megabytes of base64 on every
 start of every agent, forever, to hosts that were provisioned on day one. So when — and only when —
-the field is present, `deploy` first asks the host `command -v buzz-acp`; if the host already has it,
-the file is never even read and the script is the one the crate has always sent. The probe is an
-optimization, never the decision: the deploy script re-checks on the host and installs only into an
+the field is present, `deploy` asks the host the resolution question above first; if the host already
+has it, the file is never even read and the script is the one the crate has always sent. The probe is
+an optimization, never the decision: the deploy script re-checks on the host and installs only into an
 empty `$acp`, so a host that gains or loses the binary between the two round trips still lands
 correct.
 
@@ -194,7 +202,8 @@ missing. It is a preflight, not an installer.
    best-effort: some hosts gate it behind polkit, and failing it must not fail an otherwise good
    deploy. On those hosts, run it once by hand as root.
 
-3. **`buzz-acp` on the host's PATH**, conventionally `~/.local/bin/buzz-acp`, or an absolute path in
+3. **`buzz-acp` on the host's PATH or at `~/.local/bin/buzz-acp`** — `deploy` resolves both, since a
+   non-interactive SSH `PATH` does not contain the latter — or an absolute path in
    `buzz_acp_path`. `discover_harnesses` reports its absence without failing. `deploy` installs it
    when the desktop supplied one (`BUZZ_ACP_PUSH_BINARY`, see the `deploy` section) and otherwise
    refuses. Installing it needs `base64` and `sha256sum` on the host — coreutils, present on any
@@ -350,7 +359,7 @@ that no `TURN_TIMEOUT` key can reappear in the env file.
 
 **Deploy is the start path.** `start_managed_agent` re-enters `deploy_to_provider`, so start and
 redeploy are one code path and everything in it is idempotent. Non-idempotence would surface as
-duplicate units, not as an error. One deploy is one round trip (plus the cheap `command -v` probe,
+duplicate units, not as an error. One deploy is one round trip (plus the cheap resolution probe,
 only when `buzz_acp_binary` is set) that resolves — or, on a host that has none and a payload that
 carries one, installs — `buzz-acp`, resolves the
 harness, writes the env file atomically, enables lingering, installs the unit template,
@@ -379,8 +388,9 @@ user manager. Run `sudo loginctl enable-linger <user>` once and redeploy.
 bus was reachable through the deploy's own session, and the user manager was torn down with it.
 Enable lingering.
 
-**`buzz-acp not found on the server's PATH` (exit 90).** `command -v buzz-acp` failed on the host
-and the payload carried no binary to install. Install it to `~/.local/bin`, set `buzz_acp_path`, or
+**`buzz-acp not found on the server's PATH or in ~/.local/bin` (exit 90).** Neither `command -v
+buzz-acp` nor `~/.local/bin/buzz-acp` resolved on the host, and the payload carried no binary to
+install. Install it to `~/.local/bin`, set `buzz_acp_path`, or
 point `BUZZ_ACP_PUSH_BINARY` at a Linux `buzz-acp` on the desktop and let the deploy install it.
 Note that `discover_harnesses` reports this non-fatally, so it can first appear at deploy time.
 

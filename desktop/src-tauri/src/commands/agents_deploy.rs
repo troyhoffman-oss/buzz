@@ -146,8 +146,9 @@ pub(super) fn deploy_payload_json(
         // field will simply ignore it — no protocol break.
         "env_vars": merged_env,
         // A path on THIS machine to a Linux `buzz-acp` the provider may install
-        // on the host when the host has none. Omitted entirely when unset, so
-        // the payload and every provider's behavior are unchanged by default.
+        // on the host when the host has none. Serialized as `null` when unset —
+        // a provider reading it with `as_str()` sees `None`, exactly as it does
+        // for an absent key, so behavior is unchanged by default.
         "buzz_acp_binary": buzz_acp_binary_to_push(),
     })
 }

@@ -9,10 +9,12 @@
 # assumes: see docs/remote-agents.md, "Host prerequisites". Safe to re-run —
 # every action is idempotent, and a fully provisioned host is a no-op.
 #
-# It does NOT install `buzz-acp` or any harness CLI. Those have their own
-# installers and their own authentication, and the deploy op only ever
-# *resolves* `buzz-acp` on the host's PATH (`command -v`, exit 90 on failure) —
-# nothing in the desktop ships the binary. Installing it stays an operator step.
+# It does NOT install `buzz-acp` or any harness CLI. Harness CLIs have their own
+# installers and their own authentication, and stay an operator step. `buzz-acp`
+# the deploy op resolves — on the host's PATH or at ~/.local/bin/buzz-acp — and
+# *installs* when it resolves none and the desktop supplied a binary to push
+# (`BUZZ_ACP_PUSH_BINARY`, see docs/remote-agents.md). With no binary supplied,
+# deploy still fails with exit 90 and this preflight is what you run first.
 #
 # Exit 0 when the mandatory set is green (lingering, ~/.local/bin, systemd
 # --user); 1 otherwise. Everything else is reported as a note, never a failure.
