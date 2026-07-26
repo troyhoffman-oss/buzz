@@ -66,10 +66,7 @@ import {
   selectionOnRuntimeChange,
   type RuntimeModelProviderSelection,
 } from "./runtimeModelProviderSelection";
-import {
-  MODEL_DISCOVERY_LOADING_VALUE,
-  usePersonaModelDiscovery,
-} from "./usePersonaModelDiscovery";
+import { MODEL_DISCOVERY_LOADING_VALUE } from "./usePersonaModelDiscovery";
 import { useBakedBuildEnvKeysQuery, useRuntimeFileConfigQuery } from "../hooks";
 import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
@@ -86,6 +83,8 @@ import {
 } from "./agentAiConfigurationPolicy";
 import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { buildRuntimeModelProviderPayload } from "./agentDefinitionSubmitPayload";
+import { useRemoteAwareModelDiscovery } from "./useRemoteAwareModelDiscovery";
+import type { RemoteModelDiscoveryView } from "./whereToRunIntent";
 
 type AgentDefinitionDialogProps = {
   open: boolean;
@@ -101,8 +100,12 @@ type AgentDefinitionDialogProps = {
   onSubmit: (
     input: CreatePersonaInput | UpdatePersonaInput,
   ) => Promise<unknown>;
-  /** Rendered below the form fields in create mode only ("Where to run"). */
-  createRunSection?: React.ReactNode;
+  /**
+   * Rendered below the form fields in create mode only ("Where to run"). A
+   * render prop because the section's host model probe must carry the
+   * definition's credential env, which lives in this component's state.
+   */
+  createRunSection?: (args: { envVars: EnvVarsValue }) => React.ReactNode;
   /** Extra create-mode submit gate (e.g. incomplete provider config). */
   createSubmitBlocked?: boolean;
   /**
@@ -112,6 +115,13 @@ type AgentDefinitionDialogProps = {
    * remote-only harness unsubmittable.
    */
   createRunsRemotely?: boolean;
+  /**
+   * The picked remote harness's model catalog, read from the HOST. Non-null
+   * only for a provider create with a harness picked; it then REPLACES local
+   * model discovery, because the local catalog answers for this computer and
+   * the agent is not going to run here.
+   */
+  createRemoteModelDiscovery?: RemoteModelDiscoveryView | null;
 };
 
 const ADVANCED_FIELDS_MOTION_TRANSITION = {
@@ -134,6 +144,7 @@ export function AgentDefinitionDialog({
   createRunSection,
   createSubmitBlocked = false,
   createRunsRemotely = false,
+  createRemoteModelDiscovery = null,
 }: AgentDefinitionDialogProps) {
   const [displayName, setDisplayName] = React.useState("");
   const [aiDefaultsOpen, setAiDefaultsOpen] = React.useState(false);
@@ -466,8 +477,12 @@ export function AgentDefinitionDialog({
   } = apiKeyFieldState;
   const providerIsRequired =
     aiConfigurationMode === "custom" && runtimeCanChooseLlmProvider;
+  // A remote create has no local runtime to key the field off — its harness
+  // lives on the host — so the host's own catalog makes the field meaningful.
   const modelFieldVisible =
-    runtime.trim().length > 0 || blankRuntimeModelProviderEditable;
+    runtime.trim().length > 0 ||
+    blankRuntimeModelProviderEditable ||
+    createRemoteModelDiscovery !== null;
   const isExplicitModelRequired = aiConfigurationMode === "custom";
   // Gate the provider requirement on the field's actual visibility, not the raw
   // runtime capability. Codex/Claude hide the provider picker (they drive their
@@ -503,28 +518,26 @@ export function AgentDefinitionDialog({
     customAiPairSatisfied &&
     !isAvatarUploadPending;
 
-  // Merge global env as the base layer so credential keys satisfied via global
-  // config are available to model discovery — same rationale as in AgentInstanceEditDialog.
-  const envVarsForDiscovery = React.useMemo(
-    () => ({ ...globalConfig.env_vars, ...envVars }),
-    [globalConfig.env_vars, envVars],
-  );
   const {
     discoveredModelOptions,
     modelDiscoveryLoading,
     modelDiscoveryStatus,
-  } = usePersonaModelDiscovery({
-    envVars: envVarsForDiscovery,
-    isCustomProviderEditing,
-    modelFieldVisible,
-    open,
-    // Gate provider by runtime: runtimes that don't support LLM provider
-    // selection (codex, claude) must not inherit the global provider — doing
-    // so causes them to discover models from the wrong provider.
-    provider: runtimeSupportsLlmProviderSelection(runtime)
-      ? effectiveProvider
-      : "",
-    selectedRuntime,
+  } = useRemoteAwareModelDiscovery({
+    local: {
+      envVars,
+      globalEnvVars: globalConfig.env_vars,
+      isCustomProviderEditing,
+      modelFieldVisible,
+      open,
+      provider: effectiveProvider,
+      runtime,
+      selectedRuntime,
+    },
+    remote: createRemoteModelDiscovery,
+    onHarnessChange: () => {
+      setModel("");
+      setIsCustomModelEditing(false);
+    },
   });
   const staticModelOptions = getPersonaModelOptions(runtime, effectiveProvider);
   const runtimeModelOptions = getRuntimePersonaModelOptions(runtime);
@@ -949,7 +962,7 @@ export function AgentDefinitionDialog({
               returnFocusRef={aiDefaultsTriggerRef}
             />
 
-            {isCreateMode ? createRunSection : null}
+            {isCreateMode ? createRunSection?.({ envVars }) : null}
 
             <div className="space-y-3">
               <button

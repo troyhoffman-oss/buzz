@@ -5,9 +5,12 @@ import { useBackendProvidersQuery } from "@/features/agents/hooks";
 import {
   discoverProviderHarnesses,
   probeBackendProvider,
+  probeProviderModels,
 } from "@/shared/api/tauri";
+import type { RemoteHarness } from "@/shared/api/types";
 import { Button } from "@/shared/ui/button";
 
+import type { EnvVarsValue } from "./EnvVarsEditor";
 import {
   coerceConfigValues,
   ProviderConfigFields,
@@ -21,10 +24,18 @@ import {
 /** Optional remote-backend selector. Buzz shared compute is an LLM provider, not a run destination. */
 export function WhereToRunSection({
   draft,
+  envVars,
   isPending,
   onDraftChange,
 }: {
   draft: WhereToRunDraft;
+  /**
+   * The definition's credential env, forwarded to the host's model probe. A
+   * remote harness resolves its catalog from an API key exactly as the local
+   * one does, so without these an Anthropic-backed harness would answer with
+   * an auth error rather than a model list.
+   */
+  envVars: EnvVarsValue;
   isPending: boolean;
   onDraftChange: (next: WhereToRunDraft) => void;
 }) {
@@ -46,6 +57,13 @@ export function WhereToRunSection({
   // probe): the provider selection is the only thing that should re-probe.
   const draftRef = React.useRef(draft);
   draftRef.current = draft;
+  // Read at call time for the same reason the harness catalog is: an env edit
+  // must not open an SSH connection per keystroke.
+  const envVarsRef = React.useRef(envVars);
+  envVarsRef.current = envVars;
+  // Discards a model probe that resolves after a newer one was started (the
+  // user re-picked, or re-checked the host, while the first was in flight).
+  const modelProbeRequestRef = React.useRef(0);
 
   React.useEffect(() => {
     if (!isProviderMode || !selectedBackendProvider) {
@@ -84,11 +102,21 @@ export function WhereToRunSection({
     };
   }, [isProviderMode, onDraftChange, selectedBackendProvider]);
 
+  /**
+   * Abandon any in-flight model probe. Its answer describes a host/harness the
+   * draft no longer targets, so landing it would scope the picker to the wrong
+   * machine.
+   */
+  function discardModelProbe() {
+    modelProbeRequestRef.current += 1;
+  }
+
   // Discovery is an explicit action, not an effect on the config fields: it
   // opens a real SSH connection to the host, which must not happen once per
   // keystroke while the address is being typed.
   async function handleDiscoverHarnesses() {
     if (!selectedBackendProvider) return;
+    discardModelProbe();
     setHarnessError(null);
     setIsDiscoveringHarnesses(true);
     try {
@@ -107,21 +135,93 @@ export function WhereToRunSection({
       );
       const firstAvailable =
         keep ?? catalog.harnesses.find((harness) => harness.available) ?? null;
-      onDraftChange({
+      const next = {
         ...draftRef.current,
         remoteHarnesses: catalog.harnesses,
         remoteHarnessId: firstAvailable?.id ?? null,
-      });
+        remoteModelProbe: { status: "idle" } as const,
+      };
+      onDraftChange(next);
       if (!catalog.buzzAcp) {
         setHarnessError(
           "buzz-acp is not installed on that host. The deploy will install it.",
         );
       }
+      // A re-check can change what the auto-picked harness resolves to even
+      // when the id is unchanged (a reinstall, a different PATH entry), so the
+      // catalog read always re-probes rather than trusting a prior result.
+      if (firstAvailable) void probeModels(firstAvailable, next);
     } catch (error: unknown) {
       setHarnessError(error instanceof Error ? error.message : String(error));
     } finally {
       setIsDiscoveringHarnesses(false);
     }
+  }
+
+  /**
+   * Read the picked harness's model catalog FROM THE HOST.
+   *
+   * This is the whole point of the remote path: `get_agent_models` /
+   * `discover_agent_models` answer for this computer, so a model chosen from
+   * their list is validated against the wrong machine — the exact
+   * remote/local confusion a provider-backed create exists to avoid.
+   *
+   * Failure is non-fatal by design. The host's catalog scopes the picker; it
+   * does not gate the create, and the harness's own default remains a valid
+   * choice when the probe cannot run.
+   */
+  async function probeModels(harness: RemoteHarness, base: WhereToRunDraft) {
+    if (!selectedBackendProvider) return;
+    const requestId = modelProbeRequestRef.current + 1;
+    modelProbeRequestRef.current = requestId;
+    // `base` rather than `draftRef.current`: the caller has just published the
+    // harness pick, and React has not re-rendered yet, so the ref still holds
+    // the pre-pick draft. Spreading it here would revert the pick.
+    onDraftChange({ ...base, remoteModelProbe: { status: "loading" } });
+    try {
+      const models = await probeProviderModels(
+        selectedBackendProvider.binaryPath,
+        coerceConfigValues(
+          base.providerConfig,
+          base.probedProvider?.config_schema,
+        ),
+        harness,
+        // The harness's own catalog env rides underneath the definition's, so
+        // a user-set key wins over a default exactly as it does at spawn.
+        { ...harness.env, ...envVarsRef.current },
+      );
+      if (modelProbeRequestRef.current !== requestId) return;
+      onDraftChange({
+        ...draftRef.current,
+        remoteModelProbe: { status: "loaded", models },
+      });
+    } catch (error: unknown) {
+      if (modelProbeRequestRef.current !== requestId) return;
+      onDraftChange({
+        ...draftRef.current,
+        remoteModelProbe: {
+          status: "failed",
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
+  }
+
+  function handleSelectHarness(remoteHarnessId: string) {
+    discardModelProbe();
+    const harness = (draft.remoteHarnesses ?? []).find(
+      (candidate) => candidate.id === remoteHarnessId,
+    );
+    const next = {
+      ...draft,
+      remoteHarnessId,
+      remoteModelProbe: { status: "idle" } as const,
+    };
+    if (!harness) {
+      onDraftChange(next);
+      return;
+    }
+    void probeModels(harness, next);
   }
 
   if (backendProviders.length === 0) return null;
@@ -136,12 +236,13 @@ export function WhereToRunSection({
           className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-xs"
           disabled={isPending}
           id="agent-run-on"
-          onChange={(event) =>
+          onChange={(event) => {
+            discardModelProbe();
             onDraftChange({
               ...emptyWhereToRunDraft,
               runOn: event.target.value,
-            })
-          }
+            });
+          }}
           value={draft.runOn}
         >
           <option value="local">This computer</option>
@@ -174,17 +275,20 @@ export function WhereToRunSection({
           {draft.probedProvider?.config_schema ? (
             <ProviderConfigFields
               config={draft.providerConfig}
-              onChange={(providerConfig) =>
+              onChange={(providerConfig) => {
+                discardModelProbe();
                 onDraftChange({
                   ...draft,
                   providerConfig,
                   // Config edits invalidate a catalog read from the previous
                   // host — a stale pin would deploy a command that may not
-                  // exist on the new one.
+                  // exist on the new one, and stale models would scope the
+                  // picker to a machine the agent is no longer going to.
                   remoteHarnesses: null,
                   remoteHarnessId: null,
-                })
-              }
+                  remoteModelProbe: { status: "idle" },
+                });
+              }}
               schema={draft.probedProvider.config_schema}
             />
           ) : null}
@@ -195,9 +299,7 @@ export function WhereToRunSection({
             isDiscovering={isDiscoveringHarnesses}
             isPending={isPending}
             onDiscover={() => void handleDiscoverHarnesses()}
-            onSelect={(remoteHarnessId) =>
-              onDraftChange({ ...draft, remoteHarnessId })
-            }
+            onSelect={handleSelectHarness}
           />
         </div>
       ) : null}

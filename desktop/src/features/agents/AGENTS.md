@@ -102,6 +102,19 @@ with a TypeScript lookup table or an id comparison in a component.
    Edit. In Edit,
    selecting Custom command keeps its required command field beside the harness
    picker rather than hiding it in Advanced.
+10. **A remote create's models come from the host, never from this computer.**
+    When "Where to run" targets a backend provider and a harness is picked from
+    the host's catalog, `WhereToRunSection` calls `probeProviderModels`
+    (`probe_provider_models`, guarded by `resolve_discovered_provider`) and
+    parks the result in `WhereToRunDraft.remoteModelProbe`.
+    `remoteModelDiscoveryView()` projects it into the exact shape
+    `usePersonaModelDiscovery` returns, and `useRemoteAwareModelDiscovery`
+    substitutes it for the local one — the two are never merged (different
+    machines; the union would offer models the chosen harness cannot run) and
+    local discovery is suppressed entirely while the host owns the control.
+    Changing the picked harness resets the model for the same reason changing
+    the local runtime does. Do not add a remote-specific rendering path in
+    `PersonaModelField`: keep the substitution at the discovery seam.
 
 ## The tests that enforce this
 
@@ -112,6 +125,10 @@ with a TypeScript lookup table or an id comparison in a component.
   `shouldRenderModelControl` (successful-empty omit vs failure keep). If this
   fails, you probably reintroduced a per-surface flag or conflated empty with
   failed discovery.
+- `ui/whereToRunIntent.test.mjs` — the remote create's submit gate and
+  `remoteModelDiscoveryView` (idle/loading/failed/loaded/empty-catalog). If the
+  Model control starts offering this computer's models to a remote harness,
+  these are the tests that should have caught it.
 - `ui/usePersonaModelDiscovery.test.mjs` — `synthesizeEmptyDiscoveryStatus`,
   `isCacheableDiscoveryResponse`, `deriveModelDiscoveryPending`,
   `isSuccessfulEmptyDiscovery`. If the "reopen to retry" copy becomes inert

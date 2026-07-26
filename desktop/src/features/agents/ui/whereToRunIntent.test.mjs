@@ -5,6 +5,7 @@ import {
   canSubmitWhereToRun,
   emptyWhereToRunDraft,
   providerConfigComplete,
+  remoteModelDiscoveryView,
   resolveBackendIntent,
   selectedRemoteHarness,
 } from "./whereToRunIntent.ts";
@@ -112,4 +113,98 @@ test("local drafts never carry a remote harness", () => {
     selectedRemoteHarness({ ...providerDraft(), runOn: "local" }),
     null,
   );
+});
+
+function modelsResponse(overrides = {}) {
+  return {
+    agentName: "Goose",
+    agentVersion: "1.2.0",
+    models: [{ id: "gpt-5", name: "GPT-5" }],
+    agentDefaultModel: "gpt-5",
+    selectedModel: null,
+    supportsSwitching: true,
+    ...overrides,
+  };
+}
+
+// The whole point of the remote probe: a local draft, or one without a picked
+// harness, has nothing to have probed, so the local discovery path keeps
+// owning the Model control.
+test("model discovery view is null without a picked remote harness", () => {
+  assert.equal(remoteModelDiscoveryView(emptyWhereToRunDraft), null);
+  assert.equal(
+    remoteModelDiscoveryView(providerDraft({ remoteHarnessId: null })),
+    null,
+  );
+  assert.equal(
+    remoteModelDiscoveryView({ ...providerDraft(), runOn: "local" }),
+    null,
+  );
+});
+
+test("an unprobed harness leaves the model control to the local path", () => {
+  assert.equal(
+    remoteModelDiscoveryView(
+      providerDraft({ remoteModelProbe: { status: "idle" } }),
+    ),
+    null,
+  );
+});
+
+test("an in-flight probe reports loading with no options and no status", () => {
+  assert.deepEqual(
+    remoteModelDiscoveryView(
+      providerDraft({ remoteModelProbe: { status: "loading" } }),
+    ),
+    {
+      harnessId: "goose",
+      discoveredModelOptions: null,
+      modelDiscoveryLoading: true,
+      modelDiscoveryStatus: null,
+    },
+  );
+});
+
+test("a loaded probe offers the host's models plus a default row", () => {
+  const view = remoteModelDiscoveryView(
+    providerDraft({
+      remoteModelProbe: { status: "loaded", models: modelsResponse() },
+    }),
+  );
+  assert.equal(view.harnessId, "goose");
+  assert.equal(view.modelDiscoveryLoading, false);
+  assert.equal(view.modelDiscoveryStatus, null);
+  assert.deepEqual(view.discoveredModelOptions, [
+    { id: "", label: "Default model (gpt-5)" },
+    { id: "gpt-5", label: "GPT-5" },
+  ]);
+});
+
+// A failed probe must not fall back to this computer's catalog: it would
+// scope the picker to models the remote harness cannot run.
+test("a failed probe surfaces host-specific copy and no options", () => {
+  const view = remoteModelDiscoveryView(
+    providerDraft({
+      remoteModelProbe: { status: "failed", error: "ssh: connection refused" },
+    }),
+  );
+  assert.equal(view.discoveredModelOptions, null);
+  assert.equal(view.modelDiscoveryLoading, false);
+  assert.equal(view.modelDiscoveryStatus.tone, "warning");
+  assert.match(view.modelDiscoveryStatus.message, /ssh: connection refused/);
+});
+
+test("a harness that reports no models warns about the host, not this machine", () => {
+  const view = remoteModelDiscoveryView(
+    providerDraft({
+      remoteModelProbe: {
+        status: "loaded",
+        models: modelsResponse({ models: [], agentDefaultModel: null }),
+      },
+    }),
+  );
+  assert.equal(view.discoveredModelOptions, null);
+  assert.equal(view.modelDiscoveryStatus.tone, "warning");
+  assert.match(view.modelDiscoveryStatus.message, /Goose reported no models/);
+  assert.match(view.modelDiscoveryStatus.message, /on the host/);
 });
