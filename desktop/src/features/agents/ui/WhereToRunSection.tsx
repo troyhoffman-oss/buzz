@@ -201,8 +201,12 @@ export function WhereToRunSection({
       };
       onDraftChange(next);
       if (!catalog.buzzAcp) {
+        // Deploy installs buzz-acp only when this desktop has a binary to
+        // push (see docs/remote-agents.md); without one it fails with install
+        // guidance. The copy promises the union honestly rather than guessing
+        // which case applies from here.
         setHarnessError(
-          "buzz-acp is not installed on that host. The deploy will install it.",
+          "buzz-acp is not installed on that host. Deploy will install it or explain how to.",
         );
       }
       // A re-check can change what the auto-picked harness resolves to even
