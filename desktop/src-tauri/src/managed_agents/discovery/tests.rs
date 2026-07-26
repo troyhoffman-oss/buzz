@@ -667,6 +667,8 @@ fn apply_agent_command_update_concrete_pin_keeps_materialized_runtime() {
 
 // ── probe_codex_acp_major_version ─────────────────────────────────────────────
 
+mod codex_version;
+mod create_time_args;
 mod managed_path_resolution;
 
 #[cfg(unix)]
@@ -690,8 +692,6 @@ fn probe_codex_acp_major_version_parses_1x_output() {
 
     assert_eq!(major, Some(1), "1.x adapter must return major version 1");
 }
-
-mod codex_version;
 
 #[cfg(unix)]
 #[test]

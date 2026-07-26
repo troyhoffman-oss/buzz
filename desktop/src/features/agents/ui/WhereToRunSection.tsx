@@ -2,6 +2,7 @@ import { AlertTriangle, Loader2 } from "lucide-react";
 import * as React from "react";
 
 import { useBackendProvidersQuery } from "@/features/agents/hooks";
+import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import {
   discoverProviderHarnesses,
   probeBackendProvider,
@@ -33,13 +34,16 @@ export function WhereToRunSection({
    * The definition's credential env, forwarded to the host's model probe. A
    * remote harness resolves its catalog from an API key exactly as the local
    * one does, so without these an Anthropic-backed harness would answer with
-   * an auth error rather than a model list.
+   * an auth error rather than a model list. Passed in (rather than read here)
+   * because it is unsaved dialog state; the global layer beneath it is a
+   * shared query, so this component reads that itself.
    */
   envVars: EnvVarsValue;
   isPending: boolean;
   onDraftChange: (next: WhereToRunDraft) => void;
 }) {
   const backendProviders = useBackendProvidersQuery().data ?? [];
+  const { globalConfig } = useGlobalAgentConfig();
   const [probeError, setProbeError] = React.useState<string | null>(null);
   const [harnessError, setHarnessError] = React.useState<string | null>(null);
   const [isDiscoveringHarnesses, setIsDiscoveringHarnesses] =
@@ -59,11 +63,20 @@ export function WhereToRunSection({
   draftRef.current = draft;
   // Read at call time for the same reason the harness catalog is: an env edit
   // must not open an SSH connection per keystroke.
-  const envVarsRef = React.useRef(envVars);
-  envVarsRef.current = envVars;
-  // Discards a model probe that resolves after a newer one was started (the
-  // user re-picked, or re-checked the host, while the first was in flight).
-  const modelProbeRequestRef = React.useRef(0);
+  //
+  // Global sits UNDER the definition's env, the same order `provider_deploy`
+  // merges on the host. Without the global layer a key satisfied globally —
+  // which the dialog then shows as inherited, with no required marker, so the
+  // user has no reason to restate it — never reaches the probe, and the host
+  // answers the model request with an auth error for a credential that is in
+  // fact configured.
+  const probeEnvRef = React.useRef<EnvVarsValue>({});
+  probeEnvRef.current = { ...globalConfig.env_vars, ...envVars };
+  // Serial number of the newest host request. Every catalog read and model
+  // probe claims one at its start and re-checks it after each await; anything
+  // that moves the draft off the host/harness a request was made for bumps it,
+  // so the stale continuation drops its answer instead of writing it back.
+  const hostRequestRef = React.useRef(0);
 
   React.useEffect(() => {
     if (!isProviderMode || !selectedBackendProvider) {
@@ -89,7 +102,12 @@ export function WhereToRunSection({
         onDraftChange({
           ...draftRef.current,
           probedProvider: result,
-          providerConfig: defaults,
+          // Schema defaults are seeded UNDERNEATH what the user has typed.
+          // The probe is a round-trip to the provider binary and re-runs
+          // whenever it resolves anew, so overwriting here would wipe an
+          // address mid-edit. A provider switch empties the draft, so on the
+          // first probe of a provider this is exactly `defaults`.
+          providerConfig: { ...defaults, ...draftRef.current.providerConfig },
         });
       })
       .catch((error: unknown) => {
@@ -103,12 +121,19 @@ export function WhereToRunSection({
   }, [isProviderMode, onDraftChange, selectedBackendProvider]);
 
   /**
-   * Abandon any in-flight model probe. Its answer describes a host/harness the
-   * draft no longer targets, so landing it would scope the picker to the wrong
-   * machine.
+   * Abandon every in-flight host request. Their answers describe a
+   * host/harness the draft no longer targets, so landing one would scope the
+   * picker to the wrong machine — or, for a model probe, ship the definition's
+   * credentials to a host under a harness command never verified there.
    */
-  function discardModelProbe() {
-    modelProbeRequestRef.current += 1;
+  function discardHostRequests() {
+    hostRequestRef.current += 1;
+  }
+
+  /** Claim the newest request id, invalidating anything already in flight. */
+  function startHostRequest(): number {
+    discardHostRequests();
+    return hostRequestRef.current;
   }
 
   // Discovery is an explicit action, not an effect on the config fields: it
@@ -116,17 +141,24 @@ export function WhereToRunSection({
   // keystroke while the address is being typed.
   async function handleDiscoverHarnesses() {
     if (!selectedBackendProvider) return;
-    discardModelProbe();
+    const requestId = startHostRequest();
     setHarnessError(null);
     setIsDiscoveringHarnesses(true);
     try {
+      const config = coerceConfigValues(
+        draftRef.current.providerConfig,
+        draftRef.current.probedProvider?.config_schema,
+      );
       const catalog = await discoverProviderHarnesses(
         selectedBackendProvider.binaryPath,
-        coerceConfigValues(
-          draftRef.current.providerConfig,
-          draftRef.current.probedProvider?.config_schema,
-        ),
+        config,
       );
+      // The config can be edited (or the provider re-picked) while this read
+      // is open. That answer then describes an abandoned host: re-installing
+      // its catalog would resurrect a pin the edit deliberately cleared, and
+      // the probe below would send credentials to the NEW host under the OLD
+      // host's harness command. Drop it.
+      if (hostRequestRef.current !== requestId) return;
       // Keep an existing pick when a re-check still offers it; otherwise fall
       // to the first available so the common case needs no extra interaction.
       const previous = draftRef.current.remoteHarnessId;
@@ -152,8 +184,13 @@ export function WhereToRunSection({
       // catalog read always re-probes rather than trusting a prior result.
       if (firstAvailable) void probeModels(firstAvailable, next);
     } catch (error: unknown) {
+      if (hostRequestRef.current !== requestId) return;
       setHarnessError(error instanceof Error ? error.message : String(error));
     } finally {
+      // Unconditional: the button is disabled while this flag is set, so no
+      // second catalog read can be in flight to own it — and the model probe
+      // started just above deliberately claims a newer id. Guarding here would
+      // strand "Checking host…" on screen with no way to retry.
       setIsDiscoveringHarnesses(false);
     }
   }
@@ -172,8 +209,7 @@ export function WhereToRunSection({
    */
   async function probeModels(harness: RemoteHarness, base: WhereToRunDraft) {
     if (!selectedBackendProvider) return;
-    const requestId = modelProbeRequestRef.current + 1;
-    modelProbeRequestRef.current = requestId;
+    const requestId = startHostRequest();
     // `base` rather than `draftRef.current`: the caller has just published the
     // harness pick, and React has not re-rendered yet, so the ref still holds
     // the pre-pick draft. Spreading it here would revert the pick.
@@ -186,17 +222,17 @@ export function WhereToRunSection({
           base.probedProvider?.config_schema,
         ),
         harness,
-        // The harness's own catalog env rides underneath the definition's, so
-        // a user-set key wins over a default exactly as it does at spawn.
-        { ...harness.env, ...envVarsRef.current },
+        // The harness's own catalog env rides underneath the user's, so a
+        // user-set key wins over a default exactly as it does at spawn.
+        { ...harness.env, ...probeEnvRef.current },
       );
-      if (modelProbeRequestRef.current !== requestId) return;
+      if (hostRequestRef.current !== requestId) return;
       onDraftChange({
         ...draftRef.current,
         remoteModelProbe: { status: "loaded", models },
       });
     } catch (error: unknown) {
-      if (modelProbeRequestRef.current !== requestId) return;
+      if (hostRequestRef.current !== requestId) return;
       onDraftChange({
         ...draftRef.current,
         remoteModelProbe: {
@@ -208,7 +244,7 @@ export function WhereToRunSection({
   }
 
   function handleSelectHarness(remoteHarnessId: string) {
-    discardModelProbe();
+    discardHostRequests();
     const harness = (draft.remoteHarnesses ?? []).find(
       (candidate) => candidate.id === remoteHarnessId,
     );
@@ -237,7 +273,7 @@ export function WhereToRunSection({
           disabled={isPending}
           id="agent-run-on"
           onChange={(event) => {
-            discardModelProbe();
+            discardHostRequests();
             onDraftChange({
               ...emptyWhereToRunDraft,
               runOn: event.target.value,
@@ -276,7 +312,7 @@ export function WhereToRunSection({
             <ProviderConfigFields
               config={draft.providerConfig}
               onChange={(providerConfig) => {
-                discardModelProbe();
+                discardHostRequests();
                 onDraftChange({
                   ...draft,
                   providerConfig,

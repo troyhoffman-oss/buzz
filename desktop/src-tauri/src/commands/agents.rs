@@ -4,11 +4,11 @@ use tauri::{AppHandle, State};
 use crate::{
     app_state::AppState,
     managed_agents::{
-        build_managed_agent_summary, current_instance_id, discover_provider_candidates,
-        ensure_persona_is_active, find_managed_agent_mut, load_managed_agents, load_personas,
-        load_teams, managed_agent_avatar_url, managed_agents_base_dir, normalize_agent_args,
-        provider_deploy, resolve_provider_binary, save_managed_agents, start_managed_agent_process,
-        stop_managed_agent_process, stop_managed_agent_workspace_pair,
+        build_managed_agent_summary, create_time_agent_args, current_instance_id,
+        discover_provider_candidates, ensure_persona_is_active, find_managed_agent_mut,
+        load_managed_agents, load_personas, load_teams, managed_agent_avatar_url,
+        managed_agents_base_dir, provider_deploy, resolve_provider_binary, save_managed_agents,
+        start_managed_agent_process, stop_managed_agent_process, stop_managed_agent_workspace_pair,
         sync_managed_agent_processes, try_regenerate_nest, validate_provider_config, BackendKind,
         CreateManagedAgentRequest, CreateManagedAgentResponse, ManagedAgentRecord,
         ManagedAgentSummary, RelayMeshConfig, DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM,
@@ -731,15 +731,10 @@ pub async fn create_managed_agent(
             &personas,
             agent_command_override.as_deref(),
         );
-        let agent_args = normalize_agent_args(
-            &agent_command,
-            input
-                .agent_args
-                .iter()
-                .map(|arg| arg.trim().to_string())
-                .filter(|arg| !arg.is_empty())
-                .collect::<Vec<_>>(),
-        );
+        // Local args are normalized against the LOCAL runtime catalog; a
+        // provider create's are pinned from the remote host's catalog. See
+        // `create_time_agent_args` for why the two must not share a path.
+        let agent_args = create_time_agent_args(&input.backend, &agent_command, &input.agent_args);
 
         // Derive MCP command exclusively from the runtime catalog — the
         // per-record field is never read at spawn time so user-supplied input

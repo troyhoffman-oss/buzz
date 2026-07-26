@@ -108,6 +108,21 @@ test("a harness id with no matching catalog entry does not unblock submit", () =
   );
 });
 
+// An unavailable entry names a harness the host reported as NOT installed.
+// Pinning it would ship a command that fails at deploy time, after the create
+// has already reported success — so it can never become the selection, even
+// though a re-check can turn a live pick unavailable while it is still set.
+test("an unavailable harness can never become the pin", () => {
+  const stale = providerDraft({
+    remoteHarnesses: [{ ...gooseHarness, available: false }],
+  });
+
+  assert.equal(selectedRemoteHarness(stale), null);
+  assert.equal(canSubmitWhereToRun(stale), false);
+  assert.equal(resolveBackendIntent(stale).harness, undefined);
+  assert.equal(remoteModelDiscoveryView(stale), null);
+});
+
 test("local drafts never carry a remote harness", () => {
   assert.equal(
     selectedRemoteHarness({ ...providerDraft(), runOn: "local" }),
@@ -192,6 +207,9 @@ test("a failed probe surfaces host-specific copy and no options", () => {
   assert.equal(view.modelDiscoveryLoading, false);
   assert.equal(view.modelDiscoveryStatus.tone, "warning");
   assert.match(view.modelDiscoveryStatus.message, /ssh: connection refused/);
+  // The probe reads env at call time, so typing a missing key afterwards does
+  // not re-probe by itself. Name the retry or the auth case is a dead end.
+  assert.match(view.modelDiscoveryStatus.message, /check the host again/);
 });
 
 test("a harness that reports no models warns about the host, not this machine", () => {

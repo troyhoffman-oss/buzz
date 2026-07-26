@@ -4,9 +4,8 @@ import type {
   BackendProviderProbeResult,
   RemoteHarness,
 } from "@/shared/api/types";
-import type { PersonaModelOption } from "./agentConfigOptions";
-import type { PersonaModelDiscoveryStatus } from "./personaModelDiscoveryStatus";
 import { coerceConfigValues } from "./ProviderConfigFields";
+import type { ModelDiscoveryView } from "./useRemoteAwareModelDiscovery";
 import { getDiscoveredPersonaModelOptions } from "./usePersonaModelDiscovery";
 
 /**
@@ -61,14 +60,23 @@ export function providerConfigComplete(draft: WhereToRunDraft): boolean {
   );
 }
 
-/** The picked remote harness, or null when none is selected/available. */
+/**
+ * The picked remote harness, or null when none is selected/available.
+ *
+ * Only an `available` catalog entry can be the pick. An unavailable entry names
+ * a harness the host reported as not installed, so pinning it would ship a
+ * command that fails at deploy time — after the create has already succeeded.
+ * The picker never offers those entries, but a re-check can turn a previously
+ * available id unavailable while it is still selected, so the narrowing lives
+ * here (the single owner of "what is pinned") rather than in the component.
+ */
 export function selectedRemoteHarness(
   draft: WhereToRunDraft,
 ): RemoteHarness | null {
   if (draft.runOn === "local" || !draft.remoteHarnessId) return null;
   return (
     draft.remoteHarnesses?.find(
-      (harness) => harness.id === draft.remoteHarnessId,
+      (harness) => harness.available && harness.id === draft.remoteHarnessId,
     ) ?? null
   );
 }
@@ -81,11 +89,8 @@ export function selectedRemoteHarness(
  * rendering path. `harnessId` is the reset key: changing the harness resets
  * the dependent model exactly as changing the local one does.
  */
-export type RemoteModelDiscoveryView = {
+export type RemoteModelDiscoveryView = ModelDiscoveryView & {
   harnessId: string;
-  discoveredModelOptions: readonly PersonaModelOption[] | null;
-  modelDiscoveryLoading: boolean;
-  modelDiscoveryStatus: PersonaModelDiscoveryStatus | null;
 };
 
 /**
@@ -124,7 +129,10 @@ export function remoteModelDiscoveryView(
       ...base,
       discoveredModelOptions: null,
       modelDiscoveryStatus: {
-        message: `Could not load models from the host: ${probe.error}`,
+        // Name the retry explicitly. The probe reads the definition's env at
+        // call time, so typing a missing API key afterwards does not re-probe
+        // by itself — without this the auth-error case looks like a dead end.
+        message: `Could not load models from the host: ${probe.error}. Fix it on the host (or in this agent's credentials), then check the host again.`,
         tone: "warning",
       },
     };

@@ -31,13 +31,42 @@ type LocalModelDiscoveryInput = {
 };
 
 /**
+ * Whether the host owns the Model control, so this computer's discovery must
+ * not run at all.
+ *
+ * Running a local CLI to describe a machine the agent will never run on is
+ * pure noise and needless credential use, and its answer could only ever be
+ * rendered by merging two machines' catalogs — which
+ * [`resolveModelDiscovery`] refuses to do.
+ */
+export function shouldSuppressLocalDiscovery(
+  remote: RemoteModelDiscoveryView | null,
+): boolean {
+  return remote !== null;
+}
+
+/**
+ * Pick the catalog of the machine the agent will actually run on.
+ *
+ * The two are never merged: they come from different computers, so their union
+ * would offer models the chosen harness cannot run. Once the host has
+ * answered, its catalog wins outright — including its loading and failure
+ * states, which describe the host rather than this laptop.
+ */
+export function resolveModelDiscovery(
+  remote: RemoteModelDiscoveryView | null,
+  local: ModelDiscoveryView,
+): ModelDiscoveryView {
+  return remote ?? local;
+}
+
+/**
  * Resolve the model catalog of the machine the agent will actually run on.
  *
- * The two catalogs are never merged: they come from different computers, so
- * their union would offer models the chosen harness cannot run. Once the host
- * has answered, its catalog wins outright — and local discovery is suppressed
- * entirely, since running a CLI here to describe a machine the agent will
- * never run on is pure noise (and needless credential use).
+ * The substitution itself is [`resolveModelDiscovery`] and the local-discovery
+ * suppression is [`shouldSuppressLocalDiscovery`]; both are pure so the
+ * remote/local seam is covered by `useRemoteAwareModelDiscovery.test.mjs`
+ * rather than only by reading this hook.
  *
  * Switching harnesses invalidates the selected model for the same reason
  * switching the local runtime does — the id came from the previous harness's
@@ -62,7 +91,8 @@ export function useRemoteAwareModelDiscovery({
   const localDiscovery = usePersonaModelDiscovery({
     envVars,
     isCustomProviderEditing: local.isCustomProviderEditing,
-    modelFieldVisible: local.modelFieldVisible && remote === null,
+    modelFieldVisible:
+      local.modelFieldVisible && !shouldSuppressLocalDiscovery(remote),
     open: local.open,
     // Gate provider by runtime: runtimes that don't choose their own LLM
     // provider (codex, claude) must not inherit the global one — doing so
@@ -86,5 +116,5 @@ export function useRemoteAwareModelDiscovery({
     onHarnessChangeRef.current();
   }, [harnessId]);
 
-  return remote ?? localDiscovery;
+  return resolveModelDiscovery(remote, localDiscovery);
 }

@@ -164,11 +164,13 @@ export function usePersonaActions() {
         } catch (error) {
           // Surface the resolver's own message rather than a second copy of
           // the policy: it is the single owner of when a create is refused,
-          // and a local paraphrase here would drift from it.
+          // and a local paraphrase here would drift from it. The fallback
+          // names the harness — the only thing this path can refuse — rather
+          // than the LLM provider, which it never inspects.
           setPersonaErrorMessage(
             error instanceof Error
               ? error.message
-              : "Choose an available runtime for this agent.",
+              : "Choose an available harness for this agent.",
           );
           return false;
         }

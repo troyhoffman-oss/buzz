@@ -108,13 +108,35 @@ with a TypeScript lookup table or an id comparison in a component.
     (`probe_provider_models`, guarded by `resolve_discovered_provider`) and
     parks the result in `WhereToRunDraft.remoteModelProbe`.
     `remoteModelDiscoveryView()` projects it into the exact shape
-    `usePersonaModelDiscovery` returns, and `useRemoteAwareModelDiscovery`
-    substitutes it for the local one — the two are never merged (different
-    machines; the union would offer models the chosen harness cannot run) and
-    local discovery is suppressed entirely while the host owns the control.
-    Changing the picked harness resets the model for the same reason changing
-    the local runtime does. Do not add a remote-specific rendering path in
+    `usePersonaModelDiscovery` returns (`RemoteModelDiscoveryView` extends
+    `ModelDiscoveryView` so the compiler holds them together), and
+    `useRemoteAwareModelDiscovery` substitutes it for the local one — the two
+    are never merged (different machines; the union would offer models the
+    chosen harness cannot run) and local discovery is suppressed entirely while
+    the host owns the control. Both decisions live in pure helpers
+    (`resolveModelDiscovery`, `shouldSuppressLocalDiscovery`) precisely so they
+    are testable without hook infrastructure; keep them that way. Changing the
+    picked harness resets the model for the same reason changing the local
+    runtime does. Do not add a remote-specific rendering path in
     `PersonaModelField`: keep the substitution at the discovery seam.
+11. **Every host round-trip carries a request id.** `WhereToRunSection` opens
+    real SSH connections (`discoverProviderHarnesses`, `probeProviderModels`).
+    Both claim `hostRequestRef` at their start and re-check it after every
+    await; anything that moves the draft off the host they were made for
+    (provider switch, config edit, re-pick, re-check) bumps it. Without that
+    re-check on the CATALOG read, a config edit made mid-flight lets the old
+    host's catalog reinstall itself and then fires a credential-carrying model
+    probe at the NEW host under the OLD host's harness command. A new
+    host-touching call gets the same treatment — do not add one that only
+    guards its own continuation.
+12. **The pinned harness must be an `available` catalog entry.**
+    `selectedRemoteHarness` filters on `available`, so an id that a re-check
+    turned unavailable stops being the pin rather than deploying a command the
+    host says is not installed. Likewise the create-time args of a provider
+    record are pinned verbatim (`create_time_agent_args`): normalizing them
+    would compare a REMOTE command against LOCAL runtime identity, and a host
+    binary sharing a basename with a local runtime would have its explicit
+    args silently rewritten.
 
 ## The tests that enforce this
 
@@ -125,10 +147,17 @@ with a TypeScript lookup table or an id comparison in a component.
   `shouldRenderModelControl` (successful-empty omit vs failure keep). If this
   fails, you probably reintroduced a per-surface flag or conflated empty with
   failed discovery.
-- `ui/whereToRunIntent.test.mjs` — the remote create's submit gate and
-  `remoteModelDiscoveryView` (idle/loading/failed/loaded/empty-catalog). If the
-  Model control starts offering this computer's models to a remote harness,
-  these are the tests that should have caught it.
+- `ui/whereToRunIntent.test.mjs` — the remote create's submit gate, the
+  available-only harness pin, and `remoteModelDiscoveryView`
+  (idle/loading/failed/loaded/empty-catalog). Covers the PROJECTION of the
+  host's probe, not the substitution that consumes it.
+- `ui/useRemoteAwareModelDiscovery.test.mjs` — `resolveModelDiscovery` and
+  `shouldSuppressLocalDiscovery`. If the Model control starts offering this
+  computer's models to a remote harness, or runs local discovery IPC
+  underneath a live remote catalog, these are the tests that should have
+  caught it. The staleness guard in `WhereToRunSection` itself is NOT covered
+  (no hook/DOM test infrastructure in this workspace — `pnpm test` is bare
+  `node --test`); it is held by rule 11 and review, so read it carefully.
 - `ui/usePersonaModelDiscovery.test.mjs` — `synthesizeEmptyDiscoveryStatus`,
   `isCacheableDiscoveryResponse`, `deriveModelDiscoveryPending`,
   `isSuccessfulEmptyDiscovery`. If the "reopen to retry" copy becomes inert
@@ -137,6 +166,10 @@ with a TypeScript lookup table or an id comparison in a component.
   acceptance coverage for readiness, failure states, defaults, navigation,
   successful-empty vs failed optional-model discovery, and persistence races.
 - Rust: `runtime_metadata_env_vars` tests pin spawn-time key application.
+- Rust: `discovery/tests/create_time_args.rs` — the create-time args authority.
+  Every case asserts the local AND provider backend over the same input,
+  because a remote binary sharing a basename with a local runtime is
+  normalized without complaint otherwise.
 
 ## Keep this file true
 

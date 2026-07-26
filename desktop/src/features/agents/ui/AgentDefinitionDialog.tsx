@@ -102,8 +102,8 @@ type AgentDefinitionDialogProps = {
   ) => Promise<unknown>;
   /**
    * Rendered below the form fields in create mode only ("Where to run"). A
-   * render prop because the section's host model probe must carry the
-   * definition's credential env, which lives in this component's state.
+   * render prop because the section's host model probe must carry this
+   * component's unsaved credential env (it reads the global layer itself).
    */
   createRunSection?: (args: { envVars: EnvVarsValue }) => React.ReactNode;
   /** Extra create-mode submit gate (e.g. incomplete provider config). */
