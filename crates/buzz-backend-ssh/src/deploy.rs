@@ -54,6 +54,7 @@ pub struct Agent {
     pub agent_args: Vec<String>,
     pub system_prompt: Option<String>,
     pub model: Option<String>,
+    pub provider: Option<String>,
     pub idle_timeout_seconds: Option<u64>,
     pub max_turn_duration_seconds: Option<u64>,
     pub parallelism: u64,
@@ -117,6 +118,12 @@ impl Agent {
             agent_args: crate::discover::string_list(agent.get("agent_args")),
             system_prompt: string("system_prompt"),
             model: string("model"),
+            provider: string("provider"),
+            // `turn_timeout_seconds` is deliberately not read: the payload still
+            // carries it, but `BUZZ_ACP_TURN_TIMEOUT` is deprecated and ignored
+            // by the harness (`buzz-acp::config`), and local spawn does not
+            // write it either. `idle_timeout_seconds` and
+            // `max_turn_duration_seconds` are the live controls.
             idle_timeout_seconds: agent.get("idle_timeout_seconds").and_then(|v| v.as_u64()),
             max_turn_duration_seconds: agent
                 .get("max_turn_duration_seconds")
@@ -257,6 +264,12 @@ fn env_file_body(agent: &Agent) -> Result<String, String> {
     if let Some(model) = &agent.model {
         push("BUZZ_ACP_MODEL", model)?;
     }
+    // The harness-native half of the same selection: `BUZZ_ACP_MODEL` is what
+    // buzz-acp reads, these are what the harness underneath it reads, and local
+    // spawn writes both.
+    for (key, value) in metadata_env(agent) {
+        push(key, value)?;
+    }
     // Only when the user set them, so the harness's own defaults win otherwise.
     if let Some(idle) = agent.idle_timeout_seconds {
         push("BUZZ_ACP_IDLE_TIMEOUT", &idle.to_string())?;
@@ -285,6 +298,45 @@ fn env_file_body(agent: &Agent) -> Result<String, String> {
         push(key, value)?;
     }
     Ok(body)
+}
+
+/// The remote half of `runtime_metadata_env_vars` (`runtime.rs`).
+///
+/// Local spawn writes the effective model and provider into each runtime's own
+/// `model_env_var` / `provider_env_var`. Without this a remote Goose would see
+/// `BUZZ_ACP_MODEL` but no `GOOSE_MODEL`, and fall back to whatever
+/// `~/.config/goose/config.yaml` on the host says — the user's model pick
+/// silently ignored.
+///
+/// Keyed by command rather than harness id because the id is a create-time
+/// desktop concept and the env file is written from the pin. Runtimes absent
+/// here (Claude, Codex) declare no such vars in `KNOWN_ACP_RUNTIMES` either.
+fn metadata_env(agent: &Agent) -> Vec<(&'static str, &str)> {
+    const RUNTIME_ENV: &[(&str, &str, &str)] = &[
+        ("goose", "GOOSE_MODEL", "GOOSE_PROVIDER"),
+        ("buzz-agent", "BUZZ_AGENT_MODEL", "BUZZ_AGENT_PROVIDER"),
+    ];
+
+    // The pin may be a bare name or an absolute path; local spawn's
+    // `known_acp_runtime` matches on the file name either way.
+    let command = agent
+        .agent_command
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&agent.agent_command);
+    let Some((_, model_key, provider_key)) =
+        RUNTIME_ENV.iter().find(|(name, _, _)| *name == command)
+    else {
+        return Vec::new();
+    };
+
+    [
+        (*model_key, agent.model.as_deref()),
+        (*provider_key, agent.provider.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| Some((key, value?)))
+    .collect()
 }
 
 /// `wss://relay` → `https://relay`, for the git credential helper's scope.
@@ -446,6 +498,7 @@ mod tests {
                 "agent_args": ["acp"],
                 "system_prompt": "be brief",
                 "model": "claude-sonnet-5",
+                "provider": "anthropic",
                 "parallelism": 3,
                 "respond_to": "owner-only",
                 "respond_to_allowlist": [],
@@ -561,6 +614,48 @@ mod tests {
         assert!(!body.contains("BUZZ_ACP_MAX_TURN_DURATION"));
         // No allowlist key unless the mode asks for one.
         assert!(!body.contains("BUZZ_ACP_RESPOND_TO_ALLOWLIST"));
+    }
+
+    #[test]
+    fn the_harness_sees_the_same_model_env_local_spawn_would_set() {
+        // `runtime_metadata_env_vars` parity: buzz-acp reads BUZZ_ACP_MODEL,
+        // but Goose itself reads GOOSE_MODEL/GOOSE_PROVIDER. Emitting only the
+        // former leaves the host's ~/.config/goose/config.yaml deciding the
+        // model, silently overriding the user's pick.
+        let body = env_file_body(&Agent::from_request(&request()).unwrap()).unwrap();
+        assert!(body.contains(r#"GOOSE_MODEL="claude-sonnet-5""#), "{body}");
+        assert!(body.contains(r#"GOOSE_PROVIDER="anthropic""#), "{body}");
+
+        // An absolute pin resolves to the same runtime — `known_acp_runtime`
+        // matches on the file name locally, so this must too.
+        let mut request = request();
+        request["agent"]["agent_command"] = serde_json::json!("/home/ubuntu/.local/bin/goose");
+        let body = env_file_body(&Agent::from_request(&request).unwrap()).unwrap();
+        assert!(body.contains(r#"GOOSE_MODEL="claude-sonnet-5""#), "{body}");
+
+        // Runtimes that declare no model/provider env upstream get none here.
+        request["agent"]["agent_command"] = serde_json::json!("claude-code-acp");
+        let body = env_file_body(&Agent::from_request(&request).unwrap()).unwrap();
+        assert!(!body.contains("GOOSE_MODEL"));
+        assert!(body.contains(r#"BUZZ_ACP_MODEL="claude-sonnet-5""#));
+
+        // And an unset field writes no key at all, so the harness default wins.
+        request["agent"]["agent_command"] = serde_json::json!("goose");
+        request["agent"]["provider"] = serde_json::json!("");
+        let body = env_file_body(&Agent::from_request(&request).unwrap()).unwrap();
+        assert!(body.contains("GOOSE_MODEL"));
+        assert!(!body.contains("GOOSE_PROVIDER"));
+    }
+
+    #[test]
+    fn the_deprecated_turn_timeout_is_never_written() {
+        // The payload still carries `turn_timeout_seconds` (upstream
+        // `deploy_payload_json`), but `BUZZ_ACP_TURN_TIMEOUT` is deprecated and
+        // ignored by the harness, and local spawn does not write it either.
+        let mut request = request();
+        request["agent"]["turn_timeout_seconds"] = serde_json::json!(320);
+        let body = env_file_body(&Agent::from_request(&request).unwrap()).unwrap();
+        assert!(!body.contains("TURN_TIMEOUT"), "{body}");
     }
 
     #[test]
