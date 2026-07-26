@@ -894,26 +894,44 @@ impl AcpClient {
         self.elicitation_rx = None;
     }
 
-    /// Take the parked question, lowering the flag the main loop checks before
-    /// it routes an owner message as a reply.
+    /// Take the parked question, disarming the shared state the main loop
+    /// checks before it routes an owner message as a reply.
     fn take_pending_elicitation(&mut self) -> Option<PendingElicitation> {
         if let Some(ask) = self.elicitation.as_ref() {
-            ask.set_pending(false);
+            ask.disarm();
         }
         self.pending_elicitation.take()
     }
 
-    /// Publish the parked question's current field and raise the flag that
-    /// tells the main loop to route the owner's next message here.
-    fn ask_parked_elicitation(&self) {
-        if let (Some(ask), Some(pending)) = (&self.elicitation, &self.pending_elicitation) {
-            ask.publish(render_elicitation_field(
-                &pending.fields[pending.asking],
-                pending.asking,
-                pending.fields.len(),
-            ));
-            ask.set_pending(true);
+    /// Publish the parked question's current field and arm the shared state so
+    /// the main loop routes the owner's reply here.
+    ///
+    /// A question that never reached the relay is one nobody can answer, so on
+    /// publish failure the parked request is answered `cancel` immediately —
+    /// the agent reports an aborted tool call within seconds instead of the
+    /// turn parking until its hard cap.
+    async fn ask_parked_elicitation(&mut self) -> Result<(), AcpError> {
+        let (Some(ask), Some(pending)) = (&self.elicitation, &self.pending_elicitation) else {
+            return Ok(());
+        };
+        let body = render_elicitation_field(
+            &pending.fields[pending.asking],
+            pending.asking,
+            pending.fields.len(),
+        );
+        if ask.publish(body).await {
+            return Ok(());
         }
+        let Some(pending) = self.take_pending_elicitation() else {
+            return Ok(());
+        };
+        tracing::warn!(
+            target: "acp::elicitation",
+            "publishing the question for elicitation id={} failed — cancelling it",
+            pending.id
+        );
+        self.write_ndjson(&elicitation_response(&pending.id, "cancel", None))
+            .await
     }
 
     /// Clear any installed steer receiver without consuming it.
@@ -1365,6 +1383,19 @@ impl AcpClient {
             // agent death is still caught immediately by reader EOF.
             let elicitation_parked = self.pending_elicitation.is_some();
 
+            // With no question parked, nothing in the reply channel can be an
+            // answer: it is a reply the main loop sent for a question that was
+            // cancelled (by the agent, or by a failed publish) before the read
+            // loop consumed it. Discard it the moment the question stops being
+            // answerable, so it can neither be misattributed to the next
+            // question nor sit in the capacity-1 channel blocking the main
+            // loop's next `try_send`.
+            if !elicitation_parked {
+                if let Some(rx) = elicitation_rx.as_mut() {
+                    while rx.try_recv().is_ok() {}
+                }
+            }
+
             // Determine which deadline fires first BEFORE sleeping — this is
             // the classification we'll use on timeout, immune to scheduler jitter.
             let idle_fires_first = idle_deadline < hard_deadline && !elicitation_parked;
@@ -1647,15 +1678,6 @@ impl AcpClient {
                                 self.handle_permission_request(&msg).await?;
                             }
                             "elicitation/create" => {
-                                // Discard a reply still queued for an earlier
-                                // question — one the agent cancelled after the
-                                // main loop had already sent the answer. The
-                                // arm is gated on a parked question, so such a
-                                // reply is never read, and it must not be
-                                // misattributed to this new one.
-                                if let Some(rx) = elicitation_rx.as_mut() {
-                                    while rx.try_recv().is_ok() {}
-                                }
                                 self.handle_elicitation_request(&msg, elicitation_rx.is_some())
                                     .await?;
                             }
@@ -1967,8 +1989,7 @@ impl AcpClient {
             asking: 0,
             answers: serde_json::Map::new(),
         });
-        self.ask_parked_elicitation();
-        Ok(())
+        self.ask_parked_elicitation().await
     }
 
     /// Fold an owner reply into the parked elicitation, answering the agent
@@ -1996,8 +2017,7 @@ impl AcpClient {
                 );
                 pending.asking += 1;
                 if pending.asking < pending.fields.len() {
-                    self.ask_parked_elicitation();
-                    return Ok(());
+                    return self.ask_parked_elicitation().await;
                 }
                 let answers = std::mem::take(&mut pending.answers);
                 elicitation_response(&pending.id, "accept", Some(answers))
@@ -2119,6 +2139,9 @@ struct ElicitationField {
     /// The free-text sibling property (`<name>_custom`), when the form pairs
     /// one with this field. Holds answers that name no option.
     custom: Option<String>,
+    /// The question text shown to the owner: the schema `description`, else the
+    /// request `message`. Never the schema `title` — adapters put a short chip
+    /// label there ("Library"), not the question.
     prompt: String,
     /// Empty for free-text fields.
     options: Vec<ElicitationOption>,
@@ -2177,11 +2200,7 @@ fn parse_elicitation_fields(params: &serde_json::Value) -> Option<Vec<Elicitatio
         })
         .map(|(name, schema)| ElicitationField {
             custom: Some(format!("{name}_custom")).filter(|key| properties.contains_key(key)),
-            prompt: schema["description"]
-                .as_str()
-                .or_else(|| schema["title"].as_str())
-                .unwrap_or(message)
-                .to_owned(),
+            prompt: schema["description"].as_str().unwrap_or(message).to_owned(),
             options: elicitation_options(schema),
             ty: schema["type"].as_str().unwrap_or("string").to_owned(),
             name: name.clone(),
@@ -2527,8 +2546,6 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
 
     #[test]
     fn stop_reason_parses_all_known_values() {
@@ -3995,7 +4012,8 @@ mod tests {
     // ── Elicitation ───────────────────────────────────────────────────────
 
     /// An `elicitation/create` params object in the shape adapters send for a
-    /// single-select AskUserQuestion: a titled `oneOf` enum plus its
+    /// single-select AskUserQuestion: the question on `message`, a short chip
+    /// label on the field's `title`, a titled `oneOf` enum, and the
     /// per-question free-text sibling.
     fn ask_params() -> serde_json::Value {
         serde_json::json!({
@@ -4007,6 +4025,9 @@ mod tests {
                 "properties": {
                     "question_0": {
                         "type": "string",
+                        // The chip label the real adapter sends alongside the
+                        // question — never the question itself.
+                        "title": "Database",
                         "oneOf": [
                             {"const": "Postgres", "title": "Postgres", "description": "mature"},
                             {"const": "SQLite", "title": "SQLite"},
@@ -4018,35 +4039,80 @@ mod tests {
         })
     }
 
-    /// An ask surface pointed at an unroutable relay, plus the flag it raises:
-    /// questions are published best-effort on a spawned task, so a failing
-    /// submit is invisible to the read loop and these tests assert on the wire
-    /// response instead.
-    fn test_ask() -> (crate::pool::ElicitationAsk, Arc<AtomicBool>) {
-        let pending = Arc::new(AtomicBool::new(false));
+    /// A stub relay that answers every submission with `status`, so tests can
+    /// drive both the published-question and the failed-publish paths.
+    /// `4xx` is non-retriable, so a failing submit fails fast.
+    async fn stub_relay(status: &'static str) -> (crate::relay::RestClient, TestServer) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub relay");
+        let base_url = format!("http://{}", listener.local_addr().expect("stub relay addr"));
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0; 8192];
+                let _ = socket.read(&mut request).await;
+                let response =
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let rest = crate::relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        (rest, TestServer(server))
+    }
+
+    /// Aborts the stub relay when the test drops it.
+    struct TestServer(tokio::task::JoinHandle<()>);
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    /// An ask surface whose questions reach the relay, plus the state the main
+    /// loop reads to decide a message is an answer, and the stub relay's guard.
+    async fn test_ask() -> (
+        crate::pool::ElicitationAsk,
+        crate::pool::ElicitationState,
+        TestServer,
+    ) {
+        test_ask_with_relay("200 OK").await
+    }
+
+    async fn test_ask_with_relay(
+        status: &'static str,
+    ) -> (
+        crate::pool::ElicitationAsk,
+        crate::pool::ElicitationState,
+        TestServer,
+    ) {
+        let (rest, server) = stub_relay(status).await;
+        let state = crate::pool::ElicitationState::default();
         let ask = crate::pool::ElicitationAsk::new(
-            crate::relay::RestClient {
-                http: reqwest::Client::new(),
-                base_url: "http://127.0.0.1:0".to_string(),
-                keys: nostr::Keys::generate(),
-                auth_tag_json: None,
-            },
+            rest,
             uuid::Uuid::nil(),
             crate::queue::ThreadTags::default(),
             None,
-            Arc::clone(&pending),
+            state.clone(),
         );
-        (ask, pending)
+        (ask, state, server)
     }
 
     /// Send `reply` the way the main loop does: only once the read loop has
-    /// raised the flag saying a question is outstanding.
+    /// published a question and armed the shared state.
     async fn reply_when_asked(
-        pending: Arc<AtomicBool>,
+        state: crate::pool::ElicitationState,
         tx: tokio::sync::mpsc::Sender<crate::pool::ElicitationReply>,
         reply: crate::pool::ElicitationReply,
     ) {
-        while !pending.load(Ordering::Relaxed) {
+        while state.question_event_id().is_none() {
             tokio::task::yield_now().await;
         }
         tx.send(reply).await.expect("reply send should succeed");
@@ -4180,8 +4246,13 @@ mod tests {
             "a marker-blind client must still show how to answer: {body}"
         );
         assert!(
-            !render_elicitation_field(&fields[0], 1, 3).contains("Question 1 of"),
-            "multi-question forms number the question the owner is on"
+            !body.contains("Question"),
+            "a single-question form carries no numbering header: {body}"
+        );
+        let second_of_three = render_elicitation_field(&fields[0], 1, 3);
+        assert!(
+            second_of_three.contains("Question 2 of 3"),
+            "multi-question forms number the question the owner is on: {second_of_three}"
         );
     }
 
@@ -4203,11 +4274,11 @@ mod tests {
                       echo \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":999,\\\"result\\\":{\\\"answered\\\":$response}}\"";
         let mut client = spawn_script(script).await;
         let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(1);
-        let (ask, pending) = test_ask();
+        let (ask, state, _relay) = test_ask().await;
         client.install_elicitation(ask, reply_rx);
 
         let reply_task = tokio::spawn(reply_when_asked(
-            pending,
+            state,
             reply_tx,
             crate::pool::ElicitationReply::Answer("2".into()),
         ));
@@ -4247,11 +4318,11 @@ mod tests {
                       echo \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":999,\\\"result\\\":{\\\"answered\\\":$response}}\"";
         let mut client = spawn_script(script).await;
         let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(1);
-        let (ask, pending) = test_ask();
+        let (ask, state, _relay) = test_ask().await;
         client.install_elicitation(ask, reply_rx);
 
         let reply_task = tokio::spawn(reply_when_asked(
-            pending,
+            state,
             reply_tx,
             crate::pool::ElicitationReply::Skip,
         ));
@@ -4307,6 +4378,46 @@ mod tests {
         assert!(client.pending_elicitation.is_none());
     }
 
+    /// A question the relay rejected is a question nobody can answer: it is
+    /// cancelled within seconds rather than parking the turn until its hard
+    /// cap and surfacing as a generic "exceeded the maximum duration".
+    #[tokio::test]
+    async fn elicitation_the_relay_rejects_is_cancelled_not_parked() {
+        let script = "echo '{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"elicitation/create\",\
+                      \"params\":{\"mode\":\"form\",\"sessionId\":\"s\",\"message\":\"Which database?\",\
+                      \"requestedSchema\":{\"type\":\"object\",\"properties\":{\
+                      \"question_0\":{\"type\":\"string\",\"enum\":[\"Postgres\"]}}}}}'; \
+                      read -r response; \
+                      echo \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":999,\\\"result\\\":{\\\"answered\\\":$response}}\"";
+        let mut client = spawn_script(script).await;
+        let (_reply_tx, reply_rx) = tokio::sync::mpsc::channel(1);
+        let (ask, state, _relay) = test_ask_with_relay("400 Bad Request").await;
+        client.install_elicitation(ask, reply_rx);
+
+        let idle = std::time::Duration::from_secs(5);
+        let result = client
+            .read_until_response_with_idle_timeout(
+                "s",
+                999,
+                idle,
+                tokio::time::Instant::now() + idle,
+                idle,
+            )
+            .await
+            .expect("the turn should complete rather than park on an unseen question");
+
+        assert_eq!(
+            result["answered"]["result"],
+            serde_json::json!({"action": "cancel"})
+        );
+        assert!(client.pending_elicitation.is_none());
+        assert_eq!(
+            state.question_event_id(),
+            None,
+            "an unpublished question must not arm the main loop's reply routing"
+        );
+    }
+
     /// The silent-agent guard is suspended while a question is outstanding —
     /// a human may think for longer than `idle_timeout` — but the hard
     /// deadline keeps bounding the turn.
@@ -4319,7 +4430,8 @@ mod tests {
                       sleep 30";
         let mut client = spawn_script(script).await;
         let (_reply_tx, reply_rx) = tokio::sync::mpsc::channel(1);
-        client.install_elicitation(test_ask().0, reply_rx);
+        let (ask, _state, _relay) = test_ask().await;
+        client.install_elicitation(ask, reply_rx);
 
         let idle = std::time::Duration::from_millis(200);
         let max_duration = std::time::Duration::from_secs(2);
@@ -4343,7 +4455,8 @@ mod tests {
     async fn cancel_request_drops_the_parked_elicitation_without_responding() {
         let mut client = spawn_script("sleep 10").await;
         let (_reply_tx, reply_rx) = tokio::sync::mpsc::channel(1);
-        client.install_elicitation(test_ask().0, reply_rx);
+        let (ask, _state, _relay) = test_ask().await;
+        client.install_elicitation(ask, reply_rx);
         client
             .handle_elicitation_request(&serde_json::json!({"id": 7, "params": ask_params()}), true)
             .await
@@ -4371,7 +4484,8 @@ mod tests {
                       sleep 30";
         let mut client = spawn_script(script).await;
         let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(1);
-        client.install_elicitation(test_ask().0, reply_rx);
+        let (ask, _state, _relay) = test_ask().await;
+        client.install_elicitation(ask, reply_rx);
         reply_tx
             .send(crate::pool::ElicitationReply::Answer("Postgres".into()))
             .await

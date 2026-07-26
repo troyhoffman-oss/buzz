@@ -20,7 +20,6 @@
 //! `AcpClient` is NOT Clone — ownership moves out on claim and back on return.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -68,10 +67,14 @@ pub struct TaskMeta {
     /// tasks only — all prompt tasks install a steer channel regardless
     /// of the agent's name.
     pub steer_tx: Option<tokio::sync::mpsc::Sender<SteerRequest>>,
-    /// Owner-reply channel for a question the turn parked, and the flag saying
-    /// one is outstanding. Capacity-1: at most one question is parked at a
-    /// time. `None` for heartbeat tasks, which have no channel to ask in.
-    pub elicitation_tx: Option<(Arc<AtomicBool>, tokio::sync::mpsc::Sender<ElicitationReply>)>,
+    /// Owner-reply channel for a question the turn parked, and the shared state
+    /// naming the published question. Capacity-1: at most one question is
+    /// parked at a time. `None` for heartbeat tasks, which have no channel to
+    /// ask in.
+    pub elicitation_tx: Option<(
+        ElicitationState,
+        tokio::sync::mpsc::Sender<ElicitationReply>,
+    )>,
 }
 
 /// Model capabilities of the configured agent command. Populated on first
@@ -526,60 +529,99 @@ pub enum ElicitationReply {
     Skip,
 }
 
-/// Where the read loop publishes an agent's question and how it tells the main
-/// loop a reply is expected.
+/// The question a turn is awaiting an answer to, shared between its read loop
+/// and the main loop: the event id of the published question, or `None` when
+/// nothing is outstanding.
 ///
-/// `pending` is shared rather than queried through the pool because the main
-/// loop must decide whether an inbound message is an elicitation reply *before*
+/// Shared rather than queried through the pool because the main loop must
+/// decide whether an inbound message is an elicitation reply *before*
 /// `queue.push()` moves its content, and the turn task owns the `AcpClient` for
 /// the whole turn — there is nothing to ask.
+#[derive(Clone, Default)]
+pub struct ElicitationState(Arc<Mutex<Option<String>>>);
+
+impl ElicitationState {
+    /// Record a published question and start routing owner replies to it.
+    pub(crate) fn arm(&self, question_event_id: String) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(question_event_id);
+        }
+    }
+
+    /// Stop routing owner replies: the question was answered, cancelled, or
+    /// outlived its turn. Idempotent.
+    pub(crate) fn disarm(&self) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = None;
+        }
+    }
+
+    /// The published question's event id while one is outstanding. The main
+    /// loop matches a reply's thread parent against it.
+    pub(crate) fn question_event_id(&self) -> Option<String> {
+        self.0.lock().ok()?.clone()
+    }
+}
+
+/// Where the read loop publishes an agent's question.
 pub struct ElicitationAsk {
     rest: RestClient,
     channel_id: Uuid,
     thread_tags: ThreadTags,
     owner_pubkey: Option<String>,
-    pending: Arc<AtomicBool>,
+    state: ElicitationState,
 }
 
 impl ElicitationAsk {
     /// Build the per-turn ask surface for `channel_id`, threaded to the event
-    /// that triggered the turn. `pending` is shared with the main loop.
+    /// that triggered the turn. `state` is shared with the main loop.
     pub fn new(
         rest: RestClient,
         channel_id: Uuid,
         thread_tags: ThreadTags,
         owner_pubkey: Option<String>,
-        pending: Arc<AtomicBool>,
+        state: ElicitationState,
     ) -> Self {
         Self {
             rest,
             channel_id,
             thread_tags,
             owner_pubkey,
-            pending,
+            state,
         }
     }
 
     /// Publish `content` as a kind:9 in the turn's channel, threaded to the
-    /// triggering event and p-tagging the owner so the question notifies.
+    /// triggering event and p-tagging the owner so the question notifies, and
+    /// arm the shared state so the owner's reply is routed back to this turn.
     ///
-    /// Spawned rather than awaited: the caller is the read loop, and blocking
-    /// it on a relay round trip would stall the agent's stdout for as long as
-    /// the submit takes.
-    pub(crate) fn publish(&self, content: String) {
-        let rest = self.rest.clone();
-        let channel_id = self.channel_id;
-        let thread_tags = self.thread_tags.clone();
-        let owner = self.owner_pubkey.clone();
-        tokio::spawn(async move {
-            let mentions: Vec<&str> = owner.as_deref().into_iter().collect();
-            post_notice(&rest, channel_id, &thread_tags, &content, &mentions).await;
-        });
+    /// Returns `false` when the question never reached the relay. Awaited
+    /// rather than spawned so that failure is observable: a question nobody can
+    /// see must abort the tool call within seconds instead of parking the turn
+    /// until the hard cap. Stalling the read loop for the submit costs nothing
+    /// — the agent is blocked on the answer and produces no output meanwhile.
+    pub(crate) async fn publish(&self, content: String) -> bool {
+        let mentions: Vec<&str> = self.owner_pubkey.as_deref().into_iter().collect();
+        let published = post_notice(
+            &self.rest,
+            self.channel_id,
+            &self.thread_tags,
+            &content,
+            &mentions,
+        )
+        .await;
+        match published {
+            Some(event_id) => {
+                self.state.arm(event_id);
+                true
+            }
+            None => false,
+        }
     }
 
-    /// Raise or lower the "a reply is expected" flag the main loop reads.
-    pub(crate) fn set_pending(&self, pending: bool) {
-        self.pending.store(pending, Ordering::Relaxed);
+    /// Stop routing owner replies to this turn. Idempotent.
+    pub(crate) fn disarm(&self) {
+        self.state.disarm();
     }
 }
 
@@ -862,26 +904,40 @@ impl AgentPool {
             .map_err(|e| SteerError::Transport(e.to_string()))
     }
 
+    /// The event id (hex) of the question `channel_id`'s turn is waiting on, if
+    /// any. `None` means no message in that channel can be an answer.
+    pub fn pending_elicitation_question(&self, channel_id: Uuid) -> Option<String> {
+        self.task_map
+            .values()
+            .find(|m| m.channel_id == Some(channel_id))
+            .and_then(|m| m.elicitation_tx.as_ref())
+            .and_then(|(state, _)| state.question_event_id())
+    }
+
     /// Route an owner reply to the question parked by `channel_id`'s turn.
     ///
     /// Returns `false` when no turn there has a question outstanding, in which
     /// case the message is an ordinary one and the caller must let it fall
     /// through to normal dispatch.
     pub fn send_elicitation_reply(&mut self, channel_id: Uuid, reply: ElicitationReply) -> bool {
-        let Some((pending, tx)) = self
+        let Some((state, tx)) = self
             .task_map
             .values()
             .find(|m| m.channel_id == Some(channel_id))
             .and_then(|m| m.elicitation_tx.as_ref())
-            .filter(|(pending, _)| pending.load(Ordering::Relaxed))
+            .filter(|(state, _)| state.question_event_id().is_some())
         else {
             return false;
         };
-        // Lower the flag here rather than waiting for the read loop to consume
-        // the reply, so two messages arriving back-to-back cannot both be
-        // taken as answers to the same question.
-        pending.store(false, Ordering::Relaxed);
-        tx.try_send(reply).is_ok()
+        // Send before disarming: a failed `try_send` must leave the question
+        // answerable rather than burning it until the turn's hard cap. Two
+        // messages arriving back-to-back still cannot both answer — the
+        // capacity-1 channel rejects the second while the first is unconsumed.
+        let sent = tx.try_send(reply).is_ok();
+        if sent {
+            state.disarm();
+        }
+        sent
     }
 
     pub fn result_tx(&self) -> mpsc::UnboundedSender<PromptResult> {
@@ -3820,13 +3876,17 @@ pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str
 /// thread of `thread_tags` when the triggering event was threaded, and p-tags
 /// `mentions` so a notice that expects an answer notifies its reader. Errors
 /// are logged and swallowed — the notice must never take down the main loop.
+///
+/// Returns the published event id (hex) on success and `None` on any failure,
+/// for the one caller that must act on it: an agent question nobody can see
+/// has to abort its tool call rather than park the turn.
 pub(crate) async fn post_notice(
     rest: &crate::relay::RestClient,
     channel_id: Uuid,
     thread_tags: &ThreadTags,
     content: &str,
     mentions: &[&str],
-) {
+) -> Option<String> {
     let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
         let root_id = nostr::EventId::from_hex(root).ok()?;
         let parent_id = thread_tags
@@ -3850,20 +3910,26 @@ pub(crate) async fn post_notice(
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(channel = %channel_id, "notice: build failed: {e}");
-            return;
+            return None;
         }
     };
     let event = match builder.sign_with_keys(&rest.keys) {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(channel = %channel_id, "notice: sign failed: {e}");
-            return;
+            return None;
         }
     };
     match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "notice failed: {e}"),
-        Err(_) => tracing::warn!(channel = %channel_id, "notice timed out"),
+        Ok(Ok(_)) => Some(event.id.to_hex()),
+        Ok(Err(e)) => {
+            tracing::warn!(channel = %channel_id, "notice failed: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(channel = %channel_id, "notice timed out");
+            None
+        }
     }
 }
 
@@ -5480,13 +5546,13 @@ mod tests {
     }
 
     /// Replies are routed only to a channel whose turn actually has a question
-    /// outstanding, and only once — the flag drops as the first reply is sent
-    /// so two messages in a row cannot both answer the same question.
+    /// outstanding, and only once — the state disarms as the first reply is
+    /// sent so two messages in a row cannot both answer the same question.
     #[tokio::test]
     async fn test_send_elicitation_reply_routes_only_to_a_channel_awaiting_one() {
         let mut pool = AgentPool::from_slots(Vec::new());
         let channel_id = Uuid::new_v4();
-        let pending = Arc::new(AtomicBool::new(false));
+        let state = ElicitationState::default();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ElicitationReply>(1);
         let abort_handle = pool.join_set.spawn(async {});
         pool.task_map_mut().insert(
@@ -5498,7 +5564,7 @@ mod tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
-                elicitation_tx: Some((Arc::clone(&pending), tx)),
+                elicitation_tx: Some((state.clone(), tx)),
             },
         );
 
@@ -5506,8 +5572,18 @@ mod tests {
             !pool.send_elicitation_reply(channel_id, ElicitationReply::Skip),
             "no question outstanding — the message is an ordinary one"
         );
+        assert_eq!(
+            pool.pending_elicitation_question(channel_id),
+            None,
+            "with nothing asked, no message in the channel can be an answer"
+        );
 
-        pending.store(true, Ordering::Relaxed);
+        state.arm("question-event-id".into());
+        assert_eq!(
+            pool.pending_elicitation_question(channel_id).as_deref(),
+            Some("question-event-id"),
+            "the main loop matches a reply's thread parent against this id"
+        );
         assert!(
             !pool.send_elicitation_reply(Uuid::new_v4(), ElicitationReply::Skip),
             "another channel's turn must not receive this channel's reply"
@@ -5516,7 +5592,44 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(ElicitationReply::Answer(a)) if a == "2"));
         assert!(
             !pool.send_elicitation_reply(channel_id, ElicitationReply::Skip),
-            "the flag drops with the first reply, so the next message falls through"
+            "the state disarms with the first reply, so the next message falls through"
+        );
+    }
+
+    /// A `try_send` that fails must leave the question answerable: lowering the
+    /// flag first would burn it until the turn's hard cap.
+    #[tokio::test]
+    async fn test_failed_elicitation_send_leaves_the_question_answerable() {
+        let mut pool = AgentPool::from_slots(Vec::new());
+        let channel_id = Uuid::new_v4();
+        let state = ElicitationState::default();
+        // Capacity-1 channel, already full: the next `try_send` fails.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ElicitationReply>(1);
+        tx.try_send(ElicitationReply::Skip)
+            .expect("the first send fills the channel");
+        let abort_handle = pool.join_set.spawn(async {});
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                turn_id: "turn".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                elicitation_tx: Some((state.clone(), tx)),
+            },
+        );
+        state.arm("question-event-id".into());
+
+        assert!(
+            !pool.send_elicitation_reply(channel_id, ElicitationReply::Answer("2".into())),
+            "a full channel rejects the reply, so it falls through as an ordinary message"
+        );
+        assert_eq!(
+            pool.pending_elicitation_question(channel_id).as_deref(),
+            Some("question-event-id"),
+            "the question is still outstanding — a later reply can still answer it"
         );
     }
 

@@ -160,14 +160,20 @@ Owner control commands must be kind:9 stream messages from the owner, must menti
 may ask a question mid-turn (Claude's `AskUserQuestion`, an MCP server's
 elicitation, or a refusal-fallback consent prompt). The question is posted as a
 numbered list in the turn's channel, threaded to the triggering event and
-p-tagging the owner. The **owner** answers by replying with an option number,
-an option label, or their own text — deliberately not siblings or allowlisted
-users, since the agent is asking a human. `!skip` declines and lets the turn
-continue without an answer.
+p-tagging the owner. The **owner** answers by **replying in that question's
+thread** with an option number, an option label, or their own text —
+deliberately not siblings or allowlisted users, since the agent is asking a
+human. `!skip` declines and lets the turn continue without an answer.
+
+The thread requirement is what keeps an answer unambiguous: an unthreaded
+message, or one addressed to a different agent in the same channel, reaches the
+agent as an ordinary prompt instead of being swallowed as the answer.
 
 While a question is outstanding the idle timeout is suspended, so a slow answer
 does not kill the turn; `BUZZ_ACP_MAX_TURN_DURATION` still bounds it, and an
-unanswered question is cancelled when the turn ends. Requires
+unanswered question is cancelled when the turn ends. A question that never
+reaches the relay is cancelled immediately, so the agent reports an aborted tool
+call rather than waiting on something nobody can see. Requires
 `@agentclientprotocol/claude-agent-acp` — older `claude-code-acp` installs strip
 `AskUserQuestion` unconditionally, in which case the capability is simply inert.
 

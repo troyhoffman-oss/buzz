@@ -16,7 +16,6 @@ mod usage;
 pub use usage::TurnUsage;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -2290,31 +2289,6 @@ async fn tokio_main() -> Result<()> {
                                 _ => {}
                             }
 
-                            // Answer to a question the in-flight turn asked.
-                            // Owner-only, and deliberately not `is_owner_or_sibling`:
-                            // the agent asked a human, so another bot must not
-                            // answer for them. A reply that finds no outstanding
-                            // question — because the turn ended, rotated, or the
-                            // author isn't the owner — falls through and is
-                            // delivered as an ordinary message.
-                            if kind_u32 == KIND_STREAM_MESSAGE
-                                && owner_cache.get() == Some(buzz_event.event.pubkey.to_hex().as_str())
-                            {
-                                let content = buzz_event.event.content.trim();
-                                let reply = if content == "!skip" {
-                                    pool::ElicitationReply::Skip
-                                } else {
-                                    pool::ElicitationReply::Answer(content.to_owned())
-                                };
-                                if pool.send_elicitation_reply(buzz_event.channel_id, reply) {
-                                    tracing::info!(
-                                        channel_id = %buzz_event.channel_id,
-                                        "owner answered the agent's question"
-                                    );
-                                    continue; // consume event — do NOT push to queue
-                                }
-                            }
-
                             // Coarse security policy: drop events from disallowed
                             // authors before they reach subscription rules or the
                             // agent. Must be AFTER !shutdown (owner can always
@@ -2351,6 +2325,47 @@ async fn tokio_main() -> Result<()> {
                                         "inbound author gate — dropping event"
                                     );
                                     continue;
+                                }
+                            }
+
+                            // Answer to a question the in-flight turn asked.
+                            // Owner-only, and deliberately not `is_owner_or_sibling`:
+                            // the agent asked a human, so another bot must not
+                            // answer for them. Placed below the author gate so a
+                            // reply inherits the same DM hardening and gate mode
+                            // as every other inbound event.
+                            //
+                            // Narrowed to threaded replies to the published
+                            // question: with two agents in one channel, or an
+                            // owner aside mid-turn, an unthreaded message must
+                            // reach the queue as an ordinary prompt rather than
+                            // being silently swallowed as this agent's answer.
+                            // A reply that finds no outstanding question — the
+                            // turn ended, rotated, or never asked — likewise
+                            // falls through to normal dispatch.
+                            if kind_u32 == KIND_STREAM_MESSAGE
+                                && owner_cache.get() == Some(buzz_event.event.pubkey.to_hex().as_str())
+                            {
+                                let answers_question = pool
+                                    .pending_elicitation_question(buzz_event.channel_id)
+                                    .is_some_and(|question_id| {
+                                        queue::parse_thread_tags(&buzz_event.event).parent_event_id
+                                            == Some(question_id)
+                                    });
+                                if answers_question {
+                                    let content = buzz_event.event.content.trim();
+                                    let reply = if content == "!skip" {
+                                        pool::ElicitationReply::Skip
+                                    } else {
+                                        pool::ElicitationReply::Answer(content.to_owned())
+                                    };
+                                    if pool.send_elicitation_reply(buzz_event.channel_id, reply) {
+                                        tracing::info!(
+                                            channel_id = %buzz_event.channel_id,
+                                            "owner answered the agent's question"
+                                        );
+                                        continue; // consume event — do NOT push to queue
+                                    }
                                 }
                             }
 
@@ -3133,7 +3148,7 @@ fn dispatch_pending(
         // Elicitation seam: the read loop publishes agent questions into this
         // channel's thread and blocks on the matching reply channel, which the
         // relay event branch feeds via `pool::send_elicitation_reply`.
-        let pending_elicitation = Arc::new(AtomicBool::new(false));
+        let elicitation_state = pool::ElicitationState::default();
         let (elicitation_reply_tx, elicitation_reply_rx) =
             tokio::sync::mpsc::channel::<pool::ElicitationReply>(1);
         agent.acp.install_elicitation(
@@ -3142,7 +3157,7 @@ fn dispatch_pending(
                 channel_id,
                 typing_scope.clone(),
                 ctx.agent_owner_pubkey.map(|pk| pk.to_hex()),
-                Arc::clone(&pending_elicitation),
+                elicitation_state.clone(),
             ),
             elicitation_reply_rx,
         );
@@ -3175,7 +3190,7 @@ fn dispatch_pending(
                 recoverable_batch,
                 control_tx: Some(control_tx),
                 steer_tx,
-                elicitation_tx: Some((pending_elicitation, elicitation_reply_tx)),
+                elicitation_tx: Some((elicitation_state, elicitation_reply_tx)),
             },
         );
         dispatched_channels.push((channel_id, typing_scope));
