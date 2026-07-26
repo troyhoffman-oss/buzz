@@ -138,7 +138,88 @@ probe() {
 }
 "#;
 
-/// The one probe script: `buzz-acp` plus every harness candidate.
+/// Probe key for the Hermes CLI itself, as opposed to the `hermes-acp` shim the
+/// `hermes` [`Candidate`] resolves. Deliberately not any candidate's id, so the
+/// twelve catalog entries are unaffected by its presence or absence.
+const HERMES_CLI_KEY: &str = "hermes-cli";
+
+/// Prefix of a profile record: `hermes-profile<TAB><name>`.
+///
+/// Two fields, not the four a `probe` record carries, so [`parse_probes`] drops
+/// these on its own (`path` is `None`) and the two streams cannot be confused.
+const HERMES_PROFILE_PREFIX: &str = "hermes-profile\t";
+
+/// Per-profile entries emitted for one host. A pathological (or hostile) host
+/// with thousands of directories under `profiles/` must not turn the harness
+/// picker into an unusable wall, and `Output` caps the whole response at 1 MB
+/// regardless — which would fail the op rather than truncate it.
+///
+/// Enforced twice on purpose: the script stops early so the bytes are never
+/// sent, and [`hermes_profiles`] re-applies it because remote stdout is
+/// untrusted input and a host is free to ignore the script it was handed.
+const MAX_HERMES_PROFILES: usize = 32;
+
+/// Hermes profile enumeration, appended to the probe script.
+///
+/// Hermes runs N isolated instances out of one install — a profile is a whole
+/// `HERMES_HOME`, selected by the **global** pre-subcommand flag
+/// (`hermes --profile matt acp`). The operator's fleet is one profile per
+/// teammate, so a host has to advertise one catalog entry per profile or nine
+/// of the ten agents on it are unreachable from the picker.
+///
+/// The profile store is read from the filesystem rather than from
+/// `hermes profile list`: the directory layout **is** what Hermes resolves a
+/// profile against (`hermes_cli/profiles.py`: `get_profile_dir` →
+/// `<root>/profiles/<name>`), while the CLI output is a human table with a
+/// unicode default marker and no `--json`. Parsing that table would be reading
+/// a rendering of the truth instead of the truth.
+///
+/// `<root>` is normally `~/.hermes`. `HERMES_HOME` overrides it for Docker and
+/// custom deployments, and may itself already point *at* a profile — hence the
+/// `*/profiles/*` trim, which recovers the root from both layouts exactly as
+/// `hermes_constants.get_default_hermes_root` does.
+///
+/// The `default` profile is the root directory itself and never appears under
+/// `profiles/`, so it is emitted separately. It earns its own entry because the
+/// plain `hermes-acp` entry runs whatever profile is *sticky*: once the operator
+/// runs `hermes profile use matt`, nothing else can pin the built-in profile.
+///
+/// Names are filtered here as a prefilter only — [`is_hermes_profile_name`] is
+/// the authority, on the Rust side where it is testable. The shell never
+/// evaluates a name (only `printf '%s'`), so the filter's real job is dropping
+/// a name containing a newline or tab before it can forge a second record.
+fn hermes_profiles_block() -> String {
+    format!(
+        r#"if _hb=$(command -v hermes 2>/dev/null) && [ -n "$_hb" ]; then
+  _hr=${{HERMES_HOME:-${{HOME:-}}/.hermes}}
+  case "$_hr" in */profiles/*) _hr=${{_hr%/profiles/*}} ;; esac
+  _hc=0
+  if [ -d "$_hr" ]; then
+    printf 'hermes-profile\tdefault\n'
+    _hc=1
+  fi
+  for _hd in "$_hr"/profiles/*/; do
+    [ "$_hc" -lt {cap} ] || break
+    [ -d "$_hd" ] || continue
+    _hn=${{_hd%/}}
+    _hn=${{_hn##*/}}
+    case "$_hn" in
+      default) continue ;;
+      *[!abcdefghijklmnopqrstuvwxyz0123456789_-]*) continue ;;
+      [!abcdefghijklmnopqrstuvwxyz0123456789]*) continue ;;
+    esac
+    _hc=$((_hc + 1))
+    printf 'hermes-profile\t%s\n' "$_hn"
+  done
+fi
+:
+"#,
+        cap = MAX_HERMES_PROFILES,
+    )
+}
+
+/// The one probe script: `buzz-acp`, every harness candidate, and — only where
+/// `hermes` resolves — that host's Hermes profiles.
 fn discover_script(config: &SshConfig) -> String {
     let mut script = String::from(PROBE_PREAMBLE);
     let acp = config.buzz_acp_path.as_deref().unwrap_or("buzz-acp");
@@ -152,7 +233,66 @@ fn discover_script(config: &SshConfig) -> String {
             ));
         }
     }
+    // The Hermes CLI, which is what a per-profile entry runs — the `hermes-acp`
+    // shim takes no arguments of its own, so it cannot carry `--profile`.
+    script.push_str(&format!("probe {} 'hermes'\n", quote(HERMES_CLI_KEY)));
+    script.push_str(&hermes_profiles_block());
     script
+}
+
+/// A profile name this crate is willing to put in a catalog id and in
+/// `agent_args`.
+///
+/// The authority for the rule the script only prefilters. Names arrive from a
+/// directory listing on a machine the desktop does not control, so they are
+/// untrusted input on their way into a JSON document and then into an argument
+/// vector — the exact shape of a name is the whole security surface.
+///
+/// The charset is Hermes's own `_PROFILE_ID_RE` (`^[a-z0-9][a-z0-9_-]{0,63}$`),
+/// which is also, not by coincidence, a subset of the desktop's harness-id rule
+/// `[a-z0-9_][a-z0-9_-]*` — so `hermes-<name>` is always a legal id and
+/// `validate_harness_definition` cannot silently drop the entry. Anything else
+/// is skipped rather than sanitized: a mangled name would name a profile that
+/// does not exist, and deploy an agent pointing at nothing.
+fn is_hermes_profile_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().expect("non-empty");
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// The accepted profile names from one probe run, in host order, deduplicated
+/// and capped.
+///
+/// Returns `(names, skipped)` — `skipped` counts records the charset rule
+/// refused, which is worth surfacing rather than swallowing: it is the only
+/// signal that a host has profiles the picker deliberately did not offer.
+fn hermes_profiles(stdout: &str) -> (Vec<&str>, usize) {
+    let mut names: Vec<&str> = Vec::new();
+    let mut skipped = 0usize;
+    for line in stdout.lines() {
+        let Some(name) = line.strip_prefix(HERMES_PROFILE_PREFIX) else {
+            continue;
+        };
+        if !is_hermes_profile_name(name) {
+            skipped += 1;
+            continue;
+        }
+        if names.contains(&name) {
+            continue;
+        }
+        if names.len() >= MAX_HERMES_PROFILES {
+            skipped += 1;
+            continue;
+        }
+        names.push(name);
+    }
+    (names, skipped)
 }
 
 /// One `probe` record: `key<TAB>command<TAB>path<TAB>version`.
@@ -193,7 +333,7 @@ fn harnesses_response(stdout: &str) -> serde_json::Value {
         .map(|probe| serde_json::json!({ "path": probe.path, "version": probe.version }))
         .unwrap_or(serde_json::Value::Null);
 
-    let harnesses: Vec<serde_json::Value> = CANDIDATES
+    let mut harnesses: Vec<serde_json::Value> = CANDIDATES
         .iter()
         .map(|candidate| {
             let found = probes.iter().find(|probe| probe.key == candidate.id);
@@ -219,9 +359,66 @@ fn harnesses_response(stdout: &str) -> serde_json::Value {
         })
         .collect();
 
+    harnesses.extend(hermes_profile_harnesses(&probes, stdout));
+
     // `buzz_acp: null` with `ok: true` is deliberate: the UI can then render an
     // actionable "install buzz-acp on this host" instead of a bare failure.
     serde_json::json!({ "ok": true, "buzz_acp": buzz_acp, "harnesses": harnesses })
+}
+
+/// One extra catalog entry per Hermes profile on the host.
+///
+/// A profile is a separate `HERMES_HOME` — its own SOUL, memory, skills,
+/// credentials and gateway — so "Hermes (matt)" and "Hermes (paul)" are two
+/// different agents, not one agent configured twice. The operator's whole fleet
+/// is one profile per teammate, and without these entries the picker can only
+/// ever pin the *sticky* profile, leaving the rest unreachable through the
+/// normal create flow.
+///
+/// The command is `hermes` with `["--profile", <name>, "acp"]` rather than the
+/// `hermes-acp` shim: `--profile` is a global pre-subcommand flag, and the shim
+/// forwards no arguments of its own. The pin therefore has to name the CLI
+/// directly, which is also why the entries only appear when `hermes` itself
+/// resolved — a host with only the shim gets exactly the plain entry.
+///
+/// The plain `hermes` candidate stays as-is and remains the default option: it
+/// runs whichever profile is sticky, which is what a single-profile host wants.
+fn hermes_profile_harnesses(probes: &[Probe<'_>], stdout: &str) -> Vec<serde_json::Value> {
+    // No Hermes CLI on the host means no way to pass `--profile`, so no
+    // per-profile entries — regardless of what the profile records claim.
+    let Some(cli) = probes.iter().find(|probe| probe.key == HERMES_CLI_KEY) else {
+        return Vec::new();
+    };
+    let (names, skipped) = hermes_profiles(stdout);
+    if skipped > 0 {
+        // stderr, never stdout: stdout is this provider's single JSON response.
+        eprintln!(
+            "buzz-backend-ssh: skipped {skipped} Hermes profile(s) whose names are not \
+             [a-z0-9][a-z0-9_-]* or that exceeded the {MAX_HERMES_PROFILES}-profile cap"
+        );
+    }
+
+    names
+        .into_iter()
+        .map(|name| {
+            serde_json::json!({
+                // `hermes-` + a validated name, so this always satisfies the
+                // desktop's `[a-z0-9_][a-z0-9_-]*` harness-id rule.
+                "id": format!("hermes-{name}"),
+                "label": format!("Hermes ({name})"),
+                "command": cli.command,
+                "args": ["--profile", name, "acp"],
+                "env": serde_json::Map::new(),
+                "installInstructionsUrl": "",
+                "installHint": "",
+                // The profile directory was listed and the CLI resolved this
+                // pass, so the entry is as available as the plain one.
+                "available": true,
+                "binaryPath": cli.path,
+                "version": Some(cli.version).filter(|v| !v.is_empty()),
+            })
+        })
+        .collect()
 }
 
 pub fn discover_harnesses(
@@ -483,6 +680,338 @@ mod tests {
         assert_eq!(probes.len(), 1);
         assert_eq!(probes[0].command, "goose");
         assert_eq!(probes[0].version, "v1");
+    }
+
+    // ── Hermes per-profile entries ──────────────────────────────────────────
+
+    /// Probe output for a host with the Hermes CLI plus `profiles`.
+    fn hermes_stdout(profiles: &[&str]) -> String {
+        let mut stdout = String::from(
+            "hermes\thermes-acp\t/home/ubuntu/.local/bin/hermes-acp\t0.19.0\n\
+             hermes-cli\thermes\t/home/ubuntu/.local/bin/hermes\tHermes Agent v0.19.0\n",
+        );
+        for profile in profiles {
+            stdout.push_str(&format!("hermes-profile\t{profile}\n"));
+        }
+        stdout
+    }
+
+    fn entry<'a>(response: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+        response["harnesses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["id"] == id)
+            .unwrap_or_else(|| panic!("no harness entry {id}"))
+    }
+
+    #[test]
+    fn each_hermes_profile_becomes_its_own_catalog_entry() {
+        let response = harnesses_response(&hermes_stdout(&["default", "matt", "paul"]));
+        let harnesses = response["harnesses"].as_array().unwrap();
+        assert_eq!(harnesses.len(), CANDIDATES.len() + 3);
+
+        let matt = entry(&response, "hermes-matt");
+        assert_eq!(matt["label"], "Hermes (matt)");
+        // The CLI, not the shim: `--profile` is a global pre-subcommand flag
+        // and the shim forwards no arguments of its own.
+        assert_eq!(matt["command"], "hermes");
+        assert_eq!(
+            matt["args"],
+            serde_json::json!(["--profile", "matt", "acp"])
+        );
+        assert_eq!(matt["available"], true);
+        assert_eq!(matt["binaryPath"], "/home/ubuntu/.local/bin/hermes");
+        assert_eq!(matt["version"], "Hermes Agent v0.19.0");
+        assert_eq!(matt["env"], serde_json::json!({}));
+
+        // The sticky default keeps its own entry — once `hermes profile use`
+        // moves the sticky pointer, nothing else can pin the built-in profile.
+        assert_eq!(
+            entry(&response, "hermes-default")["args"],
+            serde_json::json!(["--profile", "default", "acp"])
+        );
+        // And the plain shim entry is untouched, still the default option.
+        let plain = entry(&response, "hermes");
+        assert_eq!(plain["command"], "hermes-acp");
+        assert_eq!(plain["args"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_host_without_hermes_gets_byte_identical_todays_catalog() {
+        // The degradation contract: absent Hermes, the response is exactly what
+        // it was before per-profile entries existed.
+        let stdout = "buzz-acp\tbuzz-acp\t/usr/local/bin/buzz-acp\t0.4.26\n\
+                      goose\tgoose\t/usr/bin/goose\tgoose 1.9.0\n";
+        let response = harnesses_response(stdout);
+        assert_eq!(
+            response["harnesses"].as_array().unwrap().len(),
+            CANDIDATES.len()
+        );
+        let expected: Vec<serde_json::Value> = CANDIDATES
+            .iter()
+            .map(|candidate| {
+                let available = candidate.id == "goose";
+                serde_json::json!({
+                    "id": candidate.id,
+                    "label": candidate.label,
+                    "command": candidate.commands[0],
+                    "args": candidate.args,
+                    "env": candidate
+                        .env
+                        .iter()
+                        .map(|(k, v)| ((*k).to_string(), serde_json::Value::from(*v)))
+                        .collect::<serde_json::Map<_, _>>(),
+                    "installInstructionsUrl": "",
+                    "installHint": "",
+                    "available": available,
+                    "binaryPath": available.then_some("/usr/bin/goose"),
+                    "version": available.then_some("goose 1.9.0"),
+                })
+            })
+            .collect();
+        assert_eq!(response["harnesses"], serde_json::Value::from(expected));
+    }
+
+    #[test]
+    fn hermes_with_no_readable_profiles_is_just_the_plain_entry() {
+        // An unreadable or empty profile store is not an error: the shim entry
+        // still runs the sticky profile.
+        let response = harnesses_response(&hermes_stdout(&[]));
+        assert_eq!(response["ok"], true);
+        assert_eq!(
+            response["harnesses"].as_array().unwrap().len(),
+            CANDIDATES.len()
+        );
+        assert_eq!(entry(&response, "hermes")["available"], true);
+    }
+
+    #[test]
+    fn profile_records_without_the_hermes_cli_produce_nothing() {
+        // Only the shim resolved, so there is no binary that accepts
+        // `--profile` — pinning one would deploy an agent that cannot start.
+        let stdout = "hermes\thermes-acp\t/usr/bin/hermes-acp\t0.19.0\n\
+                      hermes-profile\tmatt\n";
+        let response = harnesses_response(stdout);
+        assert_eq!(
+            response["harnesses"].as_array().unwrap().len(),
+            CANDIDATES.len()
+        );
+    }
+
+    #[test]
+    fn hostile_profile_names_are_skipped_never_sanitized() {
+        // A mangled name would pin a profile that does not exist. Every one of
+        // these must be dropped whole.
+        for hostile in [
+            "a b",
+            "a'b",
+            "$(touch /tmp/pwn)",
+            "`id`",
+            "a;b",
+            "../escape",
+            ".hidden",
+            "-leading-dash",
+            "_leading-underscore",
+            "UPPER",
+            "naïve",
+            "a/b",
+            "a\\b",
+            "",
+            &"x".repeat(65),
+        ] {
+            assert!(
+                !is_hermes_profile_name(hostile),
+                "{hostile:?} must be refused"
+            );
+        }
+        for ok in ["default", "matt", "msig-web-analyst", "a_b", "x9", "9x"] {
+            assert!(is_hermes_profile_name(ok), "{ok:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn a_hostile_name_that_reaches_stdout_is_dropped_from_the_catalog() {
+        // Belt and braces: even if the script's own prefilter were bypassed,
+        // nothing hostile reaches the JSON.
+        let response = harnesses_response(&hermes_stdout(&["matt", "$(id)", "Bad", "paul"]));
+        let ids: Vec<&str> = response["harnesses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"hermes-matt") && ids.contains(&"hermes-paul"));
+        assert!(!ids.iter().any(|id| id.contains("$(") || id.contains("Bad")));
+        // No mangled survivor either — the count is exactly the two good ones.
+        assert_eq!(ids.len(), CANDIDATES.len() + 2);
+    }
+
+    #[test]
+    fn the_profile_count_is_capped_against_a_pathological_host() {
+        let many: Vec<String> = (0..200).map(|i| format!("p{i}")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let response = harnesses_response(&hermes_stdout(&refs));
+        assert_eq!(
+            response["harnesses"].as_array().unwrap().len(),
+            CANDIDATES.len() + MAX_HERMES_PROFILES
+        );
+    }
+
+    #[test]
+    fn a_repeated_profile_name_yields_one_entry() {
+        // Duplicate ids would collide in the desktop's catalog.
+        let response = harnesses_response(&hermes_stdout(&["matt", "matt"]));
+        assert_eq!(
+            response["harnesses"].as_array().unwrap().len(),
+            CANDIDATES.len() + 1
+        );
+    }
+
+    #[test]
+    fn every_profile_entry_id_satisfies_the_desktop_harness_id_rule() {
+        // `validate_harness_definition` drops any entry whose id does not match
+        // `[a-z0-9_][a-z0-9_-]*`, so a legal profile name must always produce a
+        // legal id — otherwise the entry silently vanishes desktop-side.
+        for name in ["default", "matt", "msig-web-analyst", "a_b", "9x"] {
+            let id = format!("hermes-{name}");
+            let mut chars = id.chars();
+            let first = chars.next().unwrap();
+            assert!(first.is_ascii_lowercase() || first.is_ascii_digit() || first == '_');
+            assert!(
+                chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+            );
+        }
+    }
+
+    #[test]
+    fn profile_records_never_masquerade_as_probe_records() {
+        // Two fields, not four, so `parse_probes` drops them on its own and a
+        // profile can never be mistaken for a resolved binary.
+        let stdout = hermes_stdout(&["matt"]);
+        let probes = parse_probes(&stdout);
+        assert_eq!(probes.len(), 2);
+        assert!(probes.iter().all(|p| p.key != "hermes-profile"));
+    }
+
+    /// The script must only enumerate profiles on a host that has `hermes`,
+    /// and must never let a name be evaluated by the shell.
+    #[test]
+    fn the_script_gates_profile_enumeration_on_hermes_being_present() {
+        let script = discover_script(&config());
+        assert!(script.contains("probe 'hermes-cli' 'hermes'"));
+        assert!(script.contains(r#"if _hb=$(command -v hermes 2>/dev/null)"#));
+        // Names are printed as data, never expanded or executed.
+        assert!(script.contains(r#"printf 'hermes-profile\t%s\n' "$_hn""#));
+        // The shell-side cap tracks the Rust constant.
+        assert!(script.contains(&format!(r#"[ "$_hc" -lt {MAX_HERMES_PROFILES} ] || break"#)));
+    }
+
+    /// Execute the real generated script against `/bin/sh` over a fake host
+    /// layout. Substring assertions prove the script *says* the right things;
+    /// only running it proves the `case` globs, the `${_hd%/}` trimming and the
+    /// `HERMES_HOME` recovery actually behave — and that a directory named
+    /// `$(touch …)` stays inert rather than being evaluated.
+    #[cfg(unix)]
+    #[test]
+    fn the_generated_script_enumerates_a_real_profile_directory_safely() {
+        let root =
+            std::env::temp_dir().join(format!("buzz-hermes-profiles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        let profiles = root.join("hermes/profiles");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&profiles).unwrap();
+
+        let canary = root.join("pwn");
+        for name in [
+            // Normal names, including the operator's real fleet shapes.
+            "matt",
+            "paul",
+            "msig-web-analyst",
+            "codex_worker",
+            // Hostile: spaces, quotes, and a command substitution that must
+            // stay a literal directory name.
+            "evil name",
+            "ev'il",
+            &format!("$(touch {})", canary.display()),
+            // A dotfile, which is not a profile and is not matched by `*/`.
+            ".hidden",
+            // Uppercase, which Hermes itself would refuse.
+            "Upper",
+        ] {
+            std::fs::create_dir_all(profiles.join(name)).unwrap();
+        }
+        // A plain file under profiles/ is not a profile.
+        std::fs::write(profiles.join("notes.md"), "x").unwrap();
+
+        // Stub `hermes` so `command -v hermes` resolves on the fake host.
+        let hermes = bin.join("hermes");
+        std::fs::write(&hermes, "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hermes, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-s")
+            .env_clear()
+            .env("HOME", &root)
+            // Exercises the Docker/custom layout AND the `*/profiles/*` trim by
+            // pointing HERMES_HOME at a profile rather than at the root.
+            .env("HERMES_HOME", root.join("hermes/profiles/matt"))
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(discover_script(&config()).as_bytes())
+                    .unwrap();
+                child.wait_with_output()
+            })
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Nothing under `profiles/` was ever executed.
+        assert!(
+            !canary.exists(),
+            "a directory name was evaluated by the shell"
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (names, _) = hermes_profiles(&stdout);
+        assert_eq!(
+            names,
+            vec![
+                "default",
+                "codex_worker",
+                "matt",
+                "msig-web-analyst",
+                "paul"
+            ],
+            "stdout was: {stdout}"
+        );
+
+        // And the response built from that real stdout parses, with the args
+        // arrays the deploy pin will carry.
+        let response: serde_json::Value =
+            serde_json::from_str(&harnesses_response(&stdout).to_string()).unwrap();
+        assert_eq!(
+            entry(&response, "hermes-msig-web-analyst")["args"],
+            serde_json::json!(["--profile", "msig-web-analyst", "acp"])
+        );
+        assert_eq!(entry(&response, "hermes-matt")["command"], "hermes");
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

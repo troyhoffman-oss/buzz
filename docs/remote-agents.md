@@ -90,6 +90,20 @@ that exists there. `env` carries the runtime's `default_env`, which local spawn 
 catalog and a remote deploy can only get from here; the create flow pins it into the record's
 `env_vars`, where it lands in the env file underneath any user-set value.
 
+A host with the **Hermes** CLI advertises one extra entry per Hermes profile — `hermes-matt`,
+"Hermes (matt)", `command: "hermes"`, `args: ["--profile", "matt", "acp"]` — because a profile is a
+whole isolated `HERMES_HOME` (its own SOUL, memory, skills, credentials), so ten profiles are ten
+different agents, and the plain `hermes-acp` entry can only ever run whichever one is *sticky*. That
+entry stays as the default option, and `default` gets its own pin so `hermes profile use` cannot
+strand it. The profiles are read from the directory store (`<root>/profiles/*/`, `HERMES_HOME`
+honored and trimmed back to the root) in the same single script round trip, gated on `hermes`
+resolving — `hermes profile list` is a human table with no `--json`, and the directory layout is
+what Hermes itself resolves a profile against. Names are untrusted remote input on their way into an
+id and an argv, so only `[a-z0-9][a-z0-9_-]*` (Hermes's own rule, and a subset of the desktop's
+harness-id rule) is accepted; anything else is skipped whole rather than sanitized, and the count is
+capped at 32 with the remainder logged to stderr. Absent Hermes, the catalog is byte-identical to
+what it was before; present with an empty or unreadable store, it is just the plain entry.
+
 `probe_models` exports the harness env inside the script, then runs `buzz-acp models --json` on the
 host and returns the document verbatim under `models_raw`. The desktop feeds it straight into the
 same `normalize_agent_models` the local path uses, so the model picker needs no remote-specific

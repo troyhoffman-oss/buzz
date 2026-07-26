@@ -617,6 +617,35 @@ mod tests {
         assert!(script.contains("exit 91"));
     }
 
+    /// A Hermes per-profile pin, end to end through the deploy path.
+    ///
+    /// `discover_harnesses` emits `["--profile", <name>, "acp"]`, and the args
+    /// reach the host as ONE comma-joined `BUZZ_ACP_AGENT_ARGS` that `buzz-acp`
+    /// re-splits on `,` (`config.rs`, `value_delimiter`). That round trip is
+    /// only lossless because a profile name cannot contain a comma — which is
+    /// what `is_hermes_profile_name` guarantees — so pin the whole chain here
+    /// rather than trusting the two halves independently.
+    #[test]
+    fn a_hermes_profile_pin_reaches_the_host_intact() {
+        let mut request = request();
+        request["agent"]["agent_command"] = serde_json::json!("hermes");
+        request["agent"]["agent_args"] =
+            serde_json::json!(["--profile", "msig-web-analyst", "acp"]);
+        let agent = Agent::from_request(&request).unwrap();
+        assert_eq!(
+            agent.agent_args,
+            ["--profile", "msig-web-analyst", "acp"],
+            "provider args are pinned verbatim, never re-resolved"
+        );
+
+        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, None).unwrap();
+        assert!(script.contains("harness_name='hermes'"));
+        assert!(
+            script.contains(r#"BUZZ_ACP_AGENT_ARGS="--profile,msig-web-analyst,acp""#),
+            "{script}"
+        );
+    }
+
     #[test]
     fn secrets_travel_in_the_script_body_and_never_on_an_argv() {
         let agent = Agent::from_request(&request()).unwrap();
