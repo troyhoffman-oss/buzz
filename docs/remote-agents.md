@@ -102,7 +102,9 @@ what Hermes itself resolves a profile against. Names are untrusted remote input 
 id and an argv, so only `[a-z0-9][a-z0-9_-]*` (Hermes's own rule, and a subset of the desktop's
 harness-id rule) is accepted; anything else is skipped whole rather than sanitized, and the count is
 capped at 32 with the remainder logged to stderr. Absent Hermes, the catalog is byte-identical to
-what it was before; present with an empty or unreadable store, it is just the plain entry.
+what it was before; present with a Hermes root but no `profiles/` store, it is the plain entry plus
+`hermes-default`, since the root directory *is* the default profile; present with no Hermes root at
+all, it is just the plain entry.
 
 `probe_models` exports the harness env inside the script, then runs `buzz-acp models --json` on the
 host and returns the document verbatim under `models_raw`. The desktop feeds it straight into the

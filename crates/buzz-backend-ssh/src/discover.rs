@@ -184,10 +184,16 @@ const MAX_HERMES_PROFILES: usize = 32;
 /// plain `hermes-acp` entry runs whatever profile is *sticky*: once the operator
 /// runs `hermes profile use matt`, nothing else can pin the built-in profile.
 ///
-/// Names are filtered here as a prefilter only — [`is_hermes_profile_name`] is
-/// the authority, on the Rust side where it is testable. The shell never
-/// evaluates a name (only `printf '%s'`), so the filter's real job is dropping
-/// a name containing a newline or tab before it can forge a second record.
+/// The shell never *evaluates* a name (only `printf '%s'`), and
+/// [`is_hermes_profile_name`] re-checks every name that survives — but the
+/// `case` charset arms are **not** merely a prefilter. They are the only thing
+/// that stops a name containing a newline from printing a second, unlabeled
+/// line that [`parse_probes`] accepts as a four-field probe record for any
+/// candidate it names: such a line carries no `hermes-profile\t` prefix, so
+/// [`hermes_profiles`] never sees it and no Rust-side check applies. Removing
+/// them lets a hostile directory name pin an arbitrary
+/// `BUZZ_ACP_AGENT_COMMAND`. Pinned by
+/// `a_profile_directory_name_cannot_forge_a_probe_record`.
 fn hermes_profiles_block() -> String {
     format!(
         r#"if _hb=$(command -v hermes 2>/dev/null) && [ -n "$_hb" ]; then
@@ -235,6 +241,10 @@ fn discover_script(config: &SshConfig) -> String {
     }
     // The Hermes CLI, which is what a per-profile entry runs — the `hermes-acp`
     // shim takes no arguments of its own, so it cannot carry `--profile`.
+    //
+    // `hermes --version` costs ~0.7s against the 40s budget. Fine for one, but
+    // the probes are sequential: further CLI probes need to be weighed against
+    // that budget rather than simply appended.
     script.push_str(&format!("probe {} 'hermes'\n", quote(HERMES_CLI_KEY)));
     script.push_str(&hermes_profiles_block());
     script
@@ -774,9 +784,12 @@ mod tests {
     }
 
     #[test]
-    fn hermes_with_no_readable_profiles_is_just_the_plain_entry() {
-        // An unreadable or empty profile store is not an error: the shim entry
-        // still runs the sticky profile.
+    fn hermes_with_no_profile_records_is_just_the_plain_entry() {
+        // A stdout carrying no profile records at all — what a *missing* Hermes
+        // root produces — is not an error: the shim entry still runs the sticky
+        // profile. A root that exists without a `profiles/` store is a
+        // different stdout, pinned by
+        // `a_hermes_root_without_a_profiles_store_still_advertises_default`.
         let response = harnesses_response(&hermes_stdout(&[]));
         assert_eq!(response["ok"], true);
         assert_eq!(
@@ -907,6 +920,59 @@ mod tests {
         assert!(script.contains(&format!(r#"[ "$_hc" -lt {MAX_HERMES_PROFILES} ] || break"#)));
     }
 
+    /// Run the real generated script through `/bin/sh` against a fake host
+    /// rooted at `root`, with `HERMES_HOME` set to `hermes_home`. Returns the
+    /// script's stdout.
+    #[cfg(unix)]
+    fn run_discover_script(root: &std::path::Path, hermes_home: &std::path::Path) -> String {
+        // Stub `hermes` so `command -v hermes` resolves on the fake host.
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let hermes = bin.join("hermes");
+        std::fs::write(&hermes, "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hermes, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-s")
+            .env_clear()
+            .env("HOME", root)
+            .env("HERMES_HOME", hermes_home)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(discover_script(&config()).as_bytes())
+                    .unwrap();
+                child.wait_with_output()
+            })
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// Every probe key the script is allowed to emit. Anything else on stdout
+    /// in four-field shape is a forged record.
+    #[cfg(unix)]
+    fn expected_probe_keys() -> Vec<&'static str> {
+        let mut keys = vec!["buzz-acp", HERMES_CLI_KEY];
+        keys.extend(CANDIDATES.iter().map(|candidate| candidate.id));
+        keys
+    }
+
     /// Execute the real generated script against `/bin/sh` over a fake host
     /// layout. Substring assertions prove the script *says* the right things;
     /// only running it proves the `case` globs, the `${_hd%/}` trimming and the
@@ -918,9 +984,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("buzz-hermes-profiles-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let bin = root.join("bin");
         let profiles = root.join("hermes/profiles");
-        std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&profiles).unwrap();
 
         let canary = root.join("pwn");
@@ -945,49 +1009,15 @@ mod tests {
         // A plain file under profiles/ is not a profile.
         std::fs::write(profiles.join("notes.md"), "x").unwrap();
 
-        // Stub `hermes` so `command -v hermes` resolves on the fake host.
-        let hermes = bin.join("hermes");
-        std::fs::write(&hermes, "#!/bin/sh\nexit 0\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&hermes, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let output = std::process::Command::new("/bin/sh")
-            .arg("-s")
-            .env_clear()
-            .env("HOME", &root)
-            // Exercises the Docker/custom layout AND the `*/profiles/*` trim by
-            // pointing HERMES_HOME at a profile rather than at the root.
-            .env("HERMES_HOME", root.join("hermes/profiles/matt"))
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                child
-                    .stdin
-                    .take()
-                    .unwrap()
-                    .write_all(discover_script(&config()).as_bytes())
-                    .unwrap();
-                child.wait_with_output()
-            })
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "script failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        // Exercises the Docker/custom layout AND the `*/profiles/*` trim by
+        // pointing HERMES_HOME at a profile rather than at the root.
+        let stdout = run_discover_script(&root, &root.join("hermes/profiles/matt"));
         // Nothing under `profiles/` was ever executed.
         assert!(
             !canary.exists(),
             "a directory name was evaluated by the shell"
         );
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let (names, _) = hermes_profiles(&stdout);
         assert_eq!(
             names,
@@ -1010,6 +1040,93 @@ mod tests {
             serde_json::json!(["--profile", "msig-web-analyst", "acp"])
         );
         assert_eq!(entry(&response, "hermes-matt")["command"], "hermes");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The forging path, which the labeled `hermes-profile` stream never
+    /// exercises: a directory name carrying a newline plus three tab-separated
+    /// fields prints a *second*, unlabeled line that [`parse_probes`] would
+    /// accept as a four-field probe record for any candidate it names. Nothing
+    /// downstream can catch it — `hermes_profiles` only ever sees the labeled
+    /// prefix — so the script's charset `case` arms are the whole defense, and
+    /// this is what pins them.
+    #[cfg(unix)]
+    #[test]
+    fn a_profile_directory_name_cannot_forge_a_probe_record() {
+        let root = std::env::temp_dir().join(format!("buzz-hermes-forge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let profiles = root.join("hermes/profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::create_dir_all(profiles.join("matt")).unwrap();
+        // Reads on stdout as `hermes-profile<TAB>x` followed by a complete
+        // `claude<TAB>evil-acp<TAB>tmp-evil-acp<TAB>9.9.9` record.
+        std::fs::create_dir_all(profiles.join("x\nclaude\tevil-acp\ttmp-evil-acp\t9.9.9")).unwrap();
+
+        let stdout = run_discover_script(&root, &root.join("hermes"));
+
+        let keys: Vec<&str> = parse_probes(&stdout).iter().map(|p| p.key).collect();
+        let expected = expected_probe_keys();
+        assert!(
+            keys.iter().all(|key| expected.contains(key)),
+            "a directory name forged a probe record; keys were {keys:?}, stdout was: {stdout:?}"
+        );
+
+        // The concrete consequence the record would have had: `claude` claiming
+        // to be installed, pinned as the deploy's BUZZ_ACP_AGENT_COMMAND.
+        let response = harnesses_response(&stdout);
+        let claude = entry(&response, "claude");
+        assert_eq!(claude["available"], false, "stdout was: {stdout:?}");
+        assert_eq!(claude["command"], "claude-agent-acp");
+        assert!(claude["binaryPath"].is_null());
+
+        // The name is not a legal profile either, so it adds no entry.
+        let (names, _) = hermes_profiles(&stdout);
+        assert_eq!(names, vec!["default", "matt"], "stdout was: {stdout:?}");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A Hermes root that exists but has no `profiles/` store: the `default`
+    /// entry still ships, because the root directory *is* the default profile.
+    /// Distinct from a missing root, which emits nothing at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_hermes_root_without_a_profiles_store_still_advertises_default() {
+        let root =
+            std::env::temp_dir().join(format!("buzz-hermes-noprofiles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("hermes")).unwrap();
+
+        let stdout = run_discover_script(&root, &root.join("hermes"));
+        let (names, _) = hermes_profiles(&stdout);
+        assert_eq!(names, vec!["default"], "stdout was: {stdout:?}");
+
+        let response = harnesses_response(&stdout);
+        assert_eq!(
+            response["harnesses"].as_array().unwrap().len(),
+            CANDIDATES.len() + 1
+        );
+        assert_eq!(
+            entry(&response, "hermes-default")["args"],
+            serde_json::json!(["--profile", "default", "acp"])
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A missing Hermes root — the case `hermes_stdout(&[])` models — emits no
+    /// profile records at all, leaving only the plain shim entry.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_hermes_root_advertises_no_profiles() {
+        let root = std::env::temp_dir().join(format!("buzz-hermes-noroot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let stdout = run_discover_script(&root, &root.join("hermes"));
+        let (names, _) = hermes_profiles(&stdout);
+        assert!(names.is_empty(), "stdout was: {stdout:?}");
 
         std::fs::remove_dir_all(&root).unwrap();
     }
