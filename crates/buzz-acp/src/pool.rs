@@ -1205,10 +1205,9 @@ async fn apply_session_config(
         !capabilities.config_options_raw.is_empty() || capabilities.available_models_raw.is_some();
 
     // Publish the catalog to the process-wide cache, so `!model` can list and
-    // validate while every agent is checked out mid-turn.
-    if advertises_catalog {
-        ctx.model_catalog.capture(capabilities);
-    }
+    // validate while every agent is checked out mid-turn. `capture` ignores a
+    // catalog with no selectable models, which is what an absent one parses to.
+    ctx.model_catalog.capture(capabilities);
 
     // Apply desired_model if set, matching against the fresh session response.
     // Track whether the switch succeeded so session_config_captured reflects
