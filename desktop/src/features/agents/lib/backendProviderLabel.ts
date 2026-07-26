@@ -1,0 +1,41 @@
+import type { BackendProviderCandidate } from "@/shared/api/types";
+
+/**
+ * How the app names a backend provider — the `buzz-backend-*` binary that runs
+ * an agent on a machine other than this computer.
+ *
+ * A provider's own `info.name` ("SSH") is friendlier than its binary-derived id
+ * ("ssh"), but `info` is a subprocess round-trip: surfaces that render a
+ * provider before the user has asked anything of it (the onboarding notice, an
+ * agent card) have not paid for one, so the id stands in. That is the same
+ * trade `runTargetOptions` makes in the create dialog, and this is the single
+ * owner of the rule so the two cannot drift into different naming schemes for
+ * the same machine.
+ */
+export function backendProviderLabel(
+  id: string,
+  probedName?: string | null,
+): string {
+  const name = probedName?.trim();
+  if (name) return name;
+  const trimmedId = id.trim();
+  return trimmedId || "Unknown provider";
+}
+
+/**
+ * Labels for a discovered provider list, in a stable order.
+ *
+ * Sorted rather than left in discovery order because discovery walks `PATH`,
+ * so the same two providers can come back in a different order between reads
+ * and a hint line would reshuffle itself under the user.
+ */
+export function backendProviderLabels(
+  providers: readonly BackendProviderCandidate[],
+  probedNames: Readonly<Record<string, string>> = {},
+): string[] {
+  return providers
+    .map((provider) =>
+      backendProviderLabel(provider.id, probedNames[provider.id]),
+    )
+    .sort((left, right) => left.localeCompare(right));
+}
