@@ -74,9 +74,10 @@ pub struct TaskMeta {
     pub elicitation_tx: Option<(Arc<AtomicBool>, tokio::sync::mpsc::Sender<ElicitationReply>)>,
 }
 
-/// Agent-level model capabilities. Populated on first session creation.
-/// The catalog is the same across all sessions for a given agent process.
+/// Model capabilities of the configured agent command. Populated on first
+/// session creation (or resume) and identical for every later session.
 /// Fields are read by the desktop's `get_agent_models` Tauri command (Phase 3).
+#[derive(Clone)]
 #[allow(dead_code)] // Scaffolding for desktop integration — fields read via serde.
 pub struct AgentModelCapabilities {
     /// Stable: configOptions with category "model" from session/new.
@@ -124,6 +125,60 @@ impl AgentModelCapabilities {
             self.available_models_raw.as_ref(),
             model_id,
         )
+    }
+
+    /// The model the adapter itself reported as selected, in the same
+    /// half-precedence [`Self::models`] uses. This is the answer for an agent
+    /// nobody has overridden — `desired_model` is `None` until `--model` or a
+    /// live switch sets one.
+    pub fn reported_current(&self) -> Option<&str> {
+        let config_current = self
+            .config_options_raw
+            .iter()
+            .find_map(|opt| opt.get("currentValue")?.as_str());
+        config_current.or_else(|| {
+            self.available_models_raw
+                .as_ref()?
+                .get("currentModelId")?
+                .as_str()
+        })
+    }
+}
+
+/// Process-wide model catalog for the configured agent command, shared between
+/// the main loop and every in-flight prompt task.
+///
+/// The catalog is a property of the agent *command*, not of a session or a pool
+/// slot: all slots run the same binary and every session of a given process
+/// reports the same list. Holding it here rather than on [`OwnedAgent`] is what
+/// makes `!model` answerable while the agent is checked out mid-turn — with the
+/// default `--agents 1` that is the entire busy path, and a pool-slot lookup
+/// would find nothing.
+///
+/// Captured task-side from the first session bound by any slot — `session/new`
+/// or `session/resume`, whichever comes first.
+#[derive(Clone, Default)]
+pub struct ModelCatalog(Arc<Mutex<Option<AgentModelCapabilities>>>);
+
+impl ModelCatalog {
+    /// Record the catalog carried by a freshly bound session, first one wins.
+    /// A response carrying no selectable models is not a catalog — some
+    /// adapters omit both halves on `session/resume` — so it is ignored rather
+    /// than latched as an empty list.
+    pub fn capture(&self, caps: AgentModelCapabilities) {
+        if caps.models().is_empty() {
+            return;
+        }
+        if let Ok(mut slot) = self.0.lock() {
+            slot.get_or_insert(caps);
+        }
+    }
+
+    /// Snapshot of the catalog, or `None` before any session has been bound.
+    ///
+    /// Returns a clone so callers can hold it across a `&mut AgentPool` borrow.
+    pub fn get(&self) -> Option<AgentModelCapabilities> {
+        self.0.lock().ok()?.clone()
     }
 }
 
@@ -200,8 +255,6 @@ pub struct OwnedAgent {
     pub index: usize,
     pub acp: AcpClient,
     pub state: SessionState,
-    /// Model catalog from first session/new. None until first session created.
-    pub model_capabilities: Option<AgentModelCapabilities>,
     /// Desired model ID (from `Config.model`). Applied after every `session_new_full()`.
     pub desired_model: Option<String>,
     /// Whether `desired_model` was set by a live `SwitchModel` control signal
@@ -673,6 +726,10 @@ pub struct PromptContext {
     /// conversation instead of starting over. `None` disables durable resume:
     /// no data directory, or `--agents > 1` (see [`crate::session_store`]).
     pub session_store: Option<SessionStore>,
+    /// Model catalog of the configured agent command, captured task-side from
+    /// the first bound session and readable from the main loop while every
+    /// agent is mid-turn. See [`ModelCatalog`].
+    pub model_catalog: ModelCatalog,
 }
 
 impl AgentPool {
@@ -882,37 +939,40 @@ impl AgentPool {
         count
     }
 
-    /// Model catalog and current pick for `channel_id`.
+    /// The model override in force for `channel_id`, if the channel's own agent
+    /// is idle and carries one.
     ///
-    /// Prefers the idle agent holding the channel's session — with `--agents
-    /// N > 1`, `desired_model` is per-agent-process, so only that agent's pick
-    /// is the channel's. The catalog itself is identical across agents (all run
-    /// the same command), so any idle agent serves it. `None` while every agent
-    /// is mid-turn (each is moved out of its slot by [`Self::try_claim`]) or
-    /// before a first session exists.
-    pub fn model_catalog(
-        &self,
-        channel_id: Uuid,
-    ) -> Option<(&AgentModelCapabilities, Option<&str>)> {
-        let agents = self.agents.iter().flatten();
-        let owning = agents
-            .clone()
+    /// `desired_model` is per-agent-*process*, so an arbitrary slot's pick is
+    /// some other conversation's, not this channel's. Two slots can honestly
+    /// answer for `channel_id`: the one holding its session, and — when the
+    /// pool has a single slot, the default — that slot, which necessarily
+    /// serves every channel. A just-switched channel has no session (the switch
+    /// invalidates it), which is why the second case is not redundant.
+    ///
+    /// `None` means "no override readable here", not "no current model": the
+    /// adapter's own answer lives in the catalog
+    /// ([`AgentModelCapabilities::reported_current`]).
+    pub fn channel_model_override(&self, channel_id: Uuid) -> Option<&str> {
+        let owning = self
+            .agents
+            .iter()
+            .flatten()
             .find(|agent| agent.state.sessions.contains_key(&channel_id));
-        owning.into_iter().chain(agents).find_map(|agent| {
-            Some((
-                agent.model_capabilities.as_ref()?,
-                agent.desired_model.as_deref(),
-            ))
-        })
+        let sole = match self.agents.as_slice() {
+            [only] => only.as_ref(),
+            _ => None,
+        };
+        owning.or(sole)?.desired_model.as_deref()
     }
 
     /// Idle-path model switch: set `desired_model` on the idle agent for
     /// `channel_id` and invalidate its session so the next turn re-creates the
     /// session under the new model.
     ///
-    /// Pre-cancel guard: the desired model is validated against the agent's
-    /// cached catalog *before* the session is invalidated, so an unsupported
-    /// pick is rejected without disturbing the existing session.
+    /// Validation is the caller's job — [`crate::handle_model_command`] and the
+    /// desktop both pre-check against [`PromptContext::model_catalog`], which
+    /// (unlike anything reachable from a pool slot) is also readable while the
+    /// agent is mid-turn.
     ///
     /// Returns [`IdleSwitchResult`] describing what happened. The model does not
     /// take effect — and the panel does not reflect it — until the agent next
@@ -933,16 +993,6 @@ impl AgentPool {
             return IdleSwitchResult::NoIdleAgent;
         };
 
-        // Pre-cancel guard against the cached catalog. None = catalog not yet
-        // populated (no session ever created); defer validation to apply time.
-        if agent
-            .model_capabilities
-            .as_ref()
-            .is_some_and(|caps| !caps.contains(model_id))
-        {
-            return IdleSwitchResult::UnsupportedModel;
-        }
-
         agent.desired_model = Some(model_id.to_string());
         agent.model_overridden = true;
         agent.state.invalidate_channel(&channel_id);
@@ -955,10 +1005,8 @@ impl AgentPool {
 pub enum IdleSwitchResult {
     /// `desired_model` set and the channel session invalidated.
     Switched,
-    /// Desired model is not in the agent's cached catalog — pick rejected,
-    /// session untouched.
-    UnsupportedModel,
-    /// No idle agent available (all checked out / none spawned).
+    /// No idle agent holds a session for the channel (checked out, or none
+    /// spawned).
     NoIdleAgent,
 }
 
@@ -1062,13 +1110,12 @@ async fn apply_session_config(
     ctx: &PromptContext,
     resp: &SessionNewResponse,
 ) -> Result<(), AcpError> {
-    // Populate model capabilities on first session creation.
-    if agent.model_capabilities.is_none() {
-        agent.model_capabilities = Some(AgentModelCapabilities {
-            config_options_raw: extract_model_config_options(&resp.raw),
-            available_models_raw: extract_model_state(&resp.raw),
-        });
-    }
+    // Publish the catalog to the process-wide cache, so `!model` can list and
+    // validate while every agent is checked out mid-turn.
+    ctx.model_catalog.capture(AgentModelCapabilities {
+        config_options_raw: extract_model_config_options(&resp.raw),
+        available_models_raw: extract_model_state(&resp.raw),
+    });
 
     // Apply desired_model if set, matching against the fresh session response.
     // Track whether the switch succeeded so session_config_captured reflects
@@ -5334,7 +5381,6 @@ mod tests {
             index: 0,
             acp,
             state: SessionState::default(),
-            model_capabilities: None,
             desired_model: None,
             model_overridden: false,
             agent_name: "unknown".into(),
@@ -5393,7 +5439,6 @@ mod tests {
             index: 0,
             acp,
             state: SessionState::default(),
-            model_capabilities: None,
             desired_model: None,
             model_overridden: false,
             agent_name: "unknown".into(),
@@ -5693,6 +5738,7 @@ mod tests {
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
             session_store: None,
+            model_catalog: ModelCatalog::default(),
         }
     }
 
@@ -5706,7 +5752,6 @@ mod tests {
                 .await
                 .expect("spawn scripted agent"),
             state: SessionState::default(),
-            model_capabilities: None,
             desired_model: None,
             model_overridden: false,
             agent_name: "unknown".into(),
@@ -5837,11 +5882,10 @@ mod tests {
             Some("ses_1")
         );
         assert!(
-            agent
-                .model_capabilities
-                .as_ref()
+            ctx.model_catalog
+                .get()
                 .is_some_and(|caps| caps.contains("haiku")),
-            "the resumed session's catalog must populate model capabilities"
+            "the resumed session's catalog must populate the shared catalog"
         );
         agent.acp.shutdown().await;
     }

@@ -104,12 +104,24 @@ Unknown `kind` values MUST be ignored.
 
 ### Frame Kinds
 
-| `kind`             | Description                                              |
-|--------------------|----------------------------------------------------------|
-| `acp_read`         | Inbound ACP protocol frame (model → harness)             |
-| `acp_write`        | Outbound ACP protocol frame (harness → model)            |
-| `turn_started`     | A new agent turn has begun                               |
-| `session_resolved` | Session completed or terminated                          |
+| `kind`                             | Description                                                              |
+|------------------------------------|--------------------------------------------------------------------------|
+| `acp_read`                         | Inbound ACP protocol frame (model → harness)                             |
+| `acp_write`                        | Outbound ACP protocol frame (harness → model)                            |
+| `acp_parse_error`                  | A wire line could not be parsed as JSON and was skipped                  |
+| `harness_started`                  | The harness process came up and is about to start the agent pool         |
+| `agent_initialized`                | An agent slot answered `initialize`; carries the full initialize result  |
+| `managed_agent_runtime_lifecycle`  | Harness runtime state change (`listening`, `ready`, exit)                |
+| `agent_panic`                      | A prompt task panicked; the wedged channel/heartbeat was cleared         |
+| `turn_started`                     | A new agent turn has begun                                               |
+| `turn_liveness`                    | Periodic ping proving the in-flight turn is still alive                  |
+| `turn_completed`                   | A turn left the harness, on every exit path (success, error, panic)      |
+| `turn_error`                       | A turn ended in a failure the harness classified                         |
+| `session_resolved`                 | The turn's session was created, resumed, or reused                       |
+| `session_config_captured`          | Session config after model/permission-mode resolution                    |
+| `control_result`                   | Outcome of a `frame=control` command (e.g. `cancel_turn`, `switch_model`) |
+
+`test_event` is emitted only by the harness's own test suite and MUST NOT be relied on.
 
 ### Control (`frame=control`)
 

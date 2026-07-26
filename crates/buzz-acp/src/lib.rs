@@ -841,6 +841,7 @@ fn handle_relay_observer_control_event(
     keys: &nostr::Keys,
     event: nostr::Event,
     pool: &mut AgentPool,
+    catalog: &pool::ModelCatalog,
     observer: Option<&observer::ObserverHandle>,
     owner_pubkey_hex: &str,
 ) {
@@ -886,7 +887,7 @@ fn handle_relay_observer_control_event(
             handle_cancel_turn_control(&payload, pool, observer);
         }
         Some("switch_model") => {
-            handle_switch_model_control(&payload, pool, observer);
+            handle_switch_model_control(&payload, pool, catalog, observer);
         }
         _ => {
             tracing::debug!(payload = %payload, "ignoring unknown observer control frame");
@@ -958,22 +959,29 @@ impl SwitchOutcome {
     }
 }
 
-/// Switch the model backing `channel_id` (Phase 3a, Option ii).
+/// Switch the model backing `channel_id`.
+///
+/// Pre-cancel guard: an unsupported pick is rejected against the process-wide
+/// catalog before anything is disturbed, on both paths. The catalog is only
+/// unknown before the first session of the process binds, in which case the
+/// pick is passed through and validated at apply time instead.
 ///
 /// Busy path: deliver `SwitchModel` over the in-flight task's oneshot — the
 /// task cancels the turn, sets `desired_model`, and requeues the batch so it
-/// re-runs on a fresh session under the new model. A catalog miss surfaces
-/// post-cancel via `create_session_and_apply_model` (the turn restarts on the
-/// unchanged model + an `unsupported_model` result).
+/// re-runs on a fresh session under the new model.
 ///
-/// Idle path: validate against the cached catalog *before* invalidating
-/// (pre-cancel guard), then set `desired_model` + invalidate. The override
-/// takes visible effect on the agent's next turn.
+/// Idle path: set `desired_model` + invalidate the channel's session. The
+/// override takes visible effect on the agent's next turn.
 fn switch_model_for_channel(
     pool: &mut AgentPool,
+    catalog: Option<&pool::AgentModelCapabilities>,
     channel_id: Uuid,
     model_id: &str,
 ) -> SwitchOutcome {
+    if catalog.is_some_and(|caps| !caps.contains(model_id)) {
+        return SwitchOutcome::UnsupportedModel;
+    }
+
     // A turn is in flight for this channel iff a task_map entry exists. The
     // agent is moved out of the pool during a turn, so the control oneshot is
     // the only reachable lever; an idle channel has no such entry.
@@ -996,10 +1004,8 @@ fn switch_model_for_channel(
             SwitchOutcome::TurnEnding
         }
     } else {
-        // Idle path: validate against the cached catalog before invalidating.
         match pool.switch_idle_agent_model(channel_id, model_id) {
             IdleSwitchResult::Switched => SwitchOutcome::Switched,
-            IdleSwitchResult::UnsupportedModel => SwitchOutcome::UnsupportedModel,
             IdleSwitchResult::NoIdleAgent => SwitchOutcome::NoActiveTurn,
         }
     }
@@ -1010,6 +1016,7 @@ fn switch_model_for_channel(
 fn handle_switch_model_control(
     payload: &serde_json::Value,
     pool: &mut AgentPool,
+    catalog: &pool::ModelCatalog,
     observer: Option<&observer::ObserverHandle>,
 ) {
     let Some(channel_id) = payload
@@ -1025,7 +1032,8 @@ fn handle_switch_model_control(
         return;
     };
 
-    let status = switch_model_for_channel(pool, channel_id, model_id).status();
+    let status =
+        switch_model_for_channel(pool, catalog.get().as_ref(), channel_id, model_id).status();
 
     if let Some(observer) = observer {
         observer.emit(
@@ -1055,31 +1063,30 @@ fn handle_switch_model_control(
 /// pairs (`opus[1m]` vs `claude-opus-5`, `gpt-5.3-codex` vs
 /// `gpt-5.3-codex/low`), so any prefix rule would silently pick a different
 /// context lane and price point.
-fn handle_model_command(pool: &mut AgentPool, channel_id: Uuid, model_id: &str) -> String {
-    // Rendered eagerly: `model_catalog` borrows the pool that the switch below
-    // needs mutably. `None` while every agent is mid-turn (each is moved out of
-    // its slot for the duration) — switching still works from there, it goes
-    // through the in-flight task rather than the pool.
-    let catalog = pool.model_catalog(channel_id).and_then(|(caps, current)| {
-        Some((
-            render_model_catalog(caps, current)?,
-            caps.contains(model_id),
-        ))
+fn handle_model_command(
+    pool: &mut AgentPool,
+    catalog: &pool::ModelCatalog,
+    channel_id: Uuid,
+    model_id: &str,
+) -> String {
+    // The channel's current model: an owner override if one is set on the agent
+    // serving this channel, else whatever the adapter last reported as selected.
+    // Snapshotted before the switch below takes the pool mutably.
+    let caps = catalog.get();
+    let listing = caps.as_ref().and_then(|caps| {
+        let current = pool
+            .channel_model_override(channel_id)
+            .or_else(|| caps.reported_current());
+        render_model_catalog(caps, current)
     });
 
     if model_id.is_empty() {
-        return catalog.map_or_else(
-            || "I don't know my model list yet — ask again in a moment.".to_string(),
-            |(listing, _)| listing,
-        );
-    }
-    // Pre-validate so a typo never cancels a live turn. With no catalog, defer
-    // to the existing apply-time `unsupported_model` path.
-    if let Some((listing, false)) = catalog {
-        return format!("`{model_id}` isn't one of my models.\n\n{listing}");
+        return listing.unwrap_or_else(|| {
+            "I don't know my model list yet — ask again in a moment.".to_string()
+        });
     }
 
-    match switch_model_for_channel(pool, channel_id, model_id) {
+    match switch_model_for_channel(pool, caps.as_ref(), channel_id, model_id) {
         SwitchOutcome::Sent => {
             format!("Switching to `{model_id}` — restarting the current turn on the new model.")
         }
@@ -1089,7 +1096,10 @@ fn handle_model_command(pool: &mut AgentPool, channel_id: Uuid, model_id: &str) 
         SwitchOutcome::TurnEnding => {
             "The current turn is already ending — re-send once it finishes.".to_string()
         }
-        SwitchOutcome::UnsupportedModel => format!("`{model_id}` isn't one of my models."),
+        SwitchOutcome::UnsupportedModel => match listing {
+            Some(listing) => format!("`{model_id}` isn't one of my models.\n\n{listing}"),
+            None => format!("`{model_id}` isn't one of my models."),
+        },
         // No agent holds a session for this channel, so there is nothing to
         // switch. Say so rather than claiming a switch that never happened.
         SwitchOutcome::NoActiveTurn => {
@@ -1709,6 +1719,7 @@ async fn tokio_main() -> Result<()> {
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
         session_store: durable_session_store(config.agents, &pubkey_hex),
+        model_catalog: pool::ModelCatalog::default(),
     });
 
     if !config.memory_enabled {
@@ -1939,7 +1950,6 @@ async fn tokio_main() -> Result<()> {
                         index: rr.index,
                         acp,
                         state: SessionState::default(),
-                        model_capabilities: None,
                         desired_model: config.model.clone(),
                         model_overridden: false,
                         agent_name,
@@ -2039,7 +2049,7 @@ async fn tokio_main() -> Result<()> {
                     match control_event {
                         Some(event) => {
                             if let Some(ref owner_hex) = owner_cache.pubkey {
-                                handle_relay_observer_control_event(&config.keys, event, &mut pool, observer.as_ref(), owner_hex);
+                                handle_relay_observer_control_event(&config.keys, event, &mut pool, &ctx.model_catalog, observer.as_ref(), owner_hex);
                             } else {
                                 tracing::warn!("observer control frame received but no owner resolved — dropping");
                             }
@@ -2265,6 +2275,7 @@ async fn tokio_main() -> Result<()> {
                                 Some(("!model", model_id)) => {
                                     let reply = handle_model_command(
                                         &mut pool,
+                                        &ctx.model_catalog,
                                         buzz_event.channel_id,
                                         model_id,
                                     );
@@ -4005,7 +4016,6 @@ async fn initialize_agent_pool(
                             index: i,
                             acp,
                             state: SessionState::default(),
-                            model_capabilities: None,
                             desired_model: startup.model.clone(),
                             model_overridden: false,
                             agent_name,
@@ -4571,8 +4581,29 @@ mod owner_control_command_tests {
         ));
     }
 
-    /// An idle agent holding a session for `channel_id`, with a two-half
-    /// catalog whose ids mirror the ambiguous pairs real adapters ship.
+    /// A two-half catalog whose ids mirror the ambiguous pairs real adapters
+    /// ship, reporting `haiku` as the adapter's own current selection.
+    fn test_catalog() -> pool::ModelCatalog {
+        let catalog = pool::ModelCatalog::default();
+        catalog.capture(pool::AgentModelCapabilities {
+            config_options_raw: vec![serde_json::json!({
+                "id": "model",
+                "category": "model",
+                "currentValue": "haiku",
+                "options": [
+                    { "value": "haiku", "name": "Haiku" },
+                    { "value": "opus[1m]", "name": "Opus (1M context)" }
+                ]
+            })],
+            available_models_raw: Some(serde_json::json!({
+                "availableModels": [{ "modelId": "claude-opus-5" }]
+            })),
+        });
+        catalog
+    }
+
+    /// A stock idle agent holding a session for `channel_id`: no `--model`, no
+    /// prior switch, so `desired_model` is `None` like the default deployment.
     async fn idle_agent(index: usize, channel_id: Uuid) -> OwnedAgent {
         let mut state = SessionState::default();
         state.sessions.insert(channel_id, "sess-1".to_string());
@@ -4582,20 +4613,7 @@ mod owner_control_command_tests {
                 .await
                 .expect("spawn cat as inert agent"),
             state,
-            model_capabilities: Some(pool::AgentModelCapabilities {
-                config_options_raw: vec![serde_json::json!({
-                    "id": "model",
-                    "category": "model",
-                    "options": [
-                        { "value": "haiku", "name": "Haiku" },
-                        { "value": "opus[1m]", "name": "Opus (1M context)" }
-                    ]
-                })],
-                available_models_raw: Some(serde_json::json!({
-                    "availableModels": [{ "modelId": "claude-opus-5" }]
-                })),
-            }),
-            desired_model: Some("haiku".to_string()),
+            desired_model: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -4608,30 +4626,50 @@ mod owner_control_command_tests {
         AgentPool::from_slots(vec![Some(idle_agent(0, channel_id).await)])
     }
 
+    /// On a stock agent nobody has overridden — the most common `!model` call —
+    /// the marker must come from the adapter's own reported selection.
     #[tokio::test]
-    async fn model_command_without_args_lists_catalog() {
+    async fn model_command_without_args_marks_the_adapter_reported_current() {
         let channel_id = Uuid::new_v4();
         let mut pool = pool_with_idle_agent(channel_id).await;
 
         assert_eq!(
-            handle_model_command(&mut pool, channel_id, ""),
+            handle_model_command(&mut pool, &test_catalog(), channel_id, ""),
             "My models:\n- `haiku` — Haiku ← current\n- `opus[1m]` — Opus (1M context)\n- `claude-opus-5`"
         );
     }
 
+    /// An owner override outranks the adapter's reported selection: the agent
+    /// has not run a turn under it yet, so the adapter still reports the old one.
     #[tokio::test]
-    async fn model_command_marks_the_pick_of_the_agent_serving_the_channel() {
-        // `desired_model` is per-agent-process, so with --agents N > 1 only the
-        // agent holding the channel's session knows the channel's model.
+    async fn model_command_marks_the_owner_override_over_the_reported_current() {
+        let channel_id = Uuid::new_v4();
+        let mut agent = idle_agent(0, channel_id).await;
+        agent.desired_model = Some("claude-opus-5".to_string());
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        let listing = handle_model_command(&mut pool, &test_catalog(), channel_id, "");
+        assert!(listing.contains("`claude-opus-5` ← current"), "{listing}");
+        assert!(!listing.contains("`haiku` — Haiku ←"), "{listing}");
+    }
+
+    /// `desired_model` is per-agent-process, so with `--agents N > 1` only the
+    /// agent holding the channel's session speaks for the channel. Another
+    /// slot's override must never be marked as this channel's current.
+    #[tokio::test]
+    async fn model_command_ignores_another_agents_override() {
         let channel_id = Uuid::new_v4();
         let mut other = idle_agent(0, Uuid::new_v4()).await;
-        other.desired_model = Some("claude-opus-5".to_string());
+        other.desired_model = Some("opus[1m]".to_string());
         let mut pool =
             AgentPool::from_slots(vec![Some(other), Some(idle_agent(1, channel_id).await)]);
 
-        let listing = handle_model_command(&mut pool, channel_id, "");
+        let listing = handle_model_command(&mut pool, &test_catalog(), channel_id, "");
         assert!(listing.contains("`haiku` — Haiku ← current"), "{listing}");
-        assert!(!listing.contains("`claude-opus-5` ←"), "{listing}");
+        assert!(
+            !listing.contains("`opus[1m]` — Opus (1M context) ←"),
+            "{listing}"
+        );
     }
 
     #[tokio::test]
@@ -4640,11 +4678,13 @@ mod owner_control_command_tests {
         let mut pool = pool_with_idle_agent(channel_id).await;
 
         assert_eq!(
-            handle_model_command(&mut pool, channel_id, "claude-opus-5"),
+            handle_model_command(&mut pool, &test_catalog(), channel_id, "claude-opus-5"),
             "Model set to `claude-opus-5`. Takes effect on my next turn."
         );
-        let (_, current) = pool.model_catalog(channel_id).expect("catalog");
-        assert_eq!(current, Some("claude-opus-5"));
+        assert_eq!(
+            pool.channel_model_override(channel_id),
+            Some("claude-opus-5")
+        );
     }
 
     #[tokio::test]
@@ -4654,19 +4694,25 @@ mod owner_control_command_tests {
 
         // `opus` prefixes both `opus[1m]` and `claude-opus-5` — matching is
         // exact, so it is a miss, and the miss renders the list.
-        let reply = handle_model_command(&mut pool, channel_id, "opus");
+        let reply = handle_model_command(&mut pool, &test_catalog(), channel_id, "opus");
         assert!(
             reply.starts_with("`opus` isn't one of my models.\n\nMy models:"),
             "{reply}"
         );
-        let (_, current) = pool.model_catalog(channel_id).expect("catalog");
-        assert_eq!(current, Some("haiku"), "a miss must not change the model");
+        assert_eq!(
+            pool.channel_model_override(channel_id),
+            None,
+            "a miss must not change the model"
+        );
     }
 
+    /// The default deployment is `--agents 1`, so during a turn the pool is
+    /// empty — the catalog must still be reachable, or a typo cancels the turn.
     #[tokio::test]
-    async fn model_command_pre_validates_before_cancelling_a_live_turn() {
+    async fn model_command_pre_validates_with_every_agent_checked_out() {
         let channel_id = Uuid::new_v4();
-        let mut pool = pool_with_idle_agent(channel_id).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let catalog = test_catalog();
         let (control_tx, mut control_rx) = tokio::sync::oneshot::channel();
         let abort_handle = pool.join_set.spawn(async {});
         pool.task_map_mut().insert(
@@ -4682,8 +4728,10 @@ mod owner_control_command_tests {
             },
         );
 
+        // No idle agent holds the session, so the marker comes from the
+        // adapter's reported current alone.
         assert_eq!(
-            handle_model_command(&mut pool, channel_id, "bogus-model"),
+            handle_model_command(&mut pool, &catalog, channel_id, "bogus-model"),
             "`bogus-model` isn't one of my models.\n\nMy models:\n- `haiku` — Haiku ← current\n- `opus[1m]` — Opus (1M context)\n- `claude-opus-5`"
         );
         assert!(
@@ -4692,7 +4740,7 @@ mod owner_control_command_tests {
         );
 
         assert_eq!(
-            handle_model_command(&mut pool, channel_id, "opus[1m]"),
+            handle_model_command(&mut pool, &catalog, channel_id, "opus[1m]"),
             "Switching to `opus[1m]` — restarting the current turn on the new model."
         );
         assert_eq!(
@@ -4705,17 +4753,30 @@ mod owner_control_command_tests {
     fn model_command_defers_when_no_catalog_is_reachable() {
         let channel_id = Uuid::new_v4();
         let mut pool = AgentPool::from_slots(vec![]);
+        let empty = pool::ModelCatalog::default();
 
         assert_eq!(
-            handle_model_command(&mut pool, channel_id, ""),
+            handle_model_command(&mut pool, &empty, channel_id, ""),
             "I don't know my model list yet — ask again in a moment."
         );
         // No catalog and no session: nothing to switch, and the reply must not
         // claim otherwise.
         assert_eq!(
-            handle_model_command(&mut pool, channel_id, "haiku"),
+            handle_model_command(&mut pool, &empty, channel_id, "haiku"),
             "I have no session for this channel yet — message me first, then `!model`."
         );
+    }
+
+    /// An adapter that reports no selectable models is not a catalog — latching
+    /// one would make every later `!model` claim the list is empty.
+    #[test]
+    fn model_catalog_ignores_a_capture_with_no_models() {
+        let catalog = pool::ModelCatalog::default();
+        catalog.capture(pool::AgentModelCapabilities {
+            config_options_raw: vec![],
+            available_models_raw: None,
+        });
+        assert!(catalog.get().is_none());
     }
 
     #[test]
@@ -5568,7 +5629,6 @@ mod error_outcome_emission_tests {
                 .await
                 .expect("spawn cat as inert agent"),
             state: Default::default(),
-            model_capabilities: None,
             desired_model: None,
             model_overridden: false,
             agent_name: "unknown".into(),

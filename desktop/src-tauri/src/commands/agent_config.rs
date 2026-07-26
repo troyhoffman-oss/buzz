@@ -471,8 +471,11 @@ fn parse_config_options(raw: Option<&serde_json::Value>) -> Vec<AcpConfigOptionE
                     .get("category")
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
+                // The schema field is `name`; `displayName` is a
+                // pre-standardization spelling some adapters still emit.
                 display_name: opt
-                    .get("displayName")
+                    .get("name")
+                    .or_else(|| opt.get("displayName"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
                 current_value: opt
@@ -497,7 +500,8 @@ fn parse_option_values(raw: Option<&serde_json::Value>) -> Vec<AcpConfigOptionVa
             Some(AcpConfigOptionValue {
                 value,
                 display_name: o
-                    .get("displayName")
+                    .get("name")
+                    .or_else(|| o.get("displayName"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
             })
