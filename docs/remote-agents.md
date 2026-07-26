@@ -297,8 +297,8 @@ WantedBy=default.target
   systemd does not expand environment variables in the program position, and the shell indirection
   that would work around that is not worth adding to a unit whose environment carries a private key.
   The substitution is shell parameter expansion, not `sed`: `sed -i` is a GNU extension that BSD and
-  macOS hosts reject. Install runs *before* resolution in the same pass, so a deploy that installed
-  `buzz-acp` writes the path of the copy it just installed, not a stale one.
+  macOS hosts reject. Resolution runs *first*; the install only fills an empty `$acp`, so a deploy
+  that installed `buzz-acp` writes the path of the copy it just installed, not a stale one.
 
 The instance name is derived from the agent name: lowercased, non-alphanumerics collapsed to `-`,
 truncated to 32 characters, plus an 8-hex FNV-1a suffix of the original name. The suffix is not
@@ -435,12 +435,17 @@ MagicDNS name typed into it will fail with `Could not resolve hostname`.
   compute, so remote agents have no `_Stop`/`_PostCompact` hook tools.
 - `check` is implemented but has no desktop caller. `discover_harnesses` serves as the de facto
   preflight, since it is the first op the create flow runs against a host.
+- The credential gate cannot see what the host already supplies. It asks the pinned REMOTE harness
+  which env keys matter, but the runtime file layer (`~/.config/goose/config.yaml`) is local, so it
+  is suppressed entirely for a remote create rather than answering for the wrong machine. A host
+  whose config file already carries the credentials is therefore still asked for them. Closing this
+  needs a `check`-style round trip that reports the host's own configuration — a protocol addition.
 - The tailnet device picker filters out phones and TVs, but still offers Windows peers, which
   cannot be deploy targets. Picking one fails at deploy, not at selection.
 - `buzz-acp` is installed only when the desktop supplies one. `deploy` installs the binary named by
   `agent.buzz_acp_binary` (from `BUZZ_ACP_PUSH_BINARY`) on a host that has none; with the variable
   unset it still refuses with exit 90. Resolving the right release artifact for the host — which is
-  what makes the create dialog's "the deploy will install it" copy true without a developer setting
-  an env var — is the immediate follow-up, and the version-refresh rule rides with it.
+  what makes the create dialog's deploy-will-install promise true without a developer setting an
+  env var — is the immediate follow-up, and the version-refresh rule rides with it.
 - An already-installed `buzz-acp` is never upgraded by a deploy, by design (see the staleness rule).
   A host stuck on an old build has to be updated by hand until artifact fetching lands.

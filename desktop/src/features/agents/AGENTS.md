@@ -138,9 +138,15 @@ with a TypeScript lookup table or an id comparison in a component.
     together: the local `AgentHarnessField` is hidden for a remote create (its
     "not installed, visit Settings" guidance describes the wrong machine), and
     the defaults summary names the host's pick via `createRemoteHarnessLabel`
-    rather than the locally seeded `runtime`. The local-mode credential gate is
-    deliberately NOT relaxed for a remote create: a deploy writes the agent's
-    env to the host verbatim, so a missing key is just as fatal there.
+    rather than the locally seeded `runtime`. The credential gate is asked of
+    the host's pin too (`createGateHarnessId`): the deploy keys the agent's env
+    off the REMOTE command, so the local id would demand `BUZZ_AGENT_*` for a
+    remote Goose, or nothing at all when this machine defaults to Claude. It is
+    NOT relaxed, though — a deploy writes that env to the host verbatim, so a
+    missing key is just as fatal there. The one layer that is suppressed is the
+    runtime *file* config: it reads this machine's `~/.config`, and letting a
+    local `goose/config.yaml` satisfy a remote requirement trades a loud
+    create-time block for a silent deploy-time failure.
     Edit mode is untouched — `createRunSection` is create-only.
 13. **A provider decorates a config property with `oneOf`; the desktop renders
     it generically.** `providerConfigChoices` reads
@@ -160,17 +166,20 @@ with a TypeScript lookup table or an id comparison in a component.
     on a successful deploy (`commands/agents.rs`) — with no clearer anywhere,
     because the provider protocol has no undeploy. So `isManagedAgentActive`
     answering true for a remote record means "this desktop deployed it", and
-    it keeps meaning that after the remote process dies. Any surface that
-    paints liveness from it must therefore go through
+    it keeps meaning that after the remote process dies. Every surface this
+    stack touches therefore paints liveness through
     `managedAgentPresenceStatus`, which keeps the control plane authoritative
     for a local record (this machine's own process table, and relays need not
     retain ephemeral kind:20001 presence) and defers to relay presence for a
     provider-backed one — the same channel `deleteManagedAgentWithRules`
-    already trusts before warning about an orphaned deployment. Do not add SSH
-    polling, a second status channel, or a `local_setup` read for a non-local
-    record: `local_setup` asks whether *this* machine could run the agent and
-    its UI copy ("Needs setup on this device") names the wrong machine. See the
-    doc comment on `status_for_with` (`runtime_commands.rs`).
+    already trusts before warning about an orphaned deployment. Two upstream
+    surfaces, `MembersSidebarMemberCard` and `AgentStatusBadge`, still paint
+    from the stale flag; they are follow-up candidates, not a licence to add a
+    third. Do not add SSH polling, a second status channel, or a `local_setup`
+    read for a non-local record: `local_setup` asks whether *this* machine
+    could run the agent and its UI copy ("Needs setup on this device") names
+    the wrong machine. See the doc comment on `status_for_with`
+    (`runtime_commands.rs`).
 15. **The pinned harness must be an `available` catalog entry.**
     `selectedRemoteHarness` filters on `available`, so an id that a re-check
     turned unavailable stops being the pin rather than deploying a command the
