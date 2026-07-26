@@ -129,7 +129,41 @@ with a TypeScript lookup table or an id comparison in a component.
     probe at the NEW host under the OLD host's harness command. A new
     host-touching call gets the same treatment — do not add one that only
     guards its own continuation.
-12. **The pinned harness must be an `available` catalog entry.**
+12. **"Where does this agent run?" is the create flow's first question, and
+    it scopes every field below it.** `createRunSection` renders above name,
+    persona, and harness in `AgentDefinitionDialog` because the harness comes
+    from the chosen machine's catalog and the models come from that harness —
+    asking last would mean answering the dependent questions against the wrong
+    computer and silently re-scoping them. Consequences that must move
+    together: the local `AgentHarnessField` is hidden for a remote create (its
+    "not installed, visit Settings" guidance describes the wrong machine), and
+    the defaults summary names the host's pick via `createRemoteHarnessLabel`
+    rather than the locally seeded `runtime`. The local-mode credential gate is
+    deliberately NOT relaxed for a remote create: a deploy writes the agent's
+    env to the host verbatim, so a missing key is just as fatal there.
+    Edit mode is untouched — `createRunSection` is create-only.
+13. **A provider decorates a config property with `oneOf`; the desktop renders
+    it generically.** `providerConfigChoices` reads
+    `oneOf: [{ const, title }]` off any config-schema property and
+    `ProviderConfigFields` renders a select over it plus an "Other…" escape
+    hatch; no `oneOf`, and the field is the plain Input it always was. The
+    desktop knows nothing about tailnets — the SSH provider fills the
+    decoration from the local Tailscale peer list and supplies the display
+    strings. Keep it that way: a Tailscale-shaped branch in the renderer makes
+    the next provider's suggestions unrenderable. A value that is not in the
+    list (carried over, or a peer that has left the tailnet) stays in free text
+    rather than reading as "nothing selected" — that is
+    `usesProviderConfigFreeText`, and it is pure so it can be tested.
+14. **Remote liveness is relay presence; there is no second status channel.**
+    A provider-backed record shows "running" through the same path a local one
+    does — `build_managed_agent_summary` reports `"deployed"` when
+    `backend_agent_id` is set, `isManagedAgentActive` accepts it, and the
+    agent card renders the same active badge. Do not add SSH polling, a
+    remote-only status row, or a `local_setup` read for a non-local record:
+    `local_setup` asks whether *this* machine could run the agent and its UI
+    copy ("Needs setup on this device") names the wrong machine. See the
+    doc comment on `status_for_with` (`runtime_commands.rs`).
+15. **The pinned harness must be an `available` catalog entry.**
     `selectedRemoteHarness` filters on `available`, so an id that a re-check
     turned unavailable stops being the pin rather than deploying a command the
     host says is not installed. Likewise the create-time args of a provider
@@ -148,9 +182,14 @@ with a TypeScript lookup table or an id comparison in a component.
   fails, you probably reintroduced a per-surface flag or conflated empty with
   failed discovery.
 - `ui/whereToRunIntent.test.mjs` — the remote create's submit gate, the
-  available-only harness pin, and `remoteModelDiscoveryView`
+  available-only harness pin, `runTargetOptions` / `remoteHarnessSummaryLabel`
+  (the first question and the summary that follows it), and
+  `remoteModelDiscoveryView`
   (idle/loading/failed/loaded/empty-catalog). Covers the PROJECTION of the
   host's probe, not the substitution that consumes it.
+- `ui/providerConfigFields.test.mjs` — `providerConfigChoices` (a malformed
+  `oneOf` entry costs one row, not the list) and `usesProviderConfigFreeText`
+  (an unlisted value stays editable). Rule 13 lives or dies here.
 - `ui/useRemoteAwareModelDiscovery.test.mjs` — `resolveModelDiscovery` and
   `shouldSuppressLocalDiscovery`. If the Model control starts offering this
   computer's models to a remote harness, or runs local discovery IPC
