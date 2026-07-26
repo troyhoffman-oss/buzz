@@ -173,6 +173,25 @@ pub(crate) fn resolve_effective_harness_descriptor(
     })
 }
 
+/// The descriptor to display for a record whose harness id no longer resolves.
+///
+/// A dangling harness can never be spawned — `spawn_agent_child` propagates the
+/// `Err` — so the read-only consumers (card summary, spawn-config hash) degrade
+/// to a best-effort command/args pair with no env rather than failing outright.
+/// Shared so those consumers cannot drift apart in how they degrade.
+pub(crate) fn dangling_harness_descriptor(
+    record: &ManagedAgentRecord,
+    personas: &[AgentDefinition],
+) -> EffectiveHarnessDescriptor {
+    let command = crate::managed_agents::record_agent_command(record, personas);
+    let args = normalize_agent_args(&command, record.agent_args.clone());
+    EffectiveHarnessDescriptor {
+        command,
+        args,
+        env: BTreeMap::new(),
+    }
+}
+
 /// Assemble the effective agent env from a record, personas, optional
 /// known-runtime metadata, and the global agent config defaults — without an
 /// `AppHandle` so it is fully unit-testable.
@@ -226,11 +245,6 @@ fn resolve_effective_agent_env_with_def(
     // Layer 1: baked build defaults (floor — internal builds only; OSS = empty).
     let mut env = baked_build_env();
 
-    // Layer 2: runtime metadata env vars (model / provider keys derived from
-    // the record's structured fields, with global as fallback).
-    //
-    // Uses the shared resolver to guarantee readiness and spawn agree on the
-    // effective model/provider: agent → persona → global → None.
     let (effective_model, effective_provider) =
         super::global_config::resolve_effective_model_provider(record, personas, global);
 
@@ -239,8 +253,8 @@ fn resolve_effective_agent_env_with_def(
             rt.model_env_var,
             rt.provider_env_var,
             rt.provider_locked,
-            effective_model,
-            effective_provider,
+            effective_model.as_deref(),
+            effective_provider.as_deref(),
         ) {
             env.insert(key.to_string(), value.to_string());
         }
@@ -277,7 +291,11 @@ fn resolve_effective_agent_env_with_def(
     // Buzz shared compute is a native Buzz provider. Translate it to buzz-agent's
     // OpenAI-compatible transport only in the effective runtime environment.
     #[cfg(feature = "mesh-llm")]
-    super::apply_relay_mesh_env(&mut env, effective_provider, effective_model);
+    super::apply_relay_mesh_env(
+        &mut env,
+        effective_provider.as_deref(),
+        effective_model.as_deref(),
+    );
 
     EffectiveAgentEnv {
         env,

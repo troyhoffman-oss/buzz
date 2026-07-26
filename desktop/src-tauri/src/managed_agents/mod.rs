@@ -9,6 +9,7 @@ mod backend;
 pub(crate) mod config_bridge;
 pub(crate) mod custom_harnesses;
 mod discovery;
+pub(crate) mod effective_config;
 mod env_vars;
 pub(crate) mod git_bash;
 pub(crate) mod global_config;

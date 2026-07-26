@@ -80,7 +80,15 @@ const overrides = new Map([
   // ratcheting 1443 -> 1295. Queued to split further in the A2 fold.
   // global-agent-config: resolve_deploy_model_provider + visibility exports
   // add ~40 lines on top of the 1A.1 ratchet. Queued to split.
-  ["src-tauri/src/commands/agents.rs", 1340],
+  // +22 (1340 -> 1360): agent-config-resolver — start_local_agent_with_preflight
+  // uses resolve_effective_relay_mesh_model_id at both preflight call sites;
+  // preview_prospective_persona_snapshot helper extracted; orphan guard threaded
+  // through restore path. Load-bearing feature changes; queued to split.
+  // +9 (1360 -> 1369): start_local_agent_pairs_with_preflight — added
+  // personas/global load + resolve_effective_relay_mesh_model_id call to
+  // replace stale record-byte preflight. Same resolver pattern as
+  // start_local_agent_with_preflight. Load-bearing; queued to split.
+  ["src-tauri/src/commands/agents.rs", 1369],
   // agent-lifecycle-fixes: cascade-delete in delete_persona restructured into
   // 3-phase (stage/stop/commit) + commit_cascade_agents injectable helper for
   // retry-safety. Load-bearing reviewer-required change; queued to split.
@@ -119,32 +127,6 @@ const overrides = new Map([
   // helpers) replace the pubkey-keyed PID file, plus the hashed pair-scoped
   // runtime log path. Load-bearing crash-recovery surface; queued to split.
   ["src-tauri/src/managed_agents/storage.rs", 1383],
-  // harness-persona-sync: persona-runtime resolution threaded into the spawn
-  // path here. Load-bearing feature growth; queued to split in the resolver
-  // unify refactor followup. +26 for resolve_effective_prompt_model_provider
-  // re-introduced after 826d735fe removal (config-bridge caller still needs it).
-  // PGID resolution helper + PID-recycling safety guard added for orphan sweep.
-  // activity-feed threads avatar_url into build_managed_agent_summary for the
-  // assistant-bubble pinned snapshot.
-  // +1 for agent_pubkey field in setup payload (config-nudge card wire).
-  // persona-blank-fallback: resolve_effective_prompt_model_provider gains a
-  // record_provider param + applies persona_field_with_record_fallback. +5 lines.
-  // global-agent-config: spawn_agent_child loads global config and merges as
-  // lowest env layer (+8 lines). Queued to split.
-  // +2: BYOH orphan-sweep fix — `!belongs && !has_buzz_marker` OR-gate replaces
-  // the old AND-gate so custom harness processes are not silently leaked on crash.
-  // +27: BYOH F4 fix — extract shared `buzz_sweep_owns_process` predicate, fix
-  // Linux AND-gate in sweep + orphan collectors, 4 production predicate tests.
-  // +12: BYOH F2 — record_agent_command / effective_agent_command check loaded
-  // harness registry for preset/custom ids after static-builtin lookup.
-  // +61: BYOH pass-2 — I2 (spawn_agent_child env+args from definition), I3
-  // (valid_agent_runtime_receipt uses buzz_sweep_owns_process marker-only),
-  // I6 (cross-platform buzz_sweep_owns_process, drop #[cfg(unix)]), +2 new
-  // receipt-path collector-decision tests.
-  // +2: BYOH Phase A — resolve_effective_harness_descriptor single typed resolver;
-  // C-9 injectable sweep predicates (kill_stale_tracked_processes_with +
-  // valid_agent_runtime_receipt_with) with 5 discriminating tests.
-  ["src-tauri/src/managed_agents/runtime.rs", 2326],
   // config-bridge setup-payload env-boundary fix adds readiness wiring in
   // spawn_agent_child; load-bearing security fix, queued to split.
   ["src-tauri/src/managed_agents/config_bridge/reader.rs", 1016],
@@ -190,15 +172,27 @@ const overrides = new Map([
   // Windows Doctor install fix: cli_install_commands_windows field added to test stubs.
   // team-instructions-first-class: ManagedAgentRecord fixture gains the new
   // team_id field (+1 line).
-  ["src-tauri/src/managed_agents/readiness.rs", 1863],
+  // +17: merge of main (#2974) — `dangling_harness_descriptor` extracted here
+  // as the single shared fallback for the three call sites (runtime summary,
+  // spawn_config_hash, model discovery) that previously each inlined it.
+  ["src-tauri/src/managed_agents/readiness.rs", 1880],
   // Windows PATH-correctness fix: 3 #[cfg(windows)] test functions covering
   // .cmd shim rejection, .bat shim rejection, and .exe acceptance for
   // configure_runtime_cli (fix #2397). Test-only growth; queued to split.
+  // +7 (1041 -> 1048): rebase onto main — this PR's resolver tests land on top
+  // of main's #2397 Windows shim tests. Test-only; queued to split.
   // +34: BYOH custom-harness sweep condition unit tests — 3 tests validating
   // the OR-gate fix for custom-binary orphan cleanup.
   // +26: BYOH pass-2 I3 — 2 collector-decision tests for receipt path
   // ownership (valid_agent_runtime_receipt uses buzz_sweep_owns_process).
-  ["src-tauri/src/managed_agents/runtime/tests.rs", 1320],
+  // +314 (1055 -> 1369): merge of main (#2974) — main's six restart_eligible
+  // tests and this branch's custom-harness sweep coverage are disjoint blocks
+  // and both are preserved. Test-only; the split stays queued.
+  ["src-tauri/src/managed_agents/runtime/tests.rs", 1369],
+  // merge of main (#1968): both sides added persona-event tests to a file that
+  // stayed under the 1000 default on each side alone (908 / 948); the union of
+  // the two disjoint blocks crosses it. Test-only; queued to split.
+  ["src-tauri/src/managed_agents/persona_events/tests.rs", 1022],
   // applyWorkspace reposDir parameter plus the validateReposDir binding,
   // threaded through Tauri invokes for configurable repos_dir, plus the
   // harness-persona-sync `harnessOverride` create-input bit — load-bearing
@@ -233,7 +227,8 @@ const overrides = new Map([
   // mapper. This is the existing API boundary; split remains queued.
   // team-instructions-first-class: createManagedAgent Tauri bridge threads the
   // new teamId input through to the backend (+1 line).
-  ["src/shared/api/tauri.ts", 1305],
+  // +2 for model_source field in RawManagedAgent + fromRawManagedAgent mapping.
+  ["src/shared/api/tauri.ts", 1307],
   // doctor-npm-eacces-preflight: hint field added to InstallStepResult (+1 line).
   // codex-acp-package-swap: "adapter_outdated" variant added to AcpAvailabilityStatus (+1 line).
   // doctor-install-reliability: AuthStatus tagged union + nodeRequired/authStatus/
@@ -253,21 +248,10 @@ const overrides = new Map([
   // Load-bearing correctness fix. Queued to split.
   // +2: AcpRuntimeCatalogEntry.requiresExternalCli field added by main
   // (#2680) to indicate runtimes that need a separate CLI install.
-  ["src/shared/api/types.ts", 1051],
-  // readiness-gate: PersonaDialog.tsx threads computeLocalModeGate +
-  // requiredCredentialEnvKeys + RequiredFieldLabel so the "New agent" dialog
-  // shows required markers and credential amber rows (parity with
-  // CreateAgentDialog). +23 lines of gate wiring. Queued to split.
-  // config-bridge-aware requirements: useRuntimeFileConfigQuery wiring adds
-  // ~16 lines. Queued to split.
-  // baked-env-required-badge: useBakedBuildEnvKeysQuery + bakedEnvKeys wiring
-  // + correct exclusion-semantics for requiredEnvKeys adds ~14 lines.
-  // +2 lines: filter managed provider key from requiredEnvKeys (suppress dead-input locked row).
-  // global-agent-config parity: wire useGlobalAgentConfig into PersonaDialog
-  // (Gap A: global-aware computeLocalModeGate + drop bare requiredCredentialEnvKeys;
-  // Gap B: hasAutoOpenedAdvancedRef auto-expand effect) + effective-provider
-  // save gate + Inherit/Select-a-provider label. Queued to split.
-  ["src/features/agents/ui/PersonaDialog.tsx", 1080],
+  // merge of main (#1968): the definition-authoritative rework trimmed the
+  // instance-side model/provider surface, so the union lands back at main's
+  // ceiling despite the two additions above.
+  ["src/shared/api/types.ts", 1047],
   // harness-persona-sync feature growth, queued to split in the resolver-unify
   // refactor followup. discovery.rs is dominated by the new test module
   // (the effective_agent_command / divergent / create-time override matrix);
@@ -521,7 +505,19 @@ const overrides = new Map([
   // (if let Some(provider_update) = input.provider { record.provider = provider_update; }).
   // +8: harness_override thread-through in update_managed_agent so a deliberate
   // Custom pin routes to update_time_agent_command_override (comment + call).
-  ["src-tauri/src/commands/agent_models.rs", 1079],
+  // +22 (1079 -> 1101): Finding 2 — model discovery now resolves through
+  // resolve_effective_model_provider instead of raw record bytes
+  // (saved_agent_model_discovery_config takes personas/global and the
+  // get_agent_models call site loads global config), plus
+  // apply_model_provider_prompt_update's linked-instance write-guard
+  // extraction and its regression tests.
+  // +4 (1101 -> 1105): rebase onto agents-everywhere — agents.rs function
+  // signatures updated for ManagedAgentRuntimeKey-keyed runtimes map.
+  // +24 (1113 -> 1137): merge of main — `agent_model_discovery_config` and its
+  // struct extracted as the pure seam get_agent_models consumes, so the
+  // linked-agent regression binds to the code path the command reads instead
+  // of to the general-purpose resolvers underneath it.
+  ["src-tauri/src/commands/agent_models.rs", 1137],
   // global-agent-config: get_agent_config_surface / write_agent_config_field /
   // put_agent_session_config commands + GlobalAgentConfig serde types. New file
   // in this PR; queued to split with the command module refactor.
@@ -537,7 +533,14 @@ const overrides = new Map([
   // relay from the harness-attached payload relayUrl (with effective-relay
   // fallback for older harnesses) instead of a required arg the frontend
   // wrapper never passed, which silently broke the session-config cache.
-  ["src-tauri/src/commands/agent_config.rs", 1050],
+  // +60 (1050 -> 1110): agent-config-resolver — resolve_config_surface now
+  // clears a linked instance's own system_prompt/model/provider before
+  // computing had_* so stale materialized snapshot bytes can never be tagged
+  // BuzzExplicit and shadow the definition/global fallthrough; the dead
+  // persona-model re-tag branch replaced; two new regression tests added.
+  // +3 (1110 -> 1113): merge of main — the resolver rework above lands on top
+  // of this branch's remote-backend config surface.
+  ["src-tauri/src/commands/agent_config.rs", 1113],
   // codex-install-auto-restart review-fixes: should_restart_after_install
   // takes pid_alive:bool (pure predicate, no OS-dependent call); 3 racy
   // cache tests replaced with 6 pure availability_drift predicate tests;
@@ -572,7 +575,15 @@ const overrides = new Map([
   // +10: merge of main (#2767) — pass an explicit PATH through Codex adapter
   // install planning so unit tests avoid the process-global login-shell PATH
   // cache. Independent of the BYOH growth above; the two deltas compose.
-  ["src-tauri/src/commands/agent_discovery.rs", 2048],
+  // +59: run install commands under `pipefail` so a failing `curl` in a
+  // `curl … | bash` install fails the `cli` step instead of being masked by
+  // `bash`'s exit 0, plus tests for the arg shape and the real pipeline status.
+  // +81: install_shell_args re-exports the composed PATH inside the command
+  // body so login startup files can't clear or reorder it, plus an isolated
+  // hostile-profile regression the pure composition tests structurally miss.
+  // +42: gate that re-export off Windows, where join_paths is `;`-separated and
+  // bash would collapse it into one entry, plus a platform-shape test.
+  ["src-tauri/src/commands/agent_discovery.rs", 2173],
   // draft-persistence predicate: submit-time `loadDraft` check + inline comment
   // + deps-array entry in submitMessage closes the never-persisted-boundary
   // defect (Thufir Pass-3 finding). Load-bearing correctness fix; queued to
@@ -618,7 +629,9 @@ const overrides = new Map([
   // for Databricks v1 gate; prospectiveRuntimeId default fallback for builtins.
   // PR-B moves default/API-key derivation into shared hooks; the explicit
   // hidden-key projection keeps the top-level secret out of Advanced rows.
-  ["src/features/agents/ui/AgentInstanceEditDialog.tsx", 1195],
+  // +6 (1195 -> 1201): rebase onto main — this PR's model-source label wiring
+  // lands on top of main's dialog growth. Queued to split.
+  ["src/features/agents/ui/AgentInstanceEditDialog.tsx", 1201],
   // AgentDefinitionDialog grew past 1000 with the following load-bearing fixes:
   // isRuntimeAutoSeededRef tracking for edit-mode seeding (Fizz shows models);
   // runtimeSupportsLlmProviderSelection guard on discovery provider (codex fix);

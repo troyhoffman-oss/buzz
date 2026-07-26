@@ -164,7 +164,7 @@ fn redaction_env_records_value_used_for_request() {
 }
 
 #[test]
-fn saved_agent_model_discovery_uses_record_snapshot() {
+fn saved_agent_model_discovery_uses_record_snapshot_for_definition_less_agent() {
     let record: crate::managed_agents::ManagedAgentRecord = serde_json::from_str(
         r#"{
             "pubkey": "abcd1234",
@@ -194,38 +194,33 @@ fn saved_agent_model_discovery_uses_record_snapshot() {
     )
     .expect("sample managed agent record");
 
-    // resolve_effective_harness_descriptor is the single resolver used by
-    // get_agent_models — verify it layers env correctly and strips reserved keys.
-    let descriptor = crate::managed_agents::resolve_effective_harness_descriptor(
-        &record,
-        &[],
-        &Default::default(),
-    )
-    .expect("descriptor should resolve for a valid record");
+    // Bound to the seam get_agent_models consumes — verify it layers env
+    // correctly and strips reserved keys. Model/provider are
+    // definition-authoritative, but this record is definition-less, so its own
+    // values are the effective ones.
+    let config = agent_model_discovery_config(&record, &[], &Default::default())
+        .expect("config should resolve for a valid record");
 
-    assert_eq!(descriptor.command.as_str(), "goose");
+    assert_eq!(config.command.as_str(), "goose");
+    assert_eq!(config.model.as_deref(), Some("record-model"));
+    assert_eq!(config.provider.as_deref(), Some("databricks"));
     assert_eq!(
-        descriptor.env.get("GOOSE_MODEL").map(String::as_str),
+        config.env.get("GOOSE_MODEL").map(String::as_str),
         Some("record-model")
     );
     assert_eq!(
-        descriptor.env.get("GOOSE_PROVIDER").map(String::as_str),
+        config.env.get("GOOSE_PROVIDER").map(String::as_str),
         Some("databricks")
     );
     assert_eq!(
-        descriptor.env.get("OPENAI_API_KEY").map(String::as_str),
+        config.env.get("OPENAI_API_KEY").map(String::as_str),
         Some("record-key")
     );
-    // Reserved keys are stripped from the descriptor env.
-    assert!(!descriptor.env.contains_key("BUZZ_PRIVATE_KEY"));
+    // Reserved keys are stripped from the discovery env.
+    assert!(!config.env.contains_key("BUZZ_PRIVATE_KEY"));
     // The provider env var discovery recovers from is the effective harness's
-    // own key — resolved off the descriptor command, exactly as get_agent_models
-    // does before calling effective_discovery_provider.
-    assert_eq!(
-        crate::managed_agents::known_acp_runtime(&descriptor.command)
-            .and_then(|meta| meta.provider_env_var),
-        Some("GOOSE_PROVIDER")
-    );
+    // own key, resolved off the effective command.
+    assert_eq!(config.provider_env_var, Some("GOOSE_PROVIDER"));
 }
 
 // ---------------------------------------------------------------------------
@@ -356,6 +351,82 @@ fn effective_discovery_provider_reads_the_runtimes_own_env_var() {
     );
 }
 
+/// Definition-authoritative: a linked agent's stale materialized
+/// `record.model`/`record.provider` must never drive model discovery — the
+/// linked definition's current model/provider wins, mirroring spawn's
+/// `resolve_effective_model_provider`.
+#[test]
+fn saved_agent_model_discovery_ignores_stale_record_for_linked_agent() {
+    let record: crate::managed_agents::ManagedAgentRecord = serde_json::from_str(
+        r#"{
+            "pubkey": "abcd1234",
+            "name": "test-agent",
+            "persona_id": "persona-1",
+            "private_key_nsec": "nsec1fake",
+            "relay_url": "wss://localhost:3000",
+            "acp_command": "buzz-acp",
+            "agent_command": "goose",
+            "agent_args": [],
+            "mcp_command": "",
+            "turn_timeout_seconds": 320,
+            "system_prompt": null,
+            "model": "stale-record-model",
+            "provider": "stale-record-provider",
+            "env_vars": {},
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "last_started_at": null,
+            "last_stopped_at": null,
+            "last_exit_code": null,
+            "last_error": null
+        }"#,
+    )
+    .expect("sample managed agent record");
+
+    let persona = crate::managed_agents::AgentDefinition {
+        id: "persona-1".to_string(),
+        display_name: "Persona".to_string(),
+        avatar_url: None,
+        system_prompt: "You are a persona.".to_string(),
+        // Definition-authoritative on the harness axis too: the linked
+        // definition names the runtime, so discovery keys env off goose
+        // (GOOSE_MODEL) rather than the default harness.
+        runtime: Some("goose".to_string()),
+        model: Some("persona-model".to_string()),
+        provider: Some("anthropic".to_string()),
+        name_pool: Vec::new(),
+        is_builtin: false,
+        is_active: true,
+        source_team: None,
+        source_team_persona_slug: None,
+        env_vars: BTreeMap::new(),
+        respond_to: None,
+        respond_to_allowlist: Vec::new(),
+        parallelism: None,
+        created_at: "".to_string(),
+        updated_at: "".to_string(),
+    };
+
+    // Assert on the seam `get_agent_models` actually consumes, not on the
+    // general-purpose resolvers underneath it: binding to the resolvers would
+    // let a mutation that reintroduces `record.model` in the command body
+    // survive this test.
+    let config = agent_model_discovery_config(
+        &record,
+        &[persona],
+        &crate::managed_agents::GlobalAgentConfig::default(),
+    )
+    .expect("goose harness resolves");
+
+    assert_eq!(config.command, "goose");
+    assert_eq!(config.model.as_deref(), Some("persona-model"));
+    assert_eq!(config.provider.as_deref(), Some("anthropic"));
+    assert_eq!(
+        config.env.get("GOOSE_MODEL").map(String::as_str),
+        Some("persona-model")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Databricks provider detection
 // ---------------------------------------------------------------------------
@@ -394,6 +465,104 @@ fn update_request_turn_timeout_parses_for_wire_compat() {
         serde_json::from_str(r#"{"pubkey": "abc", "turnTimeoutSeconds": 9999}"#)
             .expect("request with deprecated turnTimeoutSeconds parses");
     assert_eq!(req.turn_timeout_seconds, Some(9999));
+}
+
+// ---------------------------------------------------------------------------
+// Linked-instance write guard (model/provider/prompt)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn linked_instance_ignores_model_provider_prompt_writes() {
+    let mut record: crate::managed_agents::ManagedAgentRecord = serde_json::from_str(
+        r#"{
+            "pubkey": "linked1",
+            "name": "linked-agent",
+            "persona_id": "p1",
+            "private_key_nsec": "nsec1fake",
+            "relay_url": "wss://localhost:3000",
+            "acp_command": "buzz-acp",
+            "agent_command": "goose",
+            "agent_args": [],
+            "mcp_command": "",
+            "turn_timeout_seconds": 320,
+            "system_prompt": null,
+            "model": null,
+            "provider": null,
+            "env_vars": {},
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "last_started_at": null,
+            "last_stopped_at": null,
+            "last_exit_code": null,
+            "last_error": null
+        }"#,
+    )
+    .expect("linked agent record");
+
+    let is_linked = record.persona_id.is_some();
+    assert!(is_linked, "test setup: record must be linked");
+
+    crate::commands::agent_models::apply_model_provider_prompt_update(
+        &mut record,
+        Some(Some("explicit-model".to_string())),
+        Some(Some("explicit-prov".to_string())),
+        Some(Some("explicit-prompt".to_string())),
+    );
+
+    assert!(
+        record.model.is_none(),
+        "linked record model must not be updated"
+    );
+    assert!(
+        record.provider.is_none(),
+        "linked record provider must not be updated"
+    );
+    assert!(
+        record.system_prompt.is_none(),
+        "linked record system_prompt must not be updated"
+    );
+}
+
+#[test]
+fn definition_less_instance_accepts_model_provider_prompt_writes() {
+    let mut record: crate::managed_agents::ManagedAgentRecord = serde_json::from_str(
+        r#"{
+            "pubkey": "standalone1",
+            "name": "standalone-agent",
+            "private_key_nsec": "nsec1fake",
+            "relay_url": "wss://localhost:3000",
+            "acp_command": "buzz-acp",
+            "agent_command": "goose",
+            "agent_args": [],
+            "mcp_command": "",
+            "turn_timeout_seconds": 320,
+            "system_prompt": null,
+            "model": null,
+            "provider": null,
+            "env_vars": {},
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "last_started_at": null,
+            "last_stopped_at": null,
+            "last_exit_code": null,
+            "last_error": null
+        }"#,
+    )
+    .expect("standalone agent record");
+
+    let is_linked = record.persona_id.is_some();
+    assert!(!is_linked, "test setup: record must not be linked");
+
+    crate::commands::agent_models::apply_model_provider_prompt_update(
+        &mut record,
+        Some(Some("new-model".to_string())),
+        Some(Some("new-prov".to_string())),
+        Some(Some("new-prompt".to_string())),
+    );
+
+    assert_eq!(record.model.as_deref(), Some("new-model"));
+    assert_eq!(record.provider.as_deref(), Some("new-prov"));
+    assert_eq!(record.system_prompt.as_deref(), Some("new-prompt"));
 }
 
 #[test]

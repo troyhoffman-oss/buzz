@@ -28,6 +28,63 @@ use crate::{
     util::now_iso,
 };
 
+/// Everything [`get_agent_models`] needs to run a discovery subprocess for one
+/// agent, resolved from disk state.
+pub(crate) struct AgentModelDiscoveryConfig {
+    /// The effective harness command (pre-PATH-resolution).
+    pub command: String,
+    /// Normalized effective harness args.
+    pub args: Vec<String>,
+    /// Definition-authoritative model, if any.
+    pub model: Option<String>,
+    /// Definition-authoritative provider, if any.
+    pub provider: Option<String>,
+    /// The harness's own provider env var, used to recover a build-baked
+    /// provider from `env` when neither definition nor global names one.
+    pub provider_env_var: Option<&'static str>,
+    /// The full layered process env the discovery subprocess receives.
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// Resolve the discovery configuration for `record` — the pure seam
+/// [`get_agent_models`] consumes.
+///
+/// The two axes are resolved independently and both mirror spawn exactly, so
+/// discovery can never query a configuration the agent would not actually
+/// launch with:
+///
+/// - **Config axis** (model/provider) via `resolve_effective_model_provider`:
+///   for a linked instance the definition (then global) is truth, never the
+///   record's materialized bytes. Definition-less instances keep their own.
+/// - **Harness axis** (command/args/env) via the same effective descriptor
+///   `spawn_agent_child` uses.
+///
+/// Returns `Err` on a dangling harness id.
+///
+/// This exists as a named helper rather than inline resolver calls so the
+/// linked-agent regression binds to the seam the command actually reads: a
+/// mutation reintroducing `record.model` here fails the test.
+pub(crate) fn agent_model_discovery_config(
+    record: &crate::managed_agents::ManagedAgentRecord,
+    personas: &[crate::managed_agents::AgentDefinition],
+    global: &crate::managed_agents::GlobalAgentConfig,
+) -> Result<AgentModelDiscoveryConfig, String> {
+    let descriptor =
+        crate::managed_agents::resolve_effective_harness_descriptor(record, personas, global)?;
+    let (model, provider) =
+        crate::managed_agents::resolve_effective_model_provider(record, personas, global);
+    let provider_env_var =
+        known_acp_runtime(&descriptor.command).and_then(|meta| meta.provider_env_var);
+    Ok(AgentModelDiscoveryConfig {
+        command: descriptor.command,
+        args: descriptor.args,
+        model,
+        provider,
+        provider_env_var,
+        env: descriptor.env,
+    })
+}
+
 /// Query available models from an agent via `buzz-acp models --json`.
 ///
 /// Spawns a short-lived subprocess (no relay connection needed). The subprocess
@@ -79,35 +136,28 @@ pub async fn get_agent_models(
         let personas = load_personas(&app).unwrap_or_default();
         let global = load_global_agent_config(&app).unwrap_or_default();
 
-        // Single typed descriptor — same resolver as spawn_agent_child.
-        // Returns Err on dangling harness id, propagating it to the caller.
-        let descriptor =
-            crate::managed_agents::resolve_effective_harness_descriptor(record, &personas, &global)
-                .map_err(|e| format!("cannot discover models for {pubkey}: {e}"))?;
+        let AgentModelDiscoveryConfig {
+            command,
+            args,
+            model,
+            provider,
+            provider_env_var,
+            env,
+        } = agent_model_discovery_config(record, &personas, &global)
+            .map_err(|e| format!("cannot discover models for {pubkey}: {e}"))?;
 
-        let resolved_agent = resolve_command(&descriptor.command)
+        let resolved_agent = resolve_command(&command)
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| descriptor.command.clone());
-
-        let discovery_model = record.model.clone();
-        // The record's saved provider is the explicit assertion; the runtime's
-        // own provider env var lets discovery recover a build-baked provider
-        // from `descriptor.env` when the record has none (records predating
-        // provider persistence carry `provider: null`).
-        let discovery_provider = record.provider.clone();
-        let discovery_provider_env_var =
-            known_acp_runtime(&descriptor.command).and_then(|meta| meta.provider_env_var);
-        let discovery_env = descriptor.env;
-        let args = descriptor.args;
+            .unwrap_or_else(|| command.clone());
 
         (
             resolved,
             resolved_agent,
             args,
-            discovery_model,
-            discovery_provider,
-            discovery_provider_env_var,
-            discovery_env,
+            model,
+            provider,
+            provider_env_var,
+            env,
         )
     }; // store lock released — subprocess runs without holding the lock
 
@@ -764,6 +814,35 @@ async fn discover_databricks_models(
     }))
 }
 
+/// Apply an `UpdateManagedAgentRequest`'s model/provider/system_prompt patch
+/// to `record`, enforcing the linked-instance write guard: a definition-linked
+/// record's model/provider/prompt are definition-authoritative (see
+/// `effective_config::resolve_linked`), so writes to these three fields are
+/// silently dropped for a linked instance rather than persisting a byte the
+/// resolver will never read. Definition-less instances accept the patch
+/// as-is. Extracted so the guard is exercised by both `update_managed_agent`
+/// and its regression tests — a test that reimplements this check instead of
+/// calling it can go green after the real guard is deleted.
+fn apply_model_provider_prompt_update(
+    record: &mut crate::managed_agents::ManagedAgentRecord,
+    model: Option<Option<String>>,
+    provider: Option<Option<String>>,
+    system_prompt: Option<Option<String>>,
+) {
+    if record.persona_id.is_some() {
+        return;
+    }
+    if let Some(model_update) = model {
+        record.model = model_update;
+    }
+    if let Some(provider_update) = provider {
+        record.provider = provider_update;
+    }
+    if let Some(prompt_update) = system_prompt {
+        record.system_prompt = prompt_update;
+    }
+}
+
 /// Update mutable fields on an existing managed agent record.
 ///
 /// Does NOT auto-restart the agent. Runtime config changes (system prompt,
@@ -803,15 +882,12 @@ pub async fn update_managed_agent(
                 name_changed = true;
             }
         }
-        if let Some(model_update) = input.model {
-            record.model = model_update;
-        }
-        if let Some(provider_update) = input.provider {
-            record.provider = provider_update;
-        }
-        if let Some(prompt_update) = input.system_prompt {
-            record.system_prompt = prompt_update;
-        }
+        apply_model_provider_prompt_update(
+            record,
+            input.model,
+            input.provider,
+            input.system_prompt,
+        );
         if let Some(parallelism) = input.parallelism {
             record.parallelism = parallelism;
         }
