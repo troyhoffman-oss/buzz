@@ -22,6 +22,7 @@
 
 mod deploy;
 mod discover;
+mod install;
 mod protocol;
 mod ssh;
 mod tailscale;

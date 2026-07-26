@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::install::{self, Payload};
 use crate::protocol::{Secret, SshConfig};
 use crate::ssh::{quote, Session};
 
@@ -61,6 +62,11 @@ pub struct Agent {
     pub respond_to: String,
     pub respond_to_allowlist: Vec<String>,
     pub env_vars: BTreeMap<String, String>,
+    /// A path on the **desktop** machine to a Linux `buzz-acp` to install on
+    /// the host when the host resolves none. Optional, and absent it changes
+    /// nothing: deploy resolves `buzz-acp` on the host or fails with exit 90
+    /// exactly as it always has. See [`crate::install`].
+    pub buzz_acp_binary: Option<String>,
 }
 
 impl Agent {
@@ -136,6 +142,11 @@ impl Agent {
             respond_to: string("respond_to").unwrap_or_else(|| "owner-only".to_string()),
             respond_to_allowlist: crate::discover::string_list(agent.get("respond_to_allowlist")),
             env_vars: env_map(agent.get("env_vars")),
+            // Read from the same `agent` block as everything else, but it is
+            // not agent configuration: nothing about it reaches the env file or
+            // the unit. It is the desktop handing the provider a copy of
+            // `buzz-acp` to install if the host turns out not to have one.
+            buzz_acp_binary: string("buzz_acp_binary"),
         })
     }
 
@@ -351,18 +362,31 @@ fn relay_http_base_url(relay_url: &str) -> String {
     }
 }
 
-/// The remote script. One round trip: resolve, write, install, start.
+/// The remote script. One round trip: resolve (or install), write, install,
+/// start.
 ///
 /// Every secret reaches the host inside this script, which travels on the SSH
 /// stdin channel. Nothing secret is ever an argument — not to `ssh`, and not to
 /// any command the script runs — because the remote `ps` is world-readable. The
 /// env file is written under `umask 077`, `chmod 600`, and moved into place
 /// atomically.
-fn deploy_script(agent: &Agent, config: &SshConfig, unit: &str) -> Result<String, String> {
+///
+/// `push` is the optional desktop-side `buzz-acp`. It is resolved *first*, so
+/// `$acp` — and therefore the unit's `ExecStart` — names the copy this same
+/// pass installed. The pushed bytes are not secret, but they share the stream
+/// with the minted nsec, so they travel base64-encoded and never as raw bytes
+/// (`install`).
+fn deploy_script(
+    agent: &Agent,
+    config: &SshConfig,
+    unit: &str,
+    push: Option<&Payload>,
+) -> Result<String, String> {
     let slug = agent.slug();
     let acp = quote(config.buzz_acp_path.as_deref().unwrap_or("buzz-acp"));
     let command = quote(&agent.agent_command);
     let relay_http = relay_http_base_url(&agent.relay_url);
+    let resolve_acp = install::resolve_or_install(&acp, push);
 
     let mut script = String::from("set -eu\numask 077\n");
     // The harness name is bound once and thereafter referenced only as
@@ -372,7 +396,7 @@ fn deploy_script(agent: &Agent, config: &SshConfig, unit: &str) -> Result<String
     // `$(...)` would still run. Expansion results are not re-scanned.
     script.push_str(&format!(
         r#"harness_name={command}
-acp=$(command -v {acp} 2>/dev/null) || {{ echo "buzz-acp not found on the server's PATH — install it, or set 'buzz-acp path on the server'" >&2; exit 90; }}
+{resolve_acp}
 harness=$(command -v "$harness_name" 2>/dev/null) || {{ echo "harness $harness_name not found on the server's PATH" >&2; exit 91; }}
 cred=$(command -v git-credential-nostr 2>/dev/null || true)
 conf="$HOME/.config/buzz-acp"
@@ -465,13 +489,44 @@ systemctl --user restart {service}
     Ok(script)
 }
 
+/// The binary to embed in this deploy's script, if any.
+///
+/// `None` whenever the payload carries no path — the default, and the case in
+/// which nothing about deploy changes. Otherwise the host is asked first
+/// whether it already resolves `buzz-acp`, because **deploy is the start path**:
+/// without the probe, a desktop with the seam engaged would encode and stream
+/// tens of megabytes on every agent start, forever, to a host that has had the
+/// binary since the first deploy. Reading the file is skipped in that case too.
+///
+/// A probe that cannot be answered is not fatal: the binary is embedded and the
+/// script's own `command -v` makes the real decision on the host.
+fn payload_to_push(
+    agent: &Agent,
+    config: &SshConfig,
+    session: &Session,
+) -> Result<Option<Payload>, String> {
+    let Some(path) = agent.buzz_acp_binary.as_deref() else {
+        return Ok(None);
+    };
+    let acp = quote(config.buzz_acp_path.as_deref().unwrap_or("buzz-acp"));
+    let probe = session.run(&install::probe_script(&acp), Duration::from_secs(60))?;
+    if probe.ok() {
+        return Ok(None);
+    }
+    // Read and validate before the deploy script is built: a bad path, a non-ELF
+    // file or an oversized one is the desktop's mistake, and it should be
+    // reported as that rather than as a remote failure mid-provisioning.
+    Payload::read(path).map(Some)
+}
+
 pub fn deploy(
     request: &serde_json::Value,
     config: &SshConfig,
     session: &Session,
 ) -> Result<serde_json::Value, String> {
     let agent = Agent::from_request(request)?;
-    let script = deploy_script(&agent, config, UNIT_TEMPLATE)?;
+    let push = payload_to_push(&agent, config, session)?;
+    let script = deploy_script(&agent, config, UNIT_TEMPLATE, push.as_ref())?;
     let output = session.run(&script, Duration::from_secs(300))?;
     if !output.ok() {
         return Err(output.failure());
@@ -550,7 +605,7 @@ mod tests {
     #[test]
     fn the_pinned_harness_is_what_the_unit_runs() {
         let agent = Agent::from_request(&request()).unwrap();
-        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE).unwrap();
+        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, None).unwrap();
         // Resolved to an absolute path on the HOST, and written into the env
         // file systemd re-reads on every restart — that is what makes the pin
         // durable rather than a one-shot argument.
@@ -565,7 +620,7 @@ mod tests {
     #[test]
     fn secrets_travel_in_the_script_body_and_never_on_an_argv() {
         let agent = Agent::from_request(&request()).unwrap();
-        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE).unwrap();
+        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, None).unwrap();
         assert!(script.contains(&format!("BUZZ_PRIVATE_KEY=\"{NSEC}\"")));
         assert!(script.contains(&format!("NOSTR_PRIVATE_KEY=\"{NSEC}\"")));
         assert!(script.contains("ANTHROPIC_API_KEY=\"sk-ant-secret\""));
@@ -745,7 +800,7 @@ mod tests {
     #[test]
     fn redeploy_is_idempotent() {
         let agent = Agent::from_request(&request()).unwrap();
-        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE).unwrap();
+        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, None).unwrap();
         // One templated unit per host, reloaded only when its content changed.
         assert!(script.contains(r#"unit_file="$units/buzz-acp@.service""#));
         assert!(script.contains(r#"if cmp -s "$unit_file.new" "$unit_file""#));
@@ -762,7 +817,7 @@ mod tests {
     #[test]
     fn the_unit_template_substitutes_a_resolved_buzz_acp() {
         let agent = Agent::from_request(&request()).unwrap();
-        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE).unwrap();
+        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, None).unwrap();
         assert!(UNIT_TEMPLATE.contains("ExecStart=@BUZZ_ACP_BIN@"));
         assert!(UNIT_TEMPLATE.contains("EnvironmentFile=%h/.config/buzz-acp/%i.env"));
         // Substitution is parameter expansion, not `sed`: `sed -i` is a GNU
@@ -790,6 +845,22 @@ mod tests {
         sandbox: &str,
         request: &serde_json::Value,
     ) -> (std::process::Output, std::path::PathBuf) {
+        let root = sandbox_host(sandbox, HostAcp::Installed);
+        let agent = Agent::from_request(request).unwrap();
+        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, None).unwrap();
+        (run_in_sandbox(&root, &script), root)
+    }
+
+    /// Whether the sandboxed "host" already has `buzz-acp` on its PATH. The
+    /// install path only engages on a host that does not.
+    #[derive(PartialEq)]
+    enum HostAcp {
+        Installed,
+        Missing,
+    }
+
+    /// Build the fake host: a `$HOME` with a stubbed `bin` on its PATH.
+    fn sandbox_host(sandbox: &str, acp: HostAcp) -> std::path::PathBuf {
         // Named per test rather than keyed on the thread id, which the test
         // harness recycles once a thread finishes.
         let root =
@@ -797,8 +868,7 @@ mod tests {
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         // Stub every host binary the script resolves, so the run is hermetic.
-        for (name, body) in [
-            ("buzz-acp", "#!/bin/sh\nexit 0\n"),
+        let mut stubs = vec![
             ("goose", "#!/bin/sh\nexit 0\n"),
             ("git-credential-nostr", "#!/bin/sh\nexit 0\n"),
             // Record the systemd calls instead of making them.
@@ -810,7 +880,11 @@ mod tests {
                 "loginctl",
                 "#!/bin/sh\nprintf 'loginctl %s\\n' \"$*\" >> \"$HOME/systemd.log\"\n",
             ),
-        ] {
+        ];
+        if acp == HostAcp::Installed {
+            stubs.push(("buzz-acp", "#!/bin/sh\nexit 0\n"));
+        }
+        for (name, body) in stubs {
             let path = bin.join(name);
             std::fs::write(&path, body).unwrap();
             #[cfg(unix)]
@@ -819,13 +893,17 @@ mod tests {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
         }
+        root
+    }
 
-        let agent = Agent::from_request(request).unwrap();
-        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE).unwrap();
-        let output = std::process::Command::new("/bin/sh")
+    /// Feed `script` to a real `/bin/sh` exactly as `ssh` feeds it to the
+    /// remote one: on stdin, with the sandbox as `$HOME`.
+    fn run_in_sandbox(root: &std::path::Path, script: &str) -> std::process::Output {
+        let bin = root.join("bin");
+        std::process::Command::new("/bin/sh")
             .arg("-s")
             .env_clear()
-            .env("HOME", &root)
+            .env("HOME", root)
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -841,8 +919,7 @@ mod tests {
                     .unwrap();
                 child.wait_with_output()
             })
-            .unwrap();
-        (output, root)
+            .unwrap()
     }
 
     #[cfg(unix)]
@@ -987,6 +1064,235 @@ mod tests {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
     }
 
+    /// A "buzz-acp" to push: a legal ELF header followed by every byte
+    /// sequence that would end the heredoc, escape the script, or run a command
+    /// if the transport were anything other than base64.
+    fn canary_binary(canary: &std::path::Path) -> Vec<u8> {
+        let mut bytes = b"\x7fELF\x02\x01\x01\x00".to_vec();
+        bytes.extend_from_slice(format!("$(touch {})\n", canary.display()).as_bytes());
+        bytes.extend_from_slice(format!("`touch {}`\n", canary.display()).as_bytes());
+        bytes.extend_from_slice(b"BUZZ_ACP_B64_EOF\nrm -rf \"$HOME\"\n");
+        bytes.extend_from_slice(b"\0'\"\r\n$HOME ${HOME}\n");
+        bytes.extend_from_slice(&(0u8..=255).collect::<Vec<u8>>());
+        bytes
+    }
+
+    fn push_payload(name: &str, bytes: &[u8]) -> Payload {
+        let path =
+            std::env::temp_dir().join(format!("buzz-acp-push-{}-{name}", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        Payload::read(&path.display().to_string()).unwrap()
+    }
+
+    #[test]
+    fn the_pushed_binary_is_an_optional_field_that_changes_nothing_when_absent() {
+        // The seam must be invisible: a payload without the field produces the
+        // script the crate produced before the field existed.
+        let mut request = request();
+        let agent = Agent::from_request(&request).unwrap();
+        assert!(agent.buzz_acp_binary.is_none());
+        let without = deploy_script(&agent, &config(), UNIT_TEMPLATE, None).unwrap();
+        assert!(without.contains("exit 90"));
+        assert!(!without.contains("base64 -d"));
+
+        // A blank string is "absent", not "push nothing".
+        request["agent"]["buzz_acp_binary"] = serde_json::json!("   ");
+        assert!(Agent::from_request(&request)
+            .unwrap()
+            .buzz_acp_binary
+            .is_none());
+
+        request["agent"]["buzz_acp_binary"] = serde_json::json!("/opt/buzz-acp");
+        assert_eq!(
+            Agent::from_request(&request).unwrap().buzz_acp_binary,
+            Some("/opt/buzz-acp".to_string())
+        );
+    }
+
+    #[test]
+    fn a_pushed_binary_never_displaces_the_secret_discipline() {
+        let canary = std::env::temp_dir().join("buzz-never");
+        let payload = push_payload("discipline", &canary_binary(&canary));
+        let agent = Agent::from_request(&request()).unwrap();
+        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, Some(&payload)).unwrap();
+
+        // The install block is additive: everything the secret path relies on
+        // is still exactly where it was.
+        assert!(script.starts_with("set -eu\numask 077\n"));
+        assert!(script.contains("chmod 600 \"$tmp\""));
+        assert!(script.contains(&format!("BUZZ_PRIVATE_KEY=\"{NSEC}\"")));
+        // The binary is resolved/installed BEFORE the unit is templated, so
+        // `$acp` — and therefore ExecStart — names the copy just installed.
+        let install = script.find("base64 -d").unwrap();
+        assert!(install < script.find("unit_file=").unwrap());
+        // The hash travels in the clear (it is a fingerprint, not a secret) and
+        // the encoded bytes carry nothing the shell reads as syntax.
+        assert!(script.contains(payload.sha256()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pushed_binary_installs_atomically_and_only_after_it_verifies() {
+        let canary = std::env::temp_dir().join(format!("buzz-push-pwned-{}", std::process::id()));
+        let _ = std::fs::remove_file(&canary);
+        let bytes = canary_binary(&canary);
+        let payload = push_payload("install", &bytes);
+
+        // A host with no `buzz-acp` at all — the only case the push engages.
+        let root = sandbox_host("install", HostAcp::Missing);
+        let agent = Agent::from_request(&request()).unwrap();
+        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, Some(&payload)).unwrap();
+        let output = run_in_sandbox(&root, &script);
+        assert!(
+            output.status.success(),
+            "install deploy failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Byte-identical after a round trip through base64, a heredoc, and a
+        // real `/bin/sh` — including the NULs, quotes, `$(...)` and the literal
+        // heredoc delimiter embedded in the payload.
+        let installed = root.join(".local/bin/buzz-acp");
+        assert_eq!(std::fs::read(&installed).unwrap(), bytes);
+        assert!(
+            !canary.exists(),
+            "the pushed binary's contents executed on the host"
+        );
+
+        // Executable, and no temp file left behind.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&installed).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "installed binary is not 755");
+        assert!(!leftover_temp_files(&root.join(".local/bin")));
+
+        // And the unit points at the copy this pass installed, in the same
+        // deploy — install first, resolve second.
+        let unit =
+            std::fs::read_to_string(root.join(".config/systemd/user/buzz-acp@.service")).unwrap();
+        assert!(
+            unit.contains(&format!("ExecStart={}", installed.display())),
+            "{unit}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_corrupted_push_aborts_before_the_mv_and_leaves_nothing_runnable() {
+        let canary = std::env::temp_dir().join("buzz-never");
+        let payload = push_payload("mismatch", &canary_binary(&canary));
+        let agent = Agent::from_request(&request()).unwrap();
+        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, Some(&payload)).unwrap();
+        // Stand in for a payload damaged in flight: the host is told to expect
+        // a digest the decoded bytes cannot produce.
+        let script = script.replace(payload.sha256(), &"a".repeat(64));
+
+        let root = sandbox_host("mismatch", HostAcp::Missing);
+        let output = run_in_sandbox(&root, &script);
+        assert_eq!(output.status.code(), Some(94));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("sha256"));
+
+        // Nothing installed, and — the property that matters — no half-written
+        // executable left in the directory systemd's ExecStart would name.
+        assert!(!root.join(".local/bin/buzz-acp").exists());
+        assert!(!leftover_temp_files(&root.join(".local/bin")));
+        // The deploy stopped there: no env file, no unit.
+        assert!(!root.join(".config/buzz-acp").exists());
+        assert!(!root.join(".config/systemd").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_host_without_buzz_acp_and_no_pushed_binary_still_fails_with_todays_guidance() {
+        // The un-pushed path is unchanged: exit 90 and the same message, so a
+        // user who never sets the seam sees exactly what they saw before.
+        let root = sandbox_host("no-acp", HostAcp::Missing);
+        let agent = Agent::from_request(&request()).unwrap();
+        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, None).unwrap();
+        let output = run_in_sandbox(&root, &script);
+        assert_eq!(output.status.code(), Some(90));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("buzz-acp not found on the server's PATH"),
+            "{stderr}"
+        );
+        assert!(!root.join(".local/bin/buzz-acp").exists());
+        assert!(!root.join(".config/buzz-acp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_host_binary_is_never_replaced_by_the_pushed_one() {
+        // Staleness rule: push-when-missing only. Deploy is the start path, so
+        // a version-comparing rule would reinstall underneath a running fleet
+        // on every start — and a desktop pinned to an older artifact would
+        // downgrade the host.
+        let canary = std::env::temp_dir().join("buzz-never");
+        let payload = push_payload("keep", &canary_binary(&canary));
+        let root = sandbox_host("keep", HostAcp::Installed);
+        let existing = std::fs::read(root.join("bin/buzz-acp")).unwrap();
+
+        let agent = Agent::from_request(&request()).unwrap();
+        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, Some(&payload)).unwrap();
+        let output = run_in_sandbox(&root, &script);
+        assert!(
+            output.status.success(),
+            "deploy failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert_eq!(std::fs::read(root.join("bin/buzz-acp")).unwrap(), existing);
+        assert!(
+            !root.join(".local/bin/buzz-acp").exists(),
+            "a host that already had buzz-acp got a second copy installed"
+        );
+        let unit =
+            std::fs::read_to_string(root.join(".config/systemd/user/buzz-acp@.service")).unwrap();
+        assert!(unit.contains(&format!(
+            "ExecStart={}",
+            root.join("bin/buzz-acp").display()
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_payload_that_decodes_to_garbage_aborts_before_anything_is_installed() {
+        let canary = std::env::temp_dir().join("buzz-never");
+        let payload = push_payload("decode", &canary_binary(&canary));
+        let agent = Agent::from_request(&request()).unwrap();
+        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, Some(&payload)).unwrap();
+        // Stand in for a stream truncated in flight. `!` is outside the base64
+        // alphabet, so `base64 -d` rejects the body outright — the exit-93
+        // branch, which the sha256 test cannot reach because a payload that
+        // fails to decode never gets as far as being hashed.
+        let corrupt = script.replacen(&payload.encoded()[..8], "!!!!!!!!", 1);
+        assert_ne!(corrupt, script, "the encoded body was not corrupted");
+
+        let root = sandbox_host("decode", HostAcp::Missing);
+        let output = run_in_sandbox(&root, &corrupt);
+        assert_eq!(output.status.code(), Some(93));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("decode"));
+        assert!(!root.join(".local/bin/buzz-acp").exists());
+        assert!(!leftover_temp_files(&root.join(".local/bin")));
+        // The `|| { ... }` really does bind to the heredoc-fed command: the
+        // deploy stopped here rather than running on with a corrupt file.
+        assert!(!root.join(".config/systemd").exists());
+    }
+
+    /// Any `.buzz-acp.tmp.*` still sitting in `dir`. A half-written binary that
+    /// survives a failed install is the failure mode the temp-file dance exists
+    /// to prevent.
+    fn leftover_temp_files(dir: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries.filter_map(Result::ok).any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".buzz-acp.tmp.")
+        })
+    }
+
     #[test]
     fn relay_urls_map_to_their_http_origin_for_git_auth() {
         assert_eq!(
@@ -1006,7 +1312,7 @@ mod tests {
     #[test]
     fn git_credential_env_is_emitted_only_when_the_helper_exists() {
         let agent = Agent::from_request(&request()).unwrap();
-        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE).unwrap();
+        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, None).unwrap();
         assert!(script.contains(r#"cred=$(command -v git-credential-nostr 2>/dev/null || true)"#));
         assert!(script.contains(r#"if [ -n "$cred" ]; then"#));
         assert!(

@@ -23,3 +23,9 @@ path = "src/main.rs"
 serde = { workspace = true }
 serde_json = { workspace = true }
 zeroize = { workspace = true }
+# Deploy can install `buzz-acp` on the host by streaming it inside the script
+# that already travels on the SSH stdin channel. base64 is what keeps raw bytes
+# from corrupting that stream; sha2 is what lets the host refuse a payload that
+# arrived damaged. Both are already workspace dependencies.
+base64 = "0.22"
+sha2 = { workspace = true }

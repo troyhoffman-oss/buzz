@@ -145,5 +145,28 @@ pub(super) fn deploy_payload_json(
         // Merged persona + agent env vars. Providers that don't read this
         // field will simply ignore it — no protocol break.
         "env_vars": merged_env,
+        // A path on THIS machine to a Linux `buzz-acp` the provider may install
+        // on the host when the host has none. Omitted entirely when unset, so
+        // the payload and every provider's behavior are unchanged by default.
+        "buzz_acp_binary": buzz_acp_binary_to_push(),
     })
+}
+
+/// The dev/dogfood seam for pushing `buzz-acp` to a host that lacks it.
+///
+/// `BUZZ_ACP_PUSH_BINARY` names a Linux `buzz-acp` on this machine;
+/// `buzz-backend-ssh` streams it to the host inside the deploy script and
+/// installs it to `~/.local/bin` when the host resolves none. Read at deploy
+/// time rather than captured at startup, so a developer can point it at a fresh
+/// build without restarting the app.
+///
+/// It is an env var and not a setting because the durable answer is not a path
+/// at all: the release build should resolve the artifact for the host's
+/// platform by version, with no user-visible choice. Until that lands this is
+/// the whole surface.
+fn buzz_acp_binary_to_push() -> Option<String> {
+    std::env::var("BUZZ_ACP_PUSH_BINARY")
+        .ok()
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
 }
