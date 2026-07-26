@@ -20,6 +20,7 @@ import {
   remoteHarnessSummaryLabel,
   remoteModelDiscoveryView,
   resolveBackendIntent,
+  selectedRemoteHarness,
 } from "./whereToRunIntent";
 
 type AgentDialogCreateProps = {
@@ -123,6 +124,7 @@ function AgentCreateDialogRouter({
 
   return (
     <AgentDefinitionDialog
+      createRemoteHarnessId={selectedRemoteHarness(runDraft)?.id ?? null}
       createRemoteHarnessLabel={remoteHarnessSummaryLabel(runDraft)}
       createRemoteModelDiscovery={remoteModelDiscoveryView(runDraft)}
       createRunSection={({ envVars }) => (

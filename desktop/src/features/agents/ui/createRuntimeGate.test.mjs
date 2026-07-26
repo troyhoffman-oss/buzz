@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  createGateHarnessId,
   createRuntimeIsAvailable,
   createRuntimeOptionDisabled,
   createRuntimeSelectionSatisfied,
   runtimeDropdownOptions,
   runtimeDropdownPlaceholder,
 } from "./createRuntimeGate.ts";
+import { requiredCredentialEnvKeys } from "./agentConfigOptions.tsx";
 
 function runtimeEntry(overrides = {}) {
   return {
@@ -161,4 +163,59 @@ test("the placeholder tracks loading and mode", () => {
     runtimeDropdownPlaceholder({ isCreateMode: false, runtimesLoading: false }),
     "No preference (use app default)",
   );
+});
+
+test("a local create asks the local runtime for its credential keys", () => {
+  assert.equal(
+    createGateHarnessId({
+      runsRemotely: false,
+      runtime: "buzz-agent",
+      remoteHarnessId: "goose",
+    }),
+    "buzz-agent",
+    "a stale remote pin never leaks into a local create",
+  );
+});
+
+test("a remote goose on a buzz-agent laptop demands GOOSE_*, not BUZZ_AGENT_*", () => {
+  // The bug this guards: `runtime` is seeded from the LOCAL catalog, so a
+  // machine defaulting to buzz-agent would demand BUZZ_AGENT-shaped
+  // credentials for an agent that runs Goose on someone else's host.
+  const harnessId = createGateHarnessId({
+    runsRemotely: true,
+    runtime: "buzz-agent",
+    remoteHarnessId: "goose",
+  });
+  assert.equal(harnessId, "goose");
+  assert.deepEqual(requiredCredentialEnvKeys(harnessId, "anthropic"), [
+    "ANTHROPIC_API_KEY",
+  ]);
+});
+
+test("a remote goose on a claude laptop still demands credentials", () => {
+  // The other half of the same bug: claude/codex support no provider
+  // selection, so the local id made the requirement list empty and the create
+  // shipped with no provider, model, or key at all.
+  assert.deepEqual(requiredCredentialEnvKeys("claude", "anthropic"), []);
+  assert.deepEqual(
+    requiredCredentialEnvKeys(
+      createGateHarnessId({
+        runsRemotely: true,
+        runtime: "claude",
+        remoteHarnessId: "goose",
+      }),
+      "anthropic",
+    ),
+    ["ANTHROPIC_API_KEY"],
+  );
+});
+
+test("an unpinned remote harness demands nothing yet", () => {
+  const harnessId = createGateHarnessId({
+    runsRemotely: true,
+    runtime: "buzz-agent",
+    remoteHarnessId: null,
+  });
+  assert.equal(harnessId, "");
+  assert.deepEqual(requiredCredentialEnvKeys(harnessId, "anthropic"), []);
 });

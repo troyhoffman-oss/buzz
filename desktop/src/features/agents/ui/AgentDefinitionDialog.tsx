@@ -15,6 +15,7 @@ import { Input } from "@/shared/ui/input";
 import { Textarea } from "@/shared/ui/textarea";
 import { AgentCreationPreview } from "./AgentCreationPreview";
 import {
+  createGateHarnessId,
   createRuntimeSelectionSatisfied,
   runtimeDropdownOptions as buildRuntimeDropdownOptions,
   runtimeDropdownPlaceholder,
@@ -128,6 +129,16 @@ type AgentDefinitionDialogProps = {
    * is a harness on the wrong computer that the deploy will never run.
    */
   createRemoteHarnessLabel?: string | null;
+  /**
+   * Id of the harness pinned on the HOST, which owns every credential question
+   * for a provider create: the deploy writes this agent's env on the host,
+   * keyed off the REMOTE command (`deploy.rs::metadata_env`), so the local
+   * runtime id — seeded from whatever this computer happens to have installed
+   * — names the wrong env contract. The id spaces are identical by
+   * construction: the SSH provider's discovery emits the same `goose` /
+   * `buzz-agent` keys the local catalog uses. Null until a harness is pinned.
+   */
+  createRemoteHarnessId?: string | null;
 };
 
 const ADVANCED_FIELDS_MOTION_TRANSITION = {
@@ -152,6 +163,7 @@ export function AgentDefinitionDialog({
   createRunsRemotely = false,
   createRemoteModelDiscovery = null,
   createRemoteHarnessLabel = null,
+  createRemoteHarnessId = null,
 }: AgentDefinitionDialogProps) {
   const [displayName, setDisplayName] = React.useState("");
   const [aiDefaultsOpen, setAiDefaultsOpen] = React.useState(false);
@@ -393,13 +405,21 @@ export function AgentDefinitionDialog({
   }
 
   const selectedRuntime = runtimes.find((p) => p.id === runtime);
+  // The harness whose credential contract this dialog must satisfy — the
+  // host's pin for a remote create, the local runtime otherwise. See
+  // createGateHarnessId for why the local id is the wrong question remotely.
+  const effectiveHarnessId = createGateHarnessId({
+    runsRemotely: createRunsRemotely,
+    runtime,
+    remoteHarnessId: createRemoteHarnessId,
+  });
   const blankRuntimeModelProviderEditable =
     initialModelProviderEditableWithoutRuntime && runtime.trim().length === 0;
   const runtimeCanChooseLlmProvider =
-    runtimeSupportsLlmProviderSelection(runtime) ||
+    runtimeSupportsLlmProviderSelection(effectiveHarnessId) ||
     blankRuntimeModelProviderEditable;
   const llmProviderFieldVisible =
-    (runtime.trim().length > 0 && runtimeCanChooseLlmProvider) ||
+    (effectiveHarnessId.trim().length > 0 && runtimeCanChooseLlmProvider) ||
     blankRuntimeModelProviderEditable;
   const trimmedProvider = provider.trim();
   // Required credential env keys for this runtime + provider combination.
@@ -407,9 +427,17 @@ export function AgentDefinitionDialog({
   // locked rows in the env vars editor.
   // File-layer config for the selected runtime (e.g. goose config.yaml).
   // Used to silence requirements already satisfied there.
-  const { data: runtimeFileConfig } = useRuntimeFileConfigQuery(runtime, {
-    enabled: open,
+  const { data: localRuntimeFileConfig } = useRuntimeFileConfigQuery(runtime, {
+    enabled: open && !createRunsRemotely,
   });
+  // The file layer reads THIS machine's ~/.config, so it can only answer for a
+  // local create. Letting a local goose config.yaml silence a requirement that
+  // belongs to a different host would turn a loud create-time block into a
+  // silent deploy-time failure. Disabling the query is not enough on its own:
+  // a disabled query still hands back whatever another surface cached.
+  const runtimeFileConfig = createRunsRemotely
+    ? undefined
+    : localRuntimeFileConfig;
   function handleAiConfigurationModeChange(nextMode: AgentAiConfigurationMode) {
     setAiConfigurationMode(nextMode);
     setIsCustomProviderEditing(false);
@@ -441,12 +469,11 @@ export function AgentDefinitionDialog({
         // gate demands are the ones the agent's env carries, and a remote
         // deploy writes that env to the host verbatim — so a missing key is
         // just as fatal there, and silencing the gate would ship an agent that
-        // deploys and then cannot authenticate. The keys are derived from the
-        // LOCAL runtime id, which is the known limitation, not the gate.
+        // deploys and then cannot authenticate.
         isProviderMode: false,
         model,
         provider: trimmedProvider,
-        runtimeId: runtime,
+        runtimeId: effectiveHarnessId,
         runtimeFileConfig,
       }),
     [
@@ -457,7 +484,7 @@ export function AgentDefinitionDialog({
       inheritedProviderDefault.value,
       model,
       trimmedProvider,
-      runtime,
+      effectiveHarnessId,
       runtimeFileConfig,
     ],
   );

@@ -29,6 +29,36 @@ export type CreateRuntimeGateInput = {
   hasLocalDefaultRuntime: boolean;
 };
 
+/**
+ * The harness id every credential question must be asked of.
+ *
+ * A local create asks the local catalog. A remote one asks the HOST's pin: the
+ * deploy writes this agent's env on the host keyed off the remote command
+ * (`deploy.rs::metadata_env`), while the dialog's `runtime` still holds
+ * whatever the local seeding effects resolved from this computer's catalog.
+ * Asking the local id makes the two machines disagree about which env keys
+ * matter — a remote Goose on a Claude-defaulted laptop is told it needs no
+ * credentials at all, because `runtimeSupportsLlmProviderSelection` answers
+ * false for `claude` and the requirement list comes back empty.
+ *
+ * The id spaces are identical by construction: the SSH provider's discovery
+ * emits exactly the `goose` and `buzz-agent` keys the local catalog and
+ * `metadata_env` both use. `""` for an unpinned remote harness is the honest
+ * answer — there is no harness to demand credentials for yet, and the create
+ * is already blocked until one is picked.
+ */
+export function createGateHarnessId({
+  runsRemotely,
+  runtime,
+  remoteHarnessId,
+}: {
+  runsRemotely: boolean;
+  runtime: string;
+  remoteHarnessId: string | null;
+}): string {
+  return runsRemotely ? (remoteHarnessId ?? "") : runtime;
+}
+
 /** Whether the picked runtime clears the local-availability requirement. */
 export function createRuntimeIsAvailable({
   runsRemotely,
