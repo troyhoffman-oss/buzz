@@ -120,6 +120,14 @@ field is `ssh_identity_file` and not `ssh_key_path`.
 
 There is no `unit_scope`. All deploys are `systemctl --user`.
 
+The `oneOf` is a **generic decoration, not an SSH feature**. Any provider may attach
+`oneOf: [{ const, title }]` to any config property; the desktop renders a dropdown over the
+`const` values labelled by `title`, always with an "Other…" row that swaps back to the plain
+text field. Nothing in the desktop knows what a tailnet is, and a value the list does not
+contain — one carried over from before the decoration existed, or a peer that has since left
+the tailnet — stays in the text field rather than reading as unselected. Omit the `oneOf` and
+the field is exactly the text input it was before.
+
 ## Host prerequisites
 
 `scripts/provision-buzz-host.sh` checks all of these on a candidate host and prints what is
