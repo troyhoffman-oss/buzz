@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  managedAgentPresenceStatus,
   startManagedAgentWithRules,
   respawnManagedAgentWithRules,
 } from "./managedAgentControlActions.ts";
@@ -79,6 +80,45 @@ test("ordinary local agents still start normally", async () => {
     },
   });
   assert.equal(calledWith, "deadbeef".repeat(8));
+});
+
+// --- managedAgentPresenceStatus: control-plane status is not liveness --------
+
+const REMOTE_BACKEND = { type: "provider", id: "ssh", config: {} };
+
+test("a local agent's own process table beats a silent relay", () => {
+  // Relays need not retain ephemeral kind:20001 presence, and this desktop is
+  // supervising the process — a blip must not grey out a running local agent.
+  assert.equal(managedAgentPresenceStatus(agent(), undefined), "online");
+  assert.equal(managedAgentPresenceStatus(agent(), {}), "online");
+});
+
+test("a deployed remote agent with no relay presence is not claimed online", () => {
+  // `backend_agent_id` is written once at deploy and never cleared (there is
+  // no undeploy), so "deployed" alone would light the dot green forever.
+  const remote = agent({
+    status: "deployed",
+    backend: REMOTE_BACKEND,
+    backendAgentId: "remote-1",
+  });
+  assert.equal(managedAgentPresenceStatus(remote, {}), "offline");
+  assert.equal(managedAgentPresenceStatus(remote, null), "offline");
+});
+
+test("a deployed remote agent reports whatever the relay says, verbatim", () => {
+  const remote = agent({
+    pubkey: "AB".repeat(32),
+    status: "deployed",
+    backend: REMOTE_BACKEND,
+    backendAgentId: "remote-1",
+  });
+  // Lookup keys are normalized pubkeys; a mixed-case record must still hit.
+  const lookup = { ["ab".repeat(32)]: "away" };
+  assert.equal(managedAgentPresenceStatus(remote, lookup), "away");
+  assert.equal(
+    managedAgentPresenceStatus(remote, { ["ab".repeat(32)]: "online" }),
+    "online",
+  );
 });
 
 // --- respawnManagedAgentWithRules: stop→clear→start boundary tests -----------

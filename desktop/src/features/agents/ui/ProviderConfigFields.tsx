@@ -1,6 +1,12 @@
 import * as React from "react";
 
+import { cn } from "@/shared/lib/cn";
 import { Input } from "@/shared/ui/input";
+import {
+  PERSONA_FIELD_CONTROL_CLASS,
+  PERSONA_FIELD_SHELL_CLASS,
+} from "./agentConfigOptions";
+import { PersonaDropdownField } from "./PersonaDropdownField";
 
 /// Coerce string config values to their schema-declared types (number, boolean).
 /// Providers receive JSON — sending "3" instead of 3 for an integer field breaks
@@ -63,6 +69,34 @@ export function providerConfigChoices(
     });
   }
   return choices.length > 0 ? choices : null;
+}
+
+/** The provider's suggestions plus the escape hatch, in display order. */
+export function providerConfigChoiceOptions(
+  choices: readonly ProviderConfigChoice[],
+): ProviderConfigChoice[] {
+  return [...choices, { label: "Other…", value: PROVIDER_CONFIG_OTHER_VALUE }];
+}
+
+/**
+ * What picking an option off the dropdown does to the field.
+ *
+ * Picking "Other…" keeps the current value so the free-text input opens ON it:
+ * the common edit is a listed host with a different user or a suffix, not a
+ * blank restart. Picking a listed suggestion both adopts it and drops the
+ * override, so a user who wandered into free text and back is not left with a
+ * stuck text box under a dropdown that already reads as answered.
+ */
+export function providerConfigSelection({
+  picked,
+  value,
+}: {
+  picked: string;
+  value: string;
+}): { explicitlyOther: boolean; value: string } {
+  return picked === PROVIDER_CONFIG_OTHER_VALUE
+    ? { explicitlyOther: true, value }
+    : { explicitlyOther: false, value: picked };
 }
 
 /**
@@ -139,13 +173,24 @@ export function ProviderConfigFields({
           value,
         });
         const textInput = (
-          <Input
-            {...(choices ? { "aria-label": `Other ${key}` } : {})}
-            id={choices ? `provider-cfg-${key}-other` : `provider-cfg-${key}`}
-            onChange={(e) => onChange({ ...config, [key]: e.target.value })}
-            placeholder={description}
-            value={value}
-          />
+          <div
+            className={cn(
+              "flex min-h-11 items-center px-3",
+              PERSONA_FIELD_SHELL_CLASS,
+            )}
+          >
+            <Input
+              {...(choices ? { "aria-label": `Other ${key}` } : {})}
+              className={cn(
+                "h-8 flex-1 px-0 py-0 leading-6",
+                PERSONA_FIELD_CONTROL_CLASS,
+              )}
+              id={choices ? `provider-cfg-${key}-other` : `provider-cfg-${key}`}
+              onChange={(e) => onChange({ ...config, [key]: e.target.value })}
+              placeholder={description}
+              value={value}
+            />
+          </div>
         );
 
         return (
@@ -160,30 +205,19 @@ export function ProviderConfigFields({
               ) : null}
             </label>
             {choices ? (
-              <select
-                className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-xs"
+              <PersonaDropdownField
                 id={`provider-cfg-${key}`}
-                onChange={(e) => {
-                  const isOther =
-                    e.target.value === PROVIDER_CONFIG_OTHER_VALUE;
-                  setOther(key, isOther);
-                  // Picking "Other…" keeps the current value so the free-text
-                  // field opens on it — the common edit is a listed host with
-                  // a different user or a suffix, not a blank restart.
-                  if (!isOther) onChange({ ...config, [key]: e.target.value });
+                onValueChange={(picked) => {
+                  const selection = providerConfigSelection({ picked, value });
+                  setOther(key, selection.explicitlyOther);
+                  if (selection.value !== value) {
+                    onChange({ ...config, [key]: selection.value });
+                  }
                 }}
+                options={providerConfigChoiceOptions(choices)}
+                placeholder="Select"
                 value={freeText ? PROVIDER_CONFIG_OTHER_VALUE : value}
-              >
-                {value === "" && !freeText ? (
-                  <option value="">Select</option>
-                ) : null}
-                {choices.map((choice) => (
-                  <option key={choice.value} value={choice.value}>
-                    {choice.label}
-                  </option>
-                ))}
-                <option value={PROVIDER_CONFIG_OTHER_VALUE}>Other…</option>
-              </select>
+              />
             ) : null}
             {freeText ? textInput : null}
             {description ? (

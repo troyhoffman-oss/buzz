@@ -3,6 +3,7 @@ import type {
   Channel,
   ManagedAgent,
   PresenceLookup,
+  PresenceStatus,
   RelayAgent,
 } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -33,6 +34,33 @@ export type ManagedAgentActionResult = {
 
 export function isManagedAgentActive(agent: Pick<ManagedAgent, "status">) {
   return agent.status === "running" || agent.status === "deployed";
+}
+
+/**
+ * The presence a surface should show for an agent the control plane calls
+ * active — `isManagedAgentActive` says what this desktop DID to the agent, not
+ * whether it is alive right now, and for a remote deployment those two facts
+ * diverge permanently.
+ *
+ * A local record's `"running"` is this machine's own process table, so the
+ * control plane is the liveness answer for it and stays authoritative: the
+ * relay may not retain ephemeral kind:20001 presence at all, and a relay blip
+ * must not make a process we are supervising read as dead.
+ *
+ * A provider-backed record's `"deployed"` says only that the deploy
+ * succeeded. `backend_agent_id` is written once, on that success, and nothing
+ * clears it — the provider protocol has no undeploy — so a remote agent that
+ * died hours ago is still `"deployed"` forever. The relay is the only channel
+ * that knows, which is exactly what `deleteManagedAgentWithRules` already
+ * trusts before it warns about orphaning a deployment. Silence there means
+ * "not known to be alive", so it reads offline rather than claiming otherwise.
+ */
+export function managedAgentPresenceStatus(
+  agent: Pick<ManagedAgent, "backend" | "pubkey">,
+  presenceLookup: PresenceLookup | null | undefined,
+): PresenceStatus {
+  if (agent.backend.type === "local") return "online";
+  return presenceLookup?.[normalizePubkey(agent.pubkey)] ?? "offline";
 }
 
 export function getManagedAgentPrimaryActionLabel(agent: ManagedAgent) {

@@ -59,28 +59,49 @@ export const emptyWhereToRunDraft: WhereToRunDraft = {
  * provider.
  *
  * A provider's own `info.name` ("SSH") is friendlier than its binary-derived id
- * ("ssh"), but only the SELECTED provider has been probed — `info` is a
- * subprocess round-trip, and this list is rendered before the user has asked
- * for anything. So the name is used where it has already been paid for and the
- * id stands in everywhere else, rather than spawning every discovered provider
- * on dialog open to decorate a label.
+ * ("ssh"), but `info` is a subprocess round-trip and this list is rendered
+ * before the user has asked for anything, so only providers the user has
+ * actually selected have ever been probed. `probedNames` carries the names
+ * already paid for — see `rememberProbedProviderName` — and the id stands in
+ * for the rest, rather than spawning every discovered provider on dialog open
+ * to decorate a label.
+ *
+ * The cache is what keeps the list stable. Reading the name off the CURRENT
+ * selection alone would rename a provider the moment it is picked and rename
+ * it back when it is not, so the same machine would appear under two naming
+ * schemes depending on where the cursor is, and a label would mutate under the
+ * user when a probe resolved.
  */
 export function runTargetOptions(
   providers: readonly BackendProviderCandidate[],
-  draft: WhereToRunDraft,
+  probedNames: Readonly<Record<string, string>>,
 ): PersonaDropdownOption[] {
-  const probedName =
-    draft.runOn !== LOCAL_RUN_TARGET_VALUE
-      ? draft.probedProvider?.name?.trim()
-      : "";
   return [
     { label: "This computer", value: LOCAL_RUN_TARGET_VALUE },
     ...providers.map((provider) => ({
-      label:
-        provider.id === draft.runOn && probedName ? probedName : provider.id,
+      label: probedNames[provider.id] ?? provider.id,
       value: provider.id,
     })),
   ];
+}
+
+/**
+ * Fold a completed probe into the cache of friendly provider names.
+ *
+ * Returns the SAME object when there is nothing to add, so the caller can use
+ * it as a state updater without re-rendering on every probe of a provider
+ * already named. A blank or missing name is not cached: the id is a better
+ * label than an empty one.
+ */
+export function rememberProbedProviderName(
+  probedNames: Readonly<Record<string, string>>,
+  providerId: string,
+  probed: BackendProviderProbeResult | null,
+): Readonly<Record<string, string>> {
+  const name = probed?.name?.trim();
+  if (!name || providerId === LOCAL_RUN_TARGET_VALUE) return probedNames;
+  if (probedNames[providerId] === name) return probedNames;
+  return { ...probedNames, [providerId]: name };
 }
 
 export function providerConfigComplete(draft: WhereToRunDraft): boolean {

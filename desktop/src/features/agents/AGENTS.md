@@ -154,14 +154,22 @@ with a TypeScript lookup table or an id comparison in a component.
     list (carried over, or a peer that has left the tailnet) stays in free text
     rather than reading as "nothing selected" — that is
     `usesProviderConfigFreeText`, and it is pure so it can be tested.
-14. **Remote liveness is relay presence; there is no second status channel.**
-    A provider-backed record shows "running" through the same path a local one
-    does — `build_managed_agent_summary` reports `"deployed"` when
-    `backend_agent_id` is set, `isManagedAgentActive` accepts it, and the
-    agent card renders the same active badge. Do not add SSH polling, a
-    remote-only status row, or a `local_setup` read for a non-local record:
-    `local_setup` asks whether *this* machine could run the agent and its UI
-    copy ("Needs setup on this device") names the wrong machine. See the
+14. **Remote liveness is relay presence; `"deployed"` is a control-plane fact,
+    not a liveness one.** `build_managed_agent_summary` reports `"deployed"`
+    whenever `backend_agent_id` is set, and that id is written exactly once —
+    on a successful deploy (`commands/agents.rs`) — with no clearer anywhere,
+    because the provider protocol has no undeploy. So `isManagedAgentActive`
+    answering true for a remote record means "this desktop deployed it", and
+    it keeps meaning that after the remote process dies. Any surface that
+    paints liveness from it must therefore go through
+    `managedAgentPresenceStatus`, which keeps the control plane authoritative
+    for a local record (this machine's own process table, and relays need not
+    retain ephemeral kind:20001 presence) and defers to relay presence for a
+    provider-backed one — the same channel `deleteManagedAgentWithRules`
+    already trusts before warning about an orphaned deployment. Do not add SSH
+    polling, a second status channel, or a `local_setup` read for a non-local
+    record: `local_setup` asks whether *this* machine could run the agent and
+    its UI copy ("Needs setup on this device") names the wrong machine. See the
     doc comment on `status_for_with` (`runtime_commands.rs`).
 15. **The pinned harness must be an `available` catalog entry.**
     `selectedRemoteHarness` filters on `available`, so an id that a re-check
@@ -182,14 +190,21 @@ with a TypeScript lookup table or an id comparison in a component.
   fails, you probably reintroduced a per-surface flag or conflated empty with
   failed discovery.
 - `ui/whereToRunIntent.test.mjs` — the remote create's submit gate, the
-  available-only harness pin, `runTargetOptions` / `remoteHarnessSummaryLabel`
-  (the first question and the summary that follows it), and
-  `remoteModelDiscoveryView`
+  available-only harness pin, `runTargetOptions` / `rememberProbedProviderName`
+  / `remoteHarnessSummaryLabel` (the first question, the label cache that keeps
+  its entries from renaming themselves as the selection moves, and the summary
+  that follows it), and `remoteModelDiscoveryView`
   (idle/loading/failed/loaded/empty-catalog). Covers the PROJECTION of the
   host's probe, not the substitution that consumes it.
 - `ui/providerConfigFields.test.mjs` — `providerConfigChoices` (a malformed
-  `oneOf` entry costs one row, not the list) and `usesProviderConfigFreeText`
-  (an unlisted value stays editable). Rule 13 lives or dies here.
+  `oneOf` entry costs one row, not the list), `usesProviderConfigFreeText`
+  (an unlisted value stays editable), and `providerConfigSelection` (picking
+  "Other…" keeps the value; returning to a suggestion drops the override, so a
+  round trip leaves no text box stuck open). Rule 13 lives or dies here.
+- `lib/managedAgentControlActions.test.mjs` — `managedAgentPresenceStatus`.
+  Rule 14: a deployed remote agent with nothing on the relay reads offline, a
+  running local one stays online through a silent relay. If a stopped remote
+  agent's card goes green again, this is the test that should have caught it.
 - `ui/useRemoteAwareModelDiscovery.test.mjs` — `resolveModelDiscovery` and
   `shouldSuppressLocalDiscovery`. If the Model control starts offering this
   computer's models to a remote harness, or runs local discovery IPC

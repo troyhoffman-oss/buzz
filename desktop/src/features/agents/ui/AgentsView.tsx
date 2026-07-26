@@ -152,6 +152,7 @@ export function AgentsView() {
               }
               isActionPending={isActionPending}
               isAgentsLoading={agents.managedAgentsQuery.isLoading}
+              presenceLookup={agents.managedPresenceQuery.data}
               startingAgentPubkey={agents.startingAgentPubkey}
               startingPersonaIds={agents.startingPersonaIds}
               onOpenAgentProfile={(pubkey, options) => {

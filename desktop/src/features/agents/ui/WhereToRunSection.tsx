@@ -21,6 +21,7 @@ import {
   emptyWhereToRunDraft,
   LOCAL_RUN_TARGET_VALUE,
   providerConfigComplete,
+  rememberProbedProviderName,
   runTargetOptions,
   type WhereToRunDraft,
 } from "./whereToRunIntent";
@@ -60,6 +61,12 @@ export function WhereToRunSection({
   const [harnessError, setHarnessError] = React.useState<string | null>(null);
   const [isDiscoveringHarnesses, setIsDiscoveringHarnesses] =
     React.useState(false);
+  // Friendly provider names, accumulated as probes land. Kept here rather than
+  // derived from the current selection so a provider keeps one name for the
+  // life of the dialog instead of renaming itself as the cursor moves.
+  const [probedProviderNames, setProbedProviderNames] = React.useState<
+    Readonly<Record<string, string>>
+  >({});
   const isProviderMode = draft.runOn !== LOCAL_RUN_TARGET_VALUE;
   const selectedBackendProvider = React.useMemo(
     () =>
@@ -100,6 +107,13 @@ export function WhereToRunSection({
     void probeBackendProvider(selectedBackendProvider.binaryPath)
       .then((result) => {
         if (cancelled) return;
+        setProbedProviderNames((previous) =>
+          rememberProbedProviderName(
+            previous,
+            selectedBackendProvider.id,
+            result,
+          ),
+        );
         const defaults: Record<string, string> = {};
         const properties =
           (result.config_schema as Record<string, unknown> | undefined)
@@ -295,7 +309,7 @@ export function WhereToRunSection({
             discardHostRequests();
             onDraftChange({ ...emptyWhereToRunDraft, runOn });
           }}
-          options={runTargetOptions(backendProviders, draft)}
+          options={runTargetOptions(backendProviders, probedProviderNames)}
           placeholder="This computer"
           value={draft.runOn}
         />
@@ -399,20 +413,19 @@ function RemoteHarnessPicker({
           example <span className="font-mono">goose</span>) and check again.
         </p>
       ) : (
-        <select
-          className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-xs"
+        <PersonaDropdownField
           disabled={isPending}
           id="agent-remote-harness"
-          onChange={(event) => onSelect(event.target.value)}
+          onValueChange={onSelect}
+          options={available.map((harness) => ({
+            label: `${harness.label}${
+              harness.version ? ` (${harness.version})` : ""
+            }`,
+            value: harness.id,
+          }))}
+          placeholder="Select a harness"
           value={draft.remoteHarnessId ?? ""}
-        >
-          {available.map((harness) => (
-            <option key={harness.id} value={harness.id}>
-              {harness.label}
-              {harness.version ? ` (${harness.version})` : ""}
-            </option>
-          ))}
-        </select>
+        />
       )}
       {error ? <p className="text-sm text-warning">{error}</p> : null}
       {/* Always available, in every state: a failed connection, an empty

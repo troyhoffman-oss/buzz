@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  PROVIDER_CONFIG_OTHER_VALUE,
+  providerConfigChoiceOptions,
   providerConfigChoices,
+  providerConfigSelection,
   usesProviderConfigFreeText,
 } from "./ProviderConfigFields.tsx";
 
@@ -111,5 +114,65 @@ test("an unlisted value stays editable without being asked", () => {
       value: "root@10.0.0.4",
     }),
     true,
+  );
+});
+
+// ── Picking an option ─────────────────────────────────────────────────────
+
+test("the escape hatch is offered last, after the provider's suggestions", () => {
+  assert.deepEqual(providerConfigChoiceOptions(choices), [
+    { label: "vps-prod", value: "vps-prod" },
+    { label: "laptop", value: "laptop" },
+    { label: "Other…", value: PROVIDER_CONFIG_OTHER_VALUE },
+  ]);
+});
+
+// The common edit is a listed host with a different user or a suffix, so the
+// text field must open ON the current value rather than blank.
+test("picking Other keeps the value and opens free text", () => {
+  assert.deepEqual(
+    providerConfigSelection({
+      picked: PROVIDER_CONFIG_OTHER_VALUE,
+      value: "vps-prod",
+    }),
+    { explicitlyOther: true, value: "vps-prod" },
+  );
+});
+
+test("picking a suggestion adopts it and drops the free-text override", () => {
+  assert.deepEqual(
+    providerConfigSelection({ picked: "laptop", value: "root@10.0.0.4" }),
+    { explicitlyOther: false, value: "laptop" },
+  );
+});
+
+// The full round trip a user actually takes: suggestion → Other → typed a
+// custom host → back to a suggestion. The override must not survive the
+// return, or the text box stays open under a dropdown that reads as answered.
+test("a round trip through free text and back leaves no stuck override", () => {
+  const toOther = providerConfigSelection({
+    picked: PROVIDER_CONFIG_OTHER_VALUE,
+    value: "vps-prod",
+  });
+  assert.equal(
+    usesProviderConfigFreeText({
+      choices,
+      explicitlyOther: toOther.explicitlyOther,
+      value: "root@10.0.0.4",
+    }),
+    true,
+  );
+
+  const backToListed = providerConfigSelection({
+    picked: "laptop",
+    value: "root@10.0.0.4",
+  });
+  assert.equal(
+    usesProviderConfigFreeText({
+      choices,
+      explicitlyOther: backToListed.explicitlyOther,
+      value: backToListed.value,
+    }),
+    false,
   );
 });

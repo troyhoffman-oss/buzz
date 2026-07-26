@@ -6,6 +6,7 @@ import {
   emptyWhereToRunDraft,
   providerConfigComplete,
   remoteHarnessSummaryLabel,
+  rememberProbedProviderName,
   remoteModelDiscoveryView,
   resolveBackendIntent,
   runTargetOptions,
@@ -237,42 +238,71 @@ const providers = [
 ];
 
 test("this computer always leads the run-target list", () => {
-  assert.deepEqual(runTargetOptions([], emptyWhereToRunDraft), [
+  assert.deepEqual(runTargetOptions([], {}), [
     { label: "This computer", value: "local" },
   ]);
 });
 
 test("unprobed providers are labelled by id", () => {
-  assert.deepEqual(runTargetOptions(providers, emptyWhereToRunDraft), [
+  assert.deepEqual(runTargetOptions(providers, {}), [
     { label: "This computer", value: "local" },
     { label: "blox", value: "blox" },
     { label: "ssh", value: "ssh" },
   ]);
 });
 
-// info is a subprocess round-trip and only the SELECTED provider has paid for
-// one, so the friendlier name decorates that entry alone rather than spawning
-// every discovered binary on dialog open.
-test("the probed provider's own name labels the selected entry only", () => {
-  const draft = {
-    ...emptyWhereToRunDraft,
-    runOn: "ssh",
-    probedProvider: { ok: true, name: "SSH" },
-  };
-  assert.deepEqual(runTargetOptions(providers, draft), [
+// info is a subprocess round-trip and only providers the user has actually
+// selected have paid for one, so the friendlier name decorates the entries
+// already probed rather than spawning every discovered binary on dialog open.
+test("a probed provider's own name labels its entry", () => {
+  assert.deepEqual(runTargetOptions(providers, { ssh: "SSH" }), [
     { label: "This computer", value: "local" },
     { label: "blox", value: "blox" },
     { label: "SSH", value: "ssh" },
   ]);
 });
 
+// The whole point of caching: a name, once paid for, is not surrendered when
+// the user moves the selection elsewhere. Otherwise the same machine reads
+// under two naming schemes depending on where the cursor is.
+test("a probed name survives the selection moving to another provider", () => {
+  const afterProbingSsh = rememberProbedProviderName({}, "ssh", {
+    ok: true,
+    name: "SSH",
+  });
+  const afterProbingBlox = rememberProbedProviderName(afterProbingSsh, "blox", {
+    ok: true,
+    name: "Blox",
+  });
+  assert.deepEqual(runTargetOptions(providers, afterProbingBlox), [
+    { label: "This computer", value: "local" },
+    { label: "Blox", value: "blox" },
+    { label: "SSH", value: "ssh" },
+  ]);
+});
+
 test("a blank probed name falls back to the id", () => {
-  const draft = {
-    ...emptyWhereToRunDraft,
-    runOn: "ssh",
-    probedProvider: { ok: true, name: "   " },
-  };
-  assert.equal(runTargetOptions(providers, draft)[2].label, "ssh");
+  const names = rememberProbedProviderName({}, "ssh", {
+    ok: true,
+    name: "   ",
+  });
+  assert.deepEqual(names, {});
+  assert.equal(runTargetOptions(providers, names)[2].label, "ssh");
+});
+
+// Identity matters: the cache feeds a setState, so a probe that adds nothing
+// must not re-render the dialog (probes re-run on every provider selection).
+test("remembering a name already known returns the same cache object", () => {
+  const names = { ssh: "SSH" };
+  assert.equal(
+    rememberProbedProviderName(names, "ssh", { ok: true, name: "SSH" }),
+    names,
+  );
+  assert.equal(rememberProbedProviderName(names, "ssh", null), names);
+  assert.equal(
+    rememberProbedProviderName(names, "local", { ok: true, name: "Local" }),
+    names,
+  );
 });
 
 // ── The harness summary label ─────────────────────────────────────────────
