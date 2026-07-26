@@ -2242,12 +2242,19 @@ async fn tokio_main() -> Result<()> {
                                 // immediately. Queued future events remain queued
                                 // and will create a fresh session on dispatch.
                                 Some(("!rotate", "")) => {
-                                    // Clear the durable binding here and nowhere
-                                    // else: this is the one invalidation that is
-                                    // explicit owner intent. Error-path
-                                    // invalidation must leave the binding alone —
-                                    // recovering from those is what durable resume
-                                    // is for.
+                                    // Rotation is the one invalidation that reaches
+                                    // the store: it is explicit owner intent.
+                                    // Error-path invalidation must leave the binding
+                                    // alone — recovering from those is what durable
+                                    // resume is for.
+                                    //
+                                    // This clear covers the idle fork and the narrow
+                                    // window where the signalled task's prompt wins
+                                    // its `select!` and the signal is dropped. It is
+                                    // NOT sufficient on its own: a signalled task can
+                                    // still be pre-prompt and write a fresh binding
+                                    // after this point, which is why the task repeats
+                                    // the clear from behind its own `store.put`.
                                     if let Some(store) = &ctx.session_store {
                                         store.clear(&buzz_event.channel_id);
                                     }
