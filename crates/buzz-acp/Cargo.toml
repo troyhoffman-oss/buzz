@@ -68,6 +68,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # Config file
 toml = "1.0"
 
+# Platform data directory (durable session bindings)
+dirs = "6"
+
 # Filter expressions
 evalexpr = { workspace = true }
 
@@ -79,3 +82,4 @@ nix = { version = "0.31", default-features = false, features = ["signal"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 httparse = "1"
+tempfile = "3"

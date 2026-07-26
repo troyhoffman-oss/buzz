@@ -31,7 +31,8 @@ use uuid::Uuid;
 
 use crate::acp::{
     config_option_label, extract_model_config_options, extract_model_state, model_in_catalog,
-    resolve_model_switch_method, AcpClient, AcpError, McpServer, ModelSwitchMethod, StopReason,
+    resolve_model_switch_method, AcpClient, AcpError, McpServer, ModelSwitchMethod,
+    SessionNewResponse, StopReason,
 };
 use crate::config::{DedupMode, PermissionMode};
 use crate::observer;
@@ -40,6 +41,7 @@ use crate::queue::{
     PromptProfile, PromptProfileLookup, ThreadTags,
 };
 use crate::relay::{ChannelInfo, RestClient};
+use crate::session_store::SessionStore;
 
 /// Window within which agent activity before a hard-cap death qualifies
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
@@ -213,6 +215,10 @@ pub struct OwnedAgent {
     /// the first session; method-not-found is cached as `Some(false)` so legacy
     /// user-message framing is used for this process thereafter.
     pub goose_system_prompt_supported: Option<bool>,
+    /// Whether the agent answered `session/resume`. `None` probes on the first
+    /// durable binding; method-not-found is cached as `Some(false)` so an agent
+    /// without resume support (e.g. buzz-agent) costs one RPC per process.
+    pub resume_supported: Option<bool>,
     /// Protocol version reported by the agent in its initialize response.
     pub protocol_version: u32,
 }
@@ -299,6 +305,23 @@ fn apply_completed_before_control_signal(
         ControlSignal::Rotate | ControlSignal::SwitchModel(_)
     ) {
         state.invalidate(source);
+    }
+}
+
+/// Retire `source`'s session: drop the in-memory state and, for a channel, the
+/// durable binding with it.
+///
+/// Rotation is the only invalidation that must reach the store. Error paths
+/// deliberately leave the binding — recovering an interrupted conversation is
+/// what durable resume exists for — which is why this cannot move inside
+/// [`SessionState::invalidate`], the call both meanings share. A binding that
+/// outlived its rotation would be resumed by the next turn (resume runs ahead of
+/// creation) and answer with the same cap that triggered the rotation, leaving
+/// the channel unable to make progress.
+fn rotate_session(state: &mut SessionState, ctx: &PromptContext, source: &PromptSource) {
+    state.invalidate(source);
+    if let (Some(store), PromptSource::Channel(cid)) = (&ctx.session_store, source) {
+        store.clear(cid);
     }
 }
 
@@ -646,6 +669,10 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+    /// Durable channel → session bindings, so a harness restart resumes the
+    /// conversation instead of starting over. `None` disables durable resume:
+    /// no data directory, or `--agents > 1` (see [`crate::session_store`]).
+    pub session_store: Option<SessionStore>,
 }
 
 impl AgentPool {
@@ -1019,6 +1046,22 @@ async fn create_session_and_apply_model(
         }
     }
 
+    apply_session_config(agent, ctx, &resp).await?;
+
+    Ok(resp.session_id)
+}
+
+/// Capture the model catalog and apply `desired_model` / `permission_mode` to a
+/// freshly bound session.
+///
+/// Shared by session creation and resume so the two can never drift: a resumed
+/// session gets the same model, the same permission mode, and the same
+/// `session_config_captured` frame a created one does.
+async fn apply_session_config(
+    agent: &mut OwnedAgent,
+    ctx: &PromptContext,
+    resp: &SessionNewResponse,
+) -> Result<(), AcpError> {
     // Populate model capabilities on first session creation.
     if agent.model_capabilities.is_none() {
         agent.model_capabilities = Some(AgentModelCapabilities {
@@ -1027,7 +1070,7 @@ async fn create_session_and_apply_model(
         });
     }
 
-    // Apply desired_model if set, matching against the fresh session/new response.
+    // Apply desired_model if set, matching against the fresh session response.
     // Track whether the switch succeeded so session_config_captured reflects
     // the post-switch state (not the pre-switch desired state).
     let switch_succeeded = if let Some(ref desired) = agent.desired_model {
@@ -1079,16 +1122,69 @@ async fn create_session_and_apply_model(
     );
 
     // Apply permission mode if not the agent's built-in default AND the agent
-    // advertises the requested mode in session/new. Agents that don't support
-    // the mode (e.g., goose crashes on unrecognized set_config_option values)
-    // are safely skipped — the harness auto-approves via handle_permission_request.
+    // advertises the requested mode in its session response. Agents that don't
+    // support the mode (e.g., goose crashes on unrecognized set_config_option
+    // values) are safely skipped — the harness auto-approves via
+    // handle_permission_request.
     if !ctx.permission_mode.is_default()
         && agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
     {
         apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
     }
 
-    Ok(resp.session_id)
+    Ok(())
+}
+
+/// Rebind the durable session for `channel_id` on this agent, or `None` when
+/// there is no binding, the agent cannot resume, or the transcript is gone.
+///
+/// A failed resume is deliberately left in the store: the caller falls through
+/// to `session/new`, which overwrites the binding with the fresh ID in the same
+/// turn. That both supersedes a stale binding and stops a permanently-failing
+/// one from being retried forever.
+async fn try_resume_session(
+    agent: &mut OwnedAgent,
+    ctx: &PromptContext,
+    channel_id: &Uuid,
+) -> Option<String> {
+    if agent.resume_supported == Some(false) {
+        return None;
+    }
+    let stored = ctx.session_store.as_ref()?.get(channel_id)?;
+
+    let resp = match agent
+        .acp
+        .session_resume(&ctx.cwd, &stored, ctx.mcp_servers.clone())
+        .await
+    {
+        Ok(resp) => resp,
+        Err(AcpError::AgentError { code: -32601, .. }) => {
+            agent.resume_supported = Some(false);
+            tracing::info!(
+                target: "pool::session",
+                "agent does not support session/resume — sessions will not survive a restart"
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "pool::session",
+                channel = %channel_id,
+                "failed to resume session {stored}: {error} — creating a fresh session"
+            );
+            return None;
+        }
+    };
+    agent.resume_supported = Some(true);
+
+    // `apply_session_config` only errors on transport-class failures, which mean
+    // the agent process is unusable. Fall through rather than reporting here:
+    // the creation path hits the same error and routes it to the one place that
+    // decides between respawn and retry.
+    apply_session_config(agent, ctx, &resp)
+        .await
+        .ok()
+        .map(|()| resp.session_id)
 }
 
 /// Send the appropriate ACP model-switch request with a timeout.
@@ -1627,10 +1723,26 @@ pub async fn run_prompt_task(
         PromptSource::Heartbeat => None,
     };
 
+    // Set by the resume arm so `session_resolved` can tell a continuation of a
+    // pre-restart session from an ordinary in-memory hit.
+    let mut resumed = false;
     let (session_id, is_new_session) = match &source {
         PromptSource::Channel(cid) => {
             if let Some(sid) = agent.state.sessions.get(cid) {
                 (sid.clone(), false)
+            } else if let Some(sid) = try_resume_session(&mut agent, &ctx, cid).await {
+                tracing::info!(
+                    target: "pool::session",
+                    "resumed session {sid} for channel {cid}"
+                );
+                agent.state.sessions.insert(*cid, sid.clone());
+                if let Some((pending_cid, section)) = pending_canvas.take() {
+                    agent.state.canvas_sections.insert(pending_cid, section);
+                }
+                resumed = true;
+                // Not a new session — a resumed one keeps its history, its
+                // system prompt, and its already-delivered initial message.
+                (sid, false)
             } else {
                 // Create new session with model application.
                 match create_session_and_apply_model(
@@ -1647,6 +1759,11 @@ pub async fn run_prompt_task(
                             "created session {sid} for channel {cid}"
                         );
                         agent.state.sessions.insert(*cid, sid.clone());
+                        // Overwrites any binding the resume above failed on, so a
+                        // dead session ID is superseded within the same turn.
+                        if let Some(store) = &ctx.session_store {
+                            store.put(cid, &sid);
+                        }
                         // Commit canvas only after session creation succeeds (I3).
                         if let Some((pending_cid, section)) = pending_canvas.take() {
                             agent.state.canvas_sections.insert(pending_cid, section);
@@ -1736,6 +1853,7 @@ pub async fn run_prompt_task(
         serde_json::json!({
             "sessionId": session_id,
             "isNewSession": is_new_session,
+            "resumed": resumed,
         }),
     );
 
@@ -2182,7 +2300,7 @@ pub async fn run_prompt_task(
                     target: "pool::session",
                     "rotating session for {source:?} after {stop_reason:?}",
                 );
-                agent.state.invalidate(&source);
+                rotate_session(&mut agent.state, &ctx, &source);
             }
 
             let core_stop = acp_stop_to_core(&stop_reason);
@@ -5221,6 +5339,7 @@ mod tests {
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
+            resume_supported: None,
             protocol_version: 2,
         };
 
@@ -5279,6 +5398,7 @@ mod tests {
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
+            resume_supported: None,
             protocol_version: 2,
         };
 
@@ -5572,7 +5692,203 @@ mod tests {
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
+            session_store: None,
         }
+    }
+
+    // ── try_resume_session ───────────────────────────────────────────────────
+
+    /// An agent backed by a scripted process reading `script`.
+    async fn scripted_agent(script: &str) -> OwnedAgent {
+        OwnedAgent {
+            index: 0,
+            acp: AcpClient::spawn("bash", &["-c".to_string(), script.to_string()], &[], false)
+                .await
+                .expect("spawn scripted agent"),
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "unknown".into(),
+            goose_system_prompt_supported: None,
+            resume_supported: None,
+            protocol_version: 2,
+        }
+    }
+
+    /// An agent answering one `session/resume` with `reply` — a JSON-RPC
+    /// `result` or `error` body — then going quiet.
+    async fn resuming_agent(reply: &str) -> OwnedAgent {
+        scripted_agent(&format!(
+            r#"
+            read -t 2 _REQ
+            echo '{{"jsonrpc":"2.0","id":0,{reply}}}'
+            sleep 2
+            "#
+        ))
+        .await
+    }
+
+    fn ctx_with_store(root: &tempfile::TempDir) -> PromptContext {
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.session_store = Some(SessionStore::in_root(root.path(), "aa"));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn resume_rebinds_the_stored_session() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_store(&root);
+        let channel = Uuid::new_v4();
+        ctx.session_store
+            .as_ref()
+            .unwrap()
+            .put(&channel, "ses_stored");
+        let mut agent = resuming_agent(r#""result":{"modes":null}"#).await;
+
+        let resumed = try_resume_session(&mut agent, &ctx, &channel).await;
+
+        assert_eq!(resumed.as_deref(), Some("ses_stored"));
+        assert_eq!(agent.resume_supported, Some(true));
+        agent.acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn resume_without_a_binding_never_touches_the_agent() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_store(&root);
+        // The script answers nothing, so a request here would time out rather
+        // than return `None` promptly.
+        let mut agent = scripted_agent("sleep 2").await;
+
+        assert_eq!(
+            try_resume_session(&mut agent, &ctx, &Uuid::new_v4()).await,
+            None
+        );
+        assert_eq!(agent.resume_supported, None);
+        agent.acp.shutdown().await;
+    }
+
+    /// A binding whose transcript is gone falls through to session creation,
+    /// and the agent stays eligible to resume other channels.
+    #[tokio::test]
+    async fn resume_miss_falls_through_without_disabling_resume() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_store(&root);
+        let channel = Uuid::new_v4();
+        ctx.session_store
+            .as_ref()
+            .unwrap()
+            .put(&channel, "ses_gone");
+        let mut agent =
+            resuming_agent(r#""error":{"code":-32002,"message":"Resource not found"}"#).await;
+
+        assert_eq!(try_resume_session(&mut agent, &ctx, &channel).await, None);
+        assert_eq!(agent.resume_supported, None);
+        // Left in place deliberately: the creation path overwrites it with the
+        // fresh session ID in this same turn.
+        assert_eq!(
+            ctx.session_store.as_ref().unwrap().get(&channel).as_deref(),
+            Some("ses_gone")
+        );
+        agent.acp.shutdown().await;
+    }
+
+    /// An agent without resume support is probed once and never again — the
+    /// scripted process answers a single request, so a second probe would hang.
+    #[tokio::test]
+    async fn unsupported_agent_is_probed_once_then_cached() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_store(&root);
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let store = ctx.session_store.as_ref().unwrap();
+        store.put(&first, "ses_a");
+        store.put(&second, "ses_b");
+        let mut agent =
+            resuming_agent(r#""error":{"code":-32601,"message":"Method not found"}"#).await;
+
+        assert_eq!(try_resume_session(&mut agent, &ctx, &first).await, None);
+        assert_eq!(agent.resume_supported, Some(false));
+        assert_eq!(try_resume_session(&mut agent, &ctx, &second).await, None);
+        agent.acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn resume_applies_the_desired_model_and_captures_the_catalog() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_store(&root);
+        let channel = Uuid::new_v4();
+        ctx.session_store.as_ref().unwrap().put(&channel, "ses_1");
+        // Resume response carries the catalog, then the model switch is acked.
+        let script = r#"
+            read -t 2 _RESUME
+            echo '{"jsonrpc":"2.0","id":0,"result":{"configOptions":[{"id":"model","category":"model","options":[{"value":"haiku"}]}]}}'
+            read -t 2 _SWITCH
+            echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+            sleep 2
+        "#;
+        let mut agent = scripted_agent(script).await;
+        agent.desired_model = Some("haiku".to_string());
+
+        assert_eq!(
+            try_resume_session(&mut agent, &ctx, &channel)
+                .await
+                .as_deref(),
+            Some("ses_1")
+        );
+        assert!(
+            agent
+                .model_capabilities
+                .as_ref()
+                .is_some_and(|caps| caps.contains("haiku")),
+            "the resumed session's catalog must populate model capabilities"
+        );
+        agent.acp.shutdown().await;
+    }
+
+    /// Rotation must retire the durable binding with the session it drops.
+    ///
+    /// Resume runs ahead of creation, so a binding that outlived its rotation
+    /// would be resumed on the next turn and answer with the same cap that
+    /// triggered the rotation — a channel that never makes progress again.
+    #[test]
+    fn rotation_clears_the_durable_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_store(&root);
+        let channel = Uuid::new_v4();
+        let mut state = SessionState::default();
+        state.sessions.insert(channel, "ses_capped".into());
+        ctx.session_store
+            .as_ref()
+            .unwrap()
+            .put(&channel, "ses_capped");
+
+        rotate_session(&mut state, &ctx, &PromptSource::Channel(channel));
+
+        assert!(!state.sessions.contains_key(&channel));
+        assert_eq!(ctx.session_store.as_ref().unwrap().get(&channel), None);
+    }
+
+    /// Error recovery is the case durable resume exists to serve, so the
+    /// binding must survive every invalidation that is not a rotation.
+    #[test]
+    fn error_path_invalidation_leaves_the_durable_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_store(&root);
+        let channel = Uuid::new_v4();
+        let mut state = SessionState::default();
+        state.sessions.insert(channel, "ses_live".into());
+        ctx.session_store
+            .as_ref()
+            .unwrap()
+            .put(&channel, "ses_live");
+
+        state.invalidate_all();
+
+        assert_eq!(
+            ctx.session_store.as_ref().unwrap().get(&channel).as_deref(),
+            Some("ses_live")
+        );
     }
 
     // ── render_canvas_section ────────────────────────────────────────────────

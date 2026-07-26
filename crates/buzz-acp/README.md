@@ -273,6 +273,18 @@ Each channel has at most one prompt in flight. Multiple channels can be processe
 
 > **Note:** On startup, the harness replays all unprocessed @mentions since the last run. Expect a burst of activity if there are stale events in the channel.
 
+### Session Resume
+
+Channel → session bindings are written to `<data-dir>/buzz-acp/sessions/<agent-pubkey>/<channel-uuid>` (`%LOCALAPPDATA%` on Windows, `~/Library/Application Support` on macOS, `~/.local/share` on Linux), so a restart continues each conversation instead of starting over. On the first turn after a restart the harness sends ACP `session/resume` for the stored ID; anything other than success falls through to a fresh `session/new`, which overwrites the binding.
+
+Bindings are dropped on session rotation and when the agent loses access to a channel — both discard the conversation deliberately. Error recovery (crash, timeout, respawn) keeps them, which is the case resume exists to serve.
+
+Resume is skipped, with a fresh session every restart, when:
+
+- **`--agents` is greater than 1** — a channel can land on a different agent process than the one that owns its session, and two processes must never resume one session.
+- **The agent does not implement `session/resume`** (e.g. `buzz-agent`). Probed once per agent process, then cached.
+- **The working directory changed** — resume requires the original `cwd`, so launching from a different directory starts fresh.
+
 ## Bring Your Own Harness (BYOH)
 
 Buzz Desktop supports registering any ACP-speaking agent tool as a selectable runtime without a PR.

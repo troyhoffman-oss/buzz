@@ -9,6 +9,7 @@ mod pool;
 mod pool_lifecycle;
 mod queue;
 mod relay;
+mod session_store;
 mod setup_mode;
 mod usage;
 
@@ -44,6 +45,7 @@ use pool::{
 use pool_lifecycle::PoolLifecycle;
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
 use relay::{HarnessRelay, RelayEventPublisher};
+use session_store::SessionStore;
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -1342,6 +1344,34 @@ impl Drop for RespawnGuard {
     }
 }
 
+/// Durable channel→session bindings for this agent identity, when they are safe
+/// to keep.
+///
+/// Gated on a single agent process: with `--agents N > 1`, `try_claim`'s
+/// fall-through pass can hand a channel to a second slot while the slot holding
+/// it in memory is busy elsewhere, and both would resume the same adapter
+/// session in two adapter processes. Forking into a fresh session there — what
+/// the harness does today — is the safe outcome. Lifting the gate needs a
+/// pool-level claim on the binding.
+fn durable_session_store(agents: u32, pubkey_hex: &str) -> Option<SessionStore> {
+    if agents > 1 {
+        tracing::info!(
+            target: "pool::session",
+            agents,
+            "durable session resume disabled — sessions are per-agent-process with --agents > 1"
+        );
+        return None;
+    }
+    let store = SessionStore::for_agent(pubkey_hex);
+    if store.is_none() {
+        tracing::warn!(
+            target: "pool::session",
+            "no platform data directory — sessions will not survive a restart"
+        );
+    }
+    store
+}
+
 //
 // Sync env-var propagation must run before the tokio runtime starts so that
 // any child processes inherit the correct environment. This must happen in the
@@ -1678,6 +1708,7 @@ async fn tokio_main() -> Result<()> {
         memory_enabled: config.memory_enabled,
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
+        session_store: durable_session_store(config.agents, &pubkey_hex),
     });
 
     if !config.memory_enabled {
@@ -1913,6 +1944,7 @@ async fn tokio_main() -> Result<()> {
                         model_overridden: false,
                         agent_name,
                         goose_system_prompt_supported: None,
+                        resume_supported: None,
                         protocol_version,
                     };
                     pool.return_agent(agent);
@@ -2111,6 +2143,12 @@ async fn tokio_main() -> Result<()> {
                                     } else {
                                         0
                                     };
+                                    // Losing access is the second intentional
+                                    // discard (with `!rotate`): a re-add must not
+                                    // resume a conversation from before removal.
+                                    if let Some(store) = &ctx.session_store {
+                                        store.clear(&ch);
+                                    }
                                     // Track removed channels so checked-out agents get
                                     // their sessions stripped when they return to the pool.
                                     removed_channels.insert(ch);
@@ -2195,6 +2233,15 @@ async fn tokio_main() -> Result<()> {
                                 // immediately. Queued future events remain queued
                                 // and will create a fresh session on dispatch.
                                 Some(("!rotate", "")) => {
+                                    // Clear the durable binding here and nowhere
+                                    // else: this is the one invalidation that is
+                                    // explicit owner intent. Error-path
+                                    // invalidation must leave the binding alone —
+                                    // recovering from those is what durable resume
+                                    // is for.
+                                    if let Some(store) = &ctx.session_store {
+                                        store.clear(&buzz_event.channel_id);
+                                    }
                                     let fired = signal_in_flight_task(
                                         &mut pool,
                                         buzz_event.channel_id,
@@ -3963,6 +4010,7 @@ async fn initialize_agent_pool(
                             model_overridden: false,
                             agent_name,
                             goose_system_prompt_supported: None,
+                            resume_supported: None,
                             protocol_version,
                         }));
                     }
@@ -4431,6 +4479,19 @@ mod owner_control_command_tests {
         assert!(owner_control_command(&other_agent, KIND_STREAM_MESSAGE, &agent).is_none());
     }
 
+    /// Durable resume is single-process only: with more agent slots than one,
+    /// `try_claim`'s fall-through can hand a channel to a second slot, and two
+    /// slots resuming one binding would run one session in two processes.
+    #[test]
+    fn durable_session_store_is_gated_on_a_single_agent() {
+        let pubkey = "ab".repeat(32);
+        assert_eq!(
+            durable_session_store(1, &pubkey).is_some(),
+            dirs::data_local_dir().or_else(dirs::data_dir).is_some()
+        );
+        assert!(durable_session_store(2, &pubkey).is_none());
+    }
+
     #[test]
     fn mode_gate_signal_maps_handling_to_control_signal() {
         let owner = "a".repeat(64);
@@ -4538,6 +4599,7 @@ mod owner_control_command_tests {
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
+            resume_supported: None,
             protocol_version: 2,
         }
     }
@@ -5511,6 +5573,7 @@ mod error_outcome_emission_tests {
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
+            resume_supported: None,
             // Error branches under test never read this; 1 is the legacy
             // non-systemPrompt path, the simplest valid value.
             protocol_version: 1,

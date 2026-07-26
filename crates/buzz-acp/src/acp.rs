@@ -624,6 +624,39 @@ impl AcpClient {
             .session_id)
     }
 
+    /// Send `session/resume` to rebind an existing on-disk session.
+    ///
+    /// `cwd` must match the session's original working directory. Deliberately
+    /// not `session/load`: that replays the whole prior conversation as
+    /// `session/update` notifications, which the read loop would mirror into the
+    /// observer feed. Resume rebinds without replay.
+    ///
+    /// The response carries the same `modes`/`configOptions` shape as
+    /// `session/new` but need not repeat `sessionId`, so the requested ID is the
+    /// fallback.
+    pub async fn session_resume(
+        &mut self,
+        cwd: &str,
+        session_id: &str,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<SessionNewResponse, AcpError> {
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "cwd": cwd,
+            "mcpServers": mcp_servers,
+        });
+        let result = self.send_request("session/resume", params).await?;
+        let resumed = result["sessionId"]
+            .as_str()
+            .unwrap_or(session_id)
+            .to_owned();
+        tracing::info!(target: "acp::session", "session resumed: {resumed}");
+        Ok(SessionNewResponse {
+            session_id: resumed,
+            raw: result,
+        })
+    }
+
     /// Send Goose's custom system-prompt request after `session/new`.
     pub async fn session_set_goose_system_prompt(
         &mut self,
@@ -3520,6 +3553,46 @@ mod tests {
             Some("Custom system prompt"),
             "systemPrompt should be included in params when Some"
         );
+    }
+
+    #[tokio::test]
+    async fn session_resume_sends_the_stored_session_id_and_cwd() {
+        let script = r#"
+            read -t 2 REQ
+            echo '{"jsonrpc":"2.0","id":0,"result":{"_receivedRequest":'"$REQ"'}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+
+        let resp = client
+            .session_resume("/tmp", "ses_stored", vec![])
+            .await
+            .expect("session_resume should succeed");
+
+        // No sessionId in the response — the requested ID is the fallback.
+        assert_eq!(resp.session_id, "ses_stored");
+        let received = &resp.raw["_receivedRequest"];
+        assert_eq!(received["method"], "session/resume");
+        assert_eq!(received["params"]["sessionId"], "ses_stored");
+        assert_eq!(received["params"]["cwd"], "/tmp");
+        assert!(received["params"]["mcpServers"].is_array());
+    }
+
+    #[tokio::test]
+    async fn session_resume_preserves_missing_transcript_code() {
+        // -32002 is what both claude-agent-acp and codex-acp answer for a
+        // session ID with no transcript on disk — the caller distinguishes it
+        // from -32601 (no resume support) to decide whether to probe again.
+        let script = r#"
+            read -t 2 _REQ
+            echo '{"jsonrpc":"2.0","id":0,"error":{"code":-32002,"message":"Resource not found: ses_gone"}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        assert!(matches!(
+            client.session_resume("/tmp", "ses_gone", vec![]).await,
+            Err(AcpError::AgentError { code: -32002, .. })
+        ));
     }
 
     #[tokio::test]
