@@ -19,6 +19,8 @@ import type {
   PresenceLookup,
   PresenceStatus,
   RelayEvent,
+  RemoteHarness,
+  RemoteHarnessCatalog,
   SearchMessagesInput,
   SearchMessagesResponse,
   SendChannelMessageResult,
@@ -1131,6 +1133,74 @@ export async function probeBackendProvider(
 ): Promise<BackendProviderProbeResult> {
   return invokeTauri<BackendProviderProbeResult>("probe_backend_provider", {
     binaryPath,
+  });
+}
+
+type RawRemoteHarness = {
+  id: string;
+  label?: string | null;
+  command: string;
+  args?: string[] | null;
+  env?: Record<string, string> | null;
+  available?: boolean | null;
+  binaryPath?: string | null;
+  version?: string | null;
+};
+
+type RawRemoteHarnessCatalog = {
+  buzz_acp?: { path: string; version: string } | null;
+  harnesses?: RawRemoteHarness[] | null;
+};
+
+/**
+ * The harness catalog of the machine the provider deploys to.
+ *
+ * The local ACP runtime catalog describes THIS computer, which for a remote
+ * agent is the wrong machine entirely — this is what the create dialog reads
+ * instead, and the picked entry's `command` becomes the create-time harness
+ * pin that the deploy ships to the host.
+ */
+export async function discoverProviderHarnesses(
+  binaryPath: string,
+  config: Record<string, unknown>,
+): Promise<RemoteHarnessCatalog> {
+  const raw = await invokeTauri<RawRemoteHarnessCatalog>(
+    "discover_provider_harnesses",
+    { binaryPath, config },
+  );
+  return {
+    buzzAcp: raw.buzz_acp ?? null,
+    harnesses: (raw.harnesses ?? []).map(
+      (harness): RemoteHarness => ({
+        id: harness.id,
+        label: harness.label ?? harness.id,
+        command: harness.command,
+        args: harness.args ?? [],
+        env: harness.env ?? {},
+        available: harness.available ?? false,
+        binaryPath: harness.binaryPath ?? null,
+        version: harness.version ?? null,
+      }),
+    ),
+  };
+}
+
+/**
+ * Model catalog for one remote harness. Normalized backend-side through the
+ * same `normalize_agent_models` the local path uses, so the model picker needs
+ * no remote-specific rendering.
+ */
+export async function probeProviderModels(
+  binaryPath: string,
+  config: Record<string, unknown>,
+  harness: Pick<RemoteHarness, "command" | "args">,
+  envVars?: Record<string, string>,
+): Promise<AgentModelsResponse> {
+  return invokeTauri<AgentModelsResponse>("probe_provider_models", {
+    binaryPath,
+    config,
+    harness: { command: harness.command, args: harness.args },
+    envVars,
   });
 }
 

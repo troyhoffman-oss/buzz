@@ -44,6 +44,7 @@ import {
 import { resolveManagedAgentAvatarUrl } from "./managedAgentAvatar";
 import {
   buildInstanceInputForDefinition,
+  resolveCreateRuntimeForDefinition,
   type BackendIntent,
 } from "../lib/instanceInputForDefinition";
 
@@ -142,26 +143,40 @@ export function usePersonaActions() {
         await updatePersonaMutation.mutateAsync(input);
         setPersonaNoticeMessage(`Updated ${input.displayName}.`);
       } else {
-        const runtime = availableRuntimes.find(
-          (candidate) => candidate.id === input.runtime,
-        );
-        if (!runtime) {
-          setPersonaErrorMessage(
-            "Choose an available provider for this agent.",
-          );
-          return false;
-        }
-
         // Stale-intent guard: a definition-only create never carries one.
+        // Resolved before the runtime gate because it decides whether the
+        // local catalog gates this create at all.
         const startIntent =
           resolveCreateIntent(intent) === "definition_start"
             ? (backendIntent ?? null)
             : null;
 
+        let runtime: AcpRuntime | null;
+        try {
+          // A provider create runs the harness on the remote host, so the
+          // local runtime catalog does not gate it — see
+          // resolveCreateRuntimeForDefinition.
+          ({ runtime } = resolveCreateRuntimeForDefinition(
+            availableRuntimes,
+            input.runtime,
+            startIntent?.type === "provider",
+          ));
+        } catch (error) {
+          // Surface the resolver's own message rather than a second copy of
+          // the policy: it is the single owner of when a create is refused,
+          // and a local paraphrase here would drift from it.
+          setPersonaErrorMessage(
+            error instanceof Error
+              ? error.message
+              : "Choose an available runtime for this agent.",
+          );
+          return false;
+        }
+
         const avatarUrl = await resolveManagedAgentAvatarUrl(
           input.avatarUrl,
           undefined,
-          runtime.avatarUrl,
+          runtime?.avatarUrl,
         );
         const persona = await createPersonaMutation.mutateAsync({
           ...input,

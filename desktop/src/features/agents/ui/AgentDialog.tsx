@@ -127,6 +127,7 @@ function AgentCreateDialogRouter({
           onDraftChange={setRunDraft}
         />
       }
+      createRunsRemotely={runDraft.runOn !== "local"}
       createSubmitBlocked={!canSubmitWhereToRun(runDraft)}
       description={copy.description}
       error={definitionError}

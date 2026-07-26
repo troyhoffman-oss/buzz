@@ -9,7 +9,7 @@ use buzz_core_pkg::kind::KIND_PERSONA;
 use nostr::{EventBuilder, Kind, Tag};
 use serde::{Deserialize, Serialize};
 
-use super::{AgentDefinition, ManagedAgentRecord};
+use super::{AgentDefinition, BackendKind, ManagedAgentRecord};
 use crate::app_state::AppState;
 
 /// The JSON body stored in a persona event's content field.
@@ -480,20 +480,34 @@ pub fn apply_persona_snapshot(record: &mut ManagedAgentRecord, persona: &AgentDe
     record.runtime = snapshot.runtime;
     // Drop a stale create-time harness pin when the definition names a
     // different known runtime; custom commands stay pinned.
-    if let Some(def_runtime) = persona
-        .runtime
-        .as_deref()
-        .map(str::trim)
-        .filter(|r| !r.is_empty())
-        .and_then(crate::managed_agents::known_acp_runtime_exact)
-    {
-        if let Some(pin_runtime) = record
-            .agent_command_override
+    //
+    // LOCAL RECORDS ONLY. For a provider-backed record the pin is not a
+    // local-runtime preference that the definition may override — it is the
+    // only channel by which the harness selected from the REMOTE host's
+    // catalog reaches that host (`deploy_payload_json` ships
+    // `record.agent_command`, which `record_agent_command` derives from this
+    // pin). The comparison below is against the LOCAL runtime registry, which
+    // knows nothing about what is installed on the remote machine, so clearing
+    // here would silently re-resolve the record to a locally-known command —
+    // ultimately `default_agent_command()` = `buzz-agent` — and the next
+    // deploy would provision the wrong harness. The persona's runtime is not
+    // authoritative over a remote harness choice, so the pin survives.
+    if record.backend == BackendKind::Local {
+        if let Some(def_runtime) = persona
+            .runtime
             .as_deref()
-            .and_then(crate::managed_agents::known_acp_runtime)
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .and_then(crate::managed_agents::known_acp_runtime_exact)
         {
-            if !std::ptr::eq(pin_runtime, def_runtime) {
-                record.agent_command_override = None;
+            if let Some(pin_runtime) = record
+                .agent_command_override
+                .as_deref()
+                .and_then(crate::managed_agents::known_acp_runtime)
+            {
+                if !std::ptr::eq(pin_runtime, def_runtime) {
+                    record.agent_command_override = None;
+                }
             }
         }
     }

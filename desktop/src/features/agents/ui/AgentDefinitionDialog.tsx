@@ -14,6 +14,11 @@ import { Dialog } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
 import { Textarea } from "@/shared/ui/textarea";
 import { AgentCreationPreview } from "./AgentCreationPreview";
+import {
+  createRuntimeSelectionSatisfied,
+  runtimeDropdownOptions as buildRuntimeDropdownOptions,
+  runtimeDropdownPlaceholder,
+} from "./createRuntimeGate";
 import { PersonaDropdownField } from "./PersonaDropdownField";
 import type { EnvVarsValue } from "./EnvVarsEditor";
 import { PersonaAdvancedFields } from "./PersonaAdvancedFields";
@@ -49,7 +54,6 @@ import {
   PERSONA_FIELD_SHELL_CLASS,
   PERSONA_LABEL_OPTIONAL_CLASS,
   shouldClearKnownModelForSelectionScope,
-  sortPersonaRuntimes,
 } from "./agentConfigOptions";
 import { RequiredFieldLabel } from "./agentConfigControls";
 import {
@@ -101,6 +105,13 @@ type AgentDefinitionDialogProps = {
   createRunSection?: React.ReactNode;
   /** Extra create-mode submit gate (e.g. incomplete provider config). */
   createSubmitBlocked?: boolean;
+  /**
+   * True when "Where to run" targets a backend provider. The harness then comes
+   * from the REMOTE host's catalog, so the local-runtime requirements below do
+   * not apply — demanding a locally-installed runtime would make every
+   * remote-only harness unsubmittable.
+   */
+  createRunsRemotely?: boolean;
 };
 
 const ADVANCED_FIELDS_MOTION_TRANSITION = {
@@ -122,6 +133,7 @@ export function AgentDefinitionDialog({
   onSubmit,
   createRunSection,
   createSubmitBlocked = false,
+  createRunsRemotely = false,
 }: AgentDefinitionDialogProps) {
   const [displayName, setDisplayName] = React.useState("");
   const [aiDefaultsOpen, setAiDefaultsOpen] = React.useState(false);
@@ -468,15 +480,19 @@ export function AgentDefinitionDialog({
     { provider, model },
     runtimeCanChooseLlmProvider,
   );
-  const selectedRuntimeIsAvailable =
-    runtime.trim().length === 0 ||
-    selectedRuntime?.availability === "available";
+  // How far the LOCAL catalog gates this create — see createRuntimeGate.ts.
+  const runtimeGate = {
+    isCreateMode,
+    runsRemotely: createRunsRemotely,
+    runtime,
+    selectedRuntime,
+    hasLocalDefaultRuntime: defaultRuntime !== null,
+  };
   // Gate model/provider validity through missingNormalizedFields — single
   // source of truth with the readiness gate so display and Save can't drift.
   const canSubmit =
     canSubmitPersonaDialog({ displayName, isPending }) &&
-    (!isCreateMode || runtime.trim().length > 0) &&
-    (!isCreateMode || selectedRuntimeIsAvailable) &&
+    createRuntimeSelectionSatisfied(runtimeGate) &&
     (!isCreateMode || !createSubmitBlocked) &&
     // Crash-loop guard, create AND edit: an empty allowlist would crash
     // every instance minted from this definition at startup.
@@ -552,44 +568,12 @@ export function AgentDefinitionDialog({
   const showCustomProviderInput =
     llmProviderFieldVisible && isCustomProviderEditing;
   const runtimeDropdownValue = runtime.trim() || NO_RUNTIME_DROPDOWN_VALUE;
-  const sortedRuntimes = React.useMemo(
-    () => sortPersonaRuntimes(runtimes),
-    [runtimes],
-  );
-  const blankRuntimeOptionLabel = runtimesLoading
-    ? "Loading harnesses..."
-    : isCreateMode
-      ? "Choose a harness"
-      : "No preference (use app default)";
-  const runtimeDropdownOptions: PersonaDropdownOption[] = [
-    ...(!isCreateMode
-      ? [
-          {
-            label: blankRuntimeOptionLabel,
-            value: NO_RUNTIME_DROPDOWN_VALUE,
-          },
-        ]
-      : []),
-    ...sortedRuntimes.map((candidate) => ({
-      disabled:
-        isCreateMode &&
-        defaultRuntime !== null &&
-        candidate.availability !== "available",
-      label: `${formatRuntimeOptionLabel(candidate)}${
-        isCreateMode && candidate.id === defaultRuntime?.id ? " (default)" : ""
-      }`,
-      value: candidate.id,
-    })),
-  ];
-  if (
-    runtime.trim().length > 0 &&
-    !runtimeDropdownOptions.some((option) => option.value === runtime)
-  ) {
-    runtimeDropdownOptions.push({
-      label: `${runtime.trim()} (current)`,
-      value: runtime.trim(),
-    });
-  }
+  const runtimeDropdownOptions = buildRuntimeDropdownOptions({
+    defaultRuntimeId: defaultRuntime?.id ?? null,
+    gate: runtimeGate,
+    runtimes,
+    runtimesLoading,
+  });
   const runtimeSummaryLabel = selectedRuntime
     ? formatRuntimeOptionLabel(selectedRuntime)
     : runtime.trim() || "Not configured";
@@ -846,7 +830,10 @@ export function AgentDefinitionDialog({
                   disabled={isPending || runtimesLoading}
                   onValueChange={handleRuntimeDropdownChange}
                   options={runtimeDropdownOptions}
-                  placeholder={blankRuntimeOptionLabel}
+                  placeholder={runtimeDropdownPlaceholder({
+                    isCreateMode,
+                    runtimesLoading,
+                  })}
                   value={runtimeDropdownValue}
                   warning={runtimeWarning}
                 />
