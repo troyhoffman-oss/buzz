@@ -106,6 +106,21 @@ what it was before; present with a Hermes root but no `profiles/` store, it is t
 `hermes-default`, since the root directory *is* the default profile; present with no Hermes root at
 all, it is just the plain entry.
 
+Those per-profile entries carry `"exclusive": true`, the catalog's one statement about identity: the
+entry names a persistent identity on the host — its own memory, sessions and credentials — rather
+than an ephemeral runner. Deploying `claude` or the plain `hermes-acp` entry N times to one host is
+the point; pinning two agents to *the same profile* is two puppeteers driving one body, so the
+desktop refuses the second. Every other entry omits the key, and an absent key means "deploy as many
+as you like" — the flag is the only hermes-aware thing here, and the desktop reads it generically
+(`isExclusiveRemoteHarnessAdded`): an entry counts as already taken when an existing agent is backed
+by the *same provider and provider config* and pinned to the *same command and args*, in which case
+the harness picker renders it disabled with an "(added)" suffix and auto-pick skips it. Config
+equality is exact (after trimming, dropping blanks and sorting keys), not host resolution, so
+`10.0.0.4` and `vps.tail1234.ts.net` read as different hosts and the guard simply does not fire —
+it under-matches rather than ever falsely blocking a create. Resolving aliases needs a
+host-identity answer from the provider, which is the real fix rather than a normalization table in
+the desktop.
+
 `probe_models` exports the harness env inside the script, then runs `buzz-acp models --json` on the
 host and returns the document verbatim under `models_raw`. The desktop feeds it straight into the
 same `normalize_agent_models` the local path uses, so the model picker needs no remote-specific

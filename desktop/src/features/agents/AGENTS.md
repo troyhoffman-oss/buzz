@@ -188,6 +188,23 @@ with a TypeScript lookup table or an id comparison in a component.
     would compare a REMOTE command against LOCAL runtime identity, and a host
     binary sharing a basename with a local runtime would have its explicit
     args silently rewritten.
+16. **An `exclusive` catalog entry may back at most one agent.** The provider
+    marks entries that name a persistent IDENTITY on the host (its own memory,
+    sessions, credentials) rather than an ephemeral runner — today only the
+    per-Hermes-profile entries. Deploying `claude` N times to one host is the
+    point; two agents on one profile are two puppeteers on one body.
+    `isExclusiveRemoteHarnessAdded` decides "already taken" generically: same
+    provider, same provider config, same command+args as an existing record's
+    `agentCommand`/`agentArgs` (the RESOLVED pin — `agentCommandOverride` is
+    null for a pin equal to what the definition inherits). The picker renders a
+    taken entry disabled with an "(added)" suffix — the existing annotated-and-
+    disabled option vocabulary, not a new badge — auto-pick skips it, and
+    `WhereToRunSection` clears a pick the agent list turns stale so a
+    background refresh cannot leave an armed submit behind. Nothing in the
+    desktop knows what Hermes or a profile is; do not teach it. Config equality
+    is exact after trimming/dropping-blanks/sorting, so a host reached by two
+    names under-matches (the guard does not fire) rather than falsely blocking
+    a create; the real fix is a host-identity answer from the provider.
 
 ## The tests that enforce this
 
@@ -204,7 +221,17 @@ with a TypeScript lookup table or an id comparison in a component.
   its entries from renaming themselves as the selection moves, and the summary
   that follows it), and `remoteModelDiscoveryView`
   (idle/loading/failed/loaded/empty-catalog). Covers the PROJECTION of the
-  host's probe, not the substitution that consumes it.
+  host's probe, not the substitution that consumes it. Also `remoteHarnessOptions`
+  / `autoPickRemoteHarness`: rule 16's disabled "(added)" row and the auto-pick
+  that must never arm a create the picker itself refuses.
+- `lib/exclusiveRemoteHarness.test.mjs` — rule 16's matcher. Same host + same
+  pinned identity is taken; a different host, user, provider, profile or
+  command is not; a local agent never occupies a host identity; a
+  non-exclusive entry is never taken however many agents run it; and an absent
+  flag is exactly today's behavior.
+- `shared/api/tauri.test.mjs` — `fromRawRemoteHarness`: the wire boundary for
+  `exclusive`. An asserted flag is carried; absent stays absent (the desktop
+  must not claim something the provider never said).
 - `ui/providerConfigFields.test.mjs` — `providerConfigChoices` (a malformed
   `oneOf` entry costs one row, not the list), `usesProviderConfigFreeText`
   (an unlisted value stays editable), and `providerConfigSelection` (picking

@@ -393,6 +393,15 @@ fn harnesses_response(stdout: &str) -> serde_json::Value {
 ///
 /// The plain `hermes` candidate stays as-is and remains the default option: it
 /// runs whichever profile is sticky, which is what a single-profile host wants.
+///
+/// These are the only entries that carry `exclusive: true`. `claude`, `codex`
+/// and the plain `hermes-acp` shim are ephemeral runners — deploying one of
+/// them N times against a host is the normal, intended shape. A profile is the
+/// opposite: it is a persistent IDENTITY (its own memory, sessions, credentials
+/// and nostr history), so two Buzz agents pinned to the same profile are two
+/// puppeteers driving one body — they interleave turns into the same session
+/// store. The flag is what lets the desktop refuse the second one; the provider
+/// only states the fact, and says nothing about how it is rendered.
 fn hermes_profile_harnesses(probes: &[Probe<'_>], stdout: &str) -> Vec<serde_json::Value> {
     // No Hermes CLI on the host means no way to pass `--profile`, so no
     // per-profile entries — regardless of what the profile records claim.
@@ -421,6 +430,11 @@ fn hermes_profile_harnesses(probes: &[Probe<'_>], stdout: &str) -> Vec<serde_jso
                 "env": serde_json::Map::new(),
                 "installInstructionsUrl": "",
                 "installHint": "",
+                // A persistent identity, not an ephemeral runner: at most one
+                // agent may be pinned to this exact command+args. Emitted ONLY
+                // here — every other entry omits the key, and an absent key
+                // means "deploy as many as you like".
+                "exclusive": true,
                 // The profile directory was listed and the CLI resolved this
                 // pass, so the entry is as available as the plain one.
                 "available": true,
@@ -745,6 +759,28 @@ mod tests {
         let plain = entry(&response, "hermes");
         assert_eq!(plain["command"], "hermes-acp");
         assert_eq!(plain["args"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn only_per_profile_entries_are_marked_exclusive() {
+        // A profile is a persistent identity: at most one agent may be pinned
+        // to it. Every other entry is an ephemeral runner and must OMIT the key
+        // entirely — an absent field is what the desktop reads as "no limit",
+        // so emitting `false` would be a different (and needless) contract.
+        let response = harnesses_response(&hermes_stdout(&["default", "matt"]));
+        for id in ["hermes-default", "hermes-matt"] {
+            assert_eq!(entry(&response, id)["exclusive"], true, "{id}");
+        }
+        for entry_value in response["harnesses"].as_array().unwrap() {
+            let id = entry_value["id"].as_str().unwrap();
+            if id.starts_with("hermes-") {
+                continue;
+            }
+            assert!(
+                entry_value.get("exclusive").is_none(),
+                "{id} must not advertise 'exclusive'"
+            );
+        }
     }
 
     #[test]

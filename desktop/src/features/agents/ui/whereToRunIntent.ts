@@ -117,6 +117,64 @@ export function providerConfigComplete(draft: WhereToRunDraft): boolean {
 }
 
 /**
+ * The dropdown rows for the host's harness catalog.
+ *
+ * Unavailable entries are omitted (the pin must name a binary the host
+ * reported, see `selectedRemoteHarness`). Entries in `addedExclusiveIds` stay
+ * VISIBLE but disabled: an exclusive entry is a persistent identity on the host
+ * that an existing agent already drives, and hiding it would read as "that
+ * profile is gone" rather than "it is already yours". The "(added)" suffix is
+ * the same parenthetical annotation `formatRuntimeOptionLabel` uses for
+ * "(not installed)" — the picker has one label vocabulary, not two.
+ *
+ * Pure, and agnostic about what makes an entry exclusive or added: the caller
+ * computes that set (`addedExclusiveHarnessIds`) and this only renders it.
+ */
+export function remoteHarnessOptions(
+  harnesses: readonly RemoteHarness[] | null,
+  addedExclusiveIds: ReadonlySet<string>,
+): PersonaDropdownOption[] {
+  return (harnesses ?? [])
+    .filter((harness) => harness.available)
+    .map((harness) => {
+      const added = addedExclusiveIds.has(harness.id);
+      const version = harness.version ? ` (${harness.version})` : "";
+      return {
+        label: `${harness.label}${version}${added ? " (added)" : ""}`,
+        value: harness.id,
+        ...(added ? { disabled: true } : {}),
+      };
+    });
+}
+
+/**
+ * What the harness picker should select after a catalog read.
+ *
+ * Keeps an existing pick when the re-check still offers it, otherwise falls to
+ * the first entry that can be picked at all — so the common case needs no extra
+ * interaction. An added-exclusive entry is never either of those: auto-picking
+ * one would silently arm a create the picker itself refuses, and submitting it
+ * would put a second agent on an identity that already has one.
+ *
+ * Returns the entry rather than its id because the caller immediately probes
+ * the host for its models.
+ */
+export function autoPickRemoteHarness(
+  harnesses: readonly RemoteHarness[],
+  addedExclusiveIds: ReadonlySet<string>,
+  previousId: string | null,
+): RemoteHarness | null {
+  const selectable = harnesses.filter(
+    (harness) => harness.available && !addedExclusiveIds.has(harness.id),
+  );
+  return (
+    selectable.find((harness) => harness.id === previousId) ??
+    selectable[0] ??
+    null
+  );
+}
+
+/**
  * The picked remote harness, or null when none is selected/available.
  *
  * Only an `available` catalog entry can be the pick. An unavailable entry names

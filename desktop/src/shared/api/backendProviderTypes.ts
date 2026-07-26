@@ -35,6 +35,19 @@ export type RemoteHarness = {
   available: boolean;
   binaryPath: string | null;
   version: string | null;
+  /**
+   * The entry names a persistent IDENTITY on the host rather than an ephemeral
+   * runner, so at most one agent may be pinned to it.
+   *
+   * Absent (the default, and what every entry emitted before this field looked
+   * like) means the opposite: deploying the same harness N times against one
+   * host is the point of a runner, and nothing about it is scarce. A provider
+   * sets this when a second agent on the same entry would share one identity's
+   * memory, sessions and credentials — two puppeteers on one body. The desktop
+   * knows nothing about WHICH harnesses those are; it only refuses to add a
+   * marked one twice (`isExclusiveRemoteHarnessAdded`).
+   */
+  exclusive?: boolean;
 };
 
 export type RemoteHarnessCatalog = {

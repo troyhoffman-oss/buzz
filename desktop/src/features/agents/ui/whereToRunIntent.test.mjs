@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  autoPickRemoteHarness,
   canSubmitWhereToRun,
   emptyWhereToRunDraft,
   providerConfigComplete,
+  remoteHarnessOptions,
   remoteHarnessSummaryLabel,
   rememberProbedProviderName,
   remoteModelDiscoveryView,
@@ -337,5 +339,121 @@ test("the summary label defers to the local catalog with no remote pick", () => 
     ),
     null,
     "an unavailable entry is not the pin, so it must not name the summary",
+  );
+});
+
+// ── The harness picker rows ───────────────────────────────────────────────
+
+const hermesDefault = {
+  id: "hermes-default",
+  label: "Hermes (default)",
+  command: "hermes",
+  args: ["--profile", "default", "acp"],
+  env: {},
+  available: true,
+  binaryPath: "/usr/local/bin/hermes",
+  version: null,
+  exclusive: true,
+};
+
+const hermesMatt = {
+  ...hermesDefault,
+  id: "hermes-matt",
+  label: "Hermes (matt)",
+};
+
+test("harness rows carry the label, the version, and nothing else by default", () => {
+  const options = remoteHarnessOptions(
+    [gooseHarness, hermesDefault],
+    new Set(),
+  );
+  assert.deepEqual(options, [
+    { label: "Goose (1.2.0)", value: "goose" },
+    { label: "Hermes (default)", value: "hermes-default" },
+  ]);
+});
+
+test("an added exclusive row stays visible but is disabled and annotated", () => {
+  const options = remoteHarnessOptions(
+    [gooseHarness, hermesDefault, hermesMatt],
+    new Set(["hermes-default"]),
+  );
+  assert.deepEqual(options, [
+    { label: "Goose (1.2.0)", value: "goose" },
+    {
+      label: "Hermes (default) (added)",
+      value: "hermes-default",
+      disabled: true,
+    },
+    { label: "Hermes (matt)", value: "hermes-matt" },
+  ]);
+});
+
+test("unavailable entries are never offered", () => {
+  const options = remoteHarnessOptions(
+    [{ ...gooseHarness, available: false }, hermesDefault],
+    new Set(),
+  );
+  assert.deepEqual(
+    options.map((option) => option.value),
+    ["hermes-default"],
+  );
+});
+
+test("no catalog yields no rows", () => {
+  assert.deepEqual(remoteHarnessOptions(null, new Set()), []);
+  assert.deepEqual(remoteHarnessOptions([], new Set()), []);
+});
+
+// ── Auto-pick after a catalog read ────────────────────────────────────────
+
+test("auto-pick keeps the previous choice when the host still offers it", () => {
+  assert.equal(
+    autoPickRemoteHarness(
+      [gooseHarness, hermesDefault],
+      new Set(),
+      "hermes-default",
+    )?.id,
+    "hermes-default",
+  );
+});
+
+test("auto-pick falls to the first selectable entry", () => {
+  assert.equal(
+    autoPickRemoteHarness([gooseHarness, hermesDefault], new Set(), null)?.id,
+    "goose",
+  );
+  assert.equal(
+    autoPickRemoteHarness([gooseHarness, hermesDefault], new Set(), "gone")?.id,
+    "goose",
+    "a stale previous id must not survive a re-check",
+  );
+});
+
+// Auto-picking an added-exclusive entry would arm a create the picker itself
+// refuses, and submitting it would put a second agent on one identity.
+test("auto-pick skips added-exclusive entries, even a previous pick", () => {
+  assert.equal(
+    autoPickRemoteHarness(
+      [hermesDefault, hermesMatt],
+      new Set(["hermes-default"]),
+      "hermes-default",
+    )?.id,
+    "hermes-matt",
+  );
+  assert.equal(
+    autoPickRemoteHarness([hermesDefault], new Set(["hermes-default"]), null),
+    null,
+  );
+});
+
+test("auto-pick never returns an unavailable entry", () => {
+  assert.equal(
+    autoPickRemoteHarness(
+      [{ ...gooseHarness, available: false }],
+      new Set(),
+      "goose",
+    ),
+    null,
   );
 });

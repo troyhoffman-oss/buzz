@@ -1148,12 +1148,38 @@ type RawRemoteHarness = {
   available?: boolean | null;
   binaryPath?: string | null;
   version?: string | null;
+  exclusive?: boolean | null;
 };
 
 type RawRemoteHarnessCatalog = {
   buzz_acp?: { path: string; version: string } | null;
   harnesses?: RawRemoteHarness[] | null;
 };
+
+/**
+ * One catalog row, wire → app.
+ *
+ * Exported for the same reason `fromRawAcpRuntimeCatalogEntry` is: the mapping
+ * is the API boundary contract, and a test that re-implements it proves
+ * nothing.
+ */
+export function fromRawRemoteHarness(harness: RawRemoteHarness): RemoteHarness {
+  return {
+    id: harness.id,
+    label: harness.label ?? harness.id,
+    command: harness.command,
+    args: harness.args ?? [],
+    env: harness.env ?? {},
+    available: harness.available ?? false,
+    binaryPath: harness.binaryPath ?? null,
+    version: harness.version ?? null,
+    // Only carried when the provider asserted it. Spreading a `false` for
+    // every other entry would put the desktop in the business of claiming
+    // something the provider never said; absent IS the default, and every
+    // consumer reads it as "no limit".
+    ...(harness.exclusive === true ? { exclusive: true } : {}),
+  };
+}
 
 /**
  * The harness catalog of the machine the provider deploys to.
@@ -1173,18 +1199,7 @@ export async function discoverProviderHarnesses(
   );
   return {
     buzzAcp: raw.buzz_acp ?? null,
-    harnesses: (raw.harnesses ?? []).map(
-      (harness): RemoteHarness => ({
-        id: harness.id,
-        label: harness.label ?? harness.id,
-        command: harness.command,
-        args: harness.args ?? [],
-        env: harness.env ?? {},
-        available: harness.available ?? false,
-        binaryPath: harness.binaryPath ?? null,
-        version: harness.version ?? null,
-      }),
-    ),
+    harnesses: (raw.harnesses ?? []).map(fromRawRemoteHarness),
   };
 }
 

@@ -1,14 +1,18 @@
 import { AlertTriangle, Loader2 } from "lucide-react";
 import * as React from "react";
 
-import { useBackendProvidersQuery } from "@/features/agents/hooks";
+import {
+  useBackendProvidersQuery,
+  useManagedAgentsQuery,
+} from "@/features/agents/hooks";
+import { addedExclusiveHarnessIds } from "@/features/agents/lib/exclusiveRemoteHarness";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import {
   discoverProviderHarnesses,
   probeBackendProvider,
   probeProviderModels,
 } from "@/shared/api/tauri";
-import type { RemoteHarness } from "@/shared/api/types";
+import type { ManagedAgent, RemoteHarness } from "@/shared/api/types";
 import { Button } from "@/shared/ui/button";
 
 import type { EnvVarsValue } from "./EnvVarsEditor";
@@ -18,10 +22,12 @@ import {
   ProviderConfigFields,
 } from "./ProviderConfigFields";
 import {
+  autoPickRemoteHarness,
   emptyWhereToRunDraft,
   LOCAL_RUN_TARGET_VALUE,
   providerConfigComplete,
   rememberProbedProviderName,
+  remoteHarnessOptions,
   runTargetOptions,
   type WhereToRunDraft,
 } from "./whereToRunIntent";
@@ -56,6 +62,10 @@ export function WhereToRunSection({
   onDraftChange: (next: WhereToRunDraft) => void;
 }) {
   const backendProviders = useBackendProvidersQuery().data ?? [];
+  // The agents that already exist, so an exclusive catalog entry one of them
+  // occupies can be refused. This is the same shared query the Agents surfaces
+  // read, so it is warm by the time this dialog opens.
+  const managedAgents = useManagedAgentsQuery().data ?? [];
   const { globalConfig } = useGlobalAgentConfig();
   const [probeError, setProbeError] = React.useState<string | null>(null);
   const [harnessError, setHarnessError] = React.useState<string | null>(null);
@@ -91,6 +101,12 @@ export function WhereToRunSection({
   // fact configured.
   const probeEnvRef = React.useRef<EnvVarsValue>({});
   probeEnvRef.current = { ...globalConfig.env_vars, ...envVars };
+  // Read at call time so the exclusivity check judges the catalog against the
+  // agents that exist when the answer LANDS, not when the button was pressed —
+  // a create in another window during the SSH round trip is exactly the race
+  // this guard exists for.
+  const agentsRef = React.useRef<readonly ManagedAgent[]>(managedAgents);
+  agentsRef.current = managedAgents;
   // Serial number of the newest host request. Every catalog read and model
   // probe claims one at its start and re-checks it after each await; anything
   // that moves the draft off the host/harness a request was made for bumps it,
@@ -152,9 +168,11 @@ export function WhereToRunSection({
    * picker to the wrong machine — or, for a model probe, ship the definition's
    * credentials to a host under a harness command never verified there.
    */
-  function discardHostRequests() {
+  // Stable identity: an effect below depends on it, and a per-render function
+  // there would re-run the effect on every render.
+  const discardHostRequests = React.useCallback(() => {
     hostRequestRef.current += 1;
-  }
+  }, []);
 
   /** Claim the newest request id, invalidating anything already in flight. */
   function startHostRequest(): number {
@@ -185,14 +203,20 @@ export function WhereToRunSection({
       // the probe below would send credentials to the NEW host under the OLD
       // host's harness command. Drop it.
       if (hostRequestRef.current !== requestId) return;
-      // Keep an existing pick when a re-check still offers it; otherwise fall
-      // to the first available so the common case needs no extra interaction.
-      const previous = draftRef.current.remoteHarnessId;
-      const keep = catalog.harnesses.find(
-        (harness) => harness.available && harness.id === previous,
+      // Auto-pick skips entries an existing agent already occupies: an
+      // exclusive entry is a persistent identity on the host, and arming the
+      // create with one the picker itself refuses would ship a second agent
+      // onto it on submit. Computed against the config this read used, not the
+      // draft's current one.
+      const firstAvailable = autoPickRemoteHarness(
+        catalog.harnesses,
+        addedExclusiveHarnessIds(
+          catalog.harnesses,
+          { providerId: selectedBackendProvider.id, config },
+          agentsRef.current,
+        ),
+        draftRef.current.remoteHarnessId,
       );
-      const firstAvailable =
-        keep ?? catalog.harnesses.find((harness) => harness.available) ?? null;
       const next = {
         ...draftRef.current,
         remoteHarnesses: catalog.harnesses,
@@ -297,6 +321,51 @@ export function WhereToRunSection({
   // explains why it has only one entry.
   const hasProviders = backendProviders.length > 0;
 
+  // The catalog entries an existing agent already occupies. Recomputed as the
+  // agent list refreshes, so an agent created elsewhere disables its entry here
+  // without a re-check of the host.
+  const addedExclusiveIds = React.useMemo(
+    () =>
+      addedExclusiveHarnessIds(
+        draft.remoteHarnesses ?? [],
+        {
+          providerId: draft.runOn,
+          config: coerceConfigValues(
+            draft.providerConfig,
+            draft.probedProvider?.config_schema,
+          ),
+        },
+        managedAgents,
+      ),
+    [
+      draft.probedProvider?.config_schema,
+      draft.providerConfig,
+      draft.remoteHarnesses,
+      draft.runOn,
+      managedAgents,
+    ],
+  );
+
+  // A pick can go stale while the dialog is open: another window (or this one,
+  // in an earlier create) can take the identity between the catalog read and
+  // submit, and the agent list refreshes on its own. The row goes disabled, but
+  // the PIN would survive and submit would still deploy the second agent — so
+  // the selection is dropped with it. Clearing is safe to repeat: once the id
+  // is null the condition cannot hold again.
+  const staleHarnessId =
+    draft.remoteHarnessId && addedExclusiveIds.has(draft.remoteHarnessId)
+      ? draft.remoteHarnessId
+      : null;
+  React.useEffect(() => {
+    if (!staleHarnessId) return;
+    discardHostRequests();
+    onDraftChange({
+      ...draftRef.current,
+      remoteHarnessId: null,
+      remoteModelProbe: { status: "idle" },
+    });
+  }, [discardHostRequests, onDraftChange, staleHarnessId]);
+
   return (
     <div className="space-y-4">
       <div className="space-y-1.5">
@@ -364,6 +433,7 @@ export function WhereToRunSection({
           ) : null}
 
           <RemoteHarnessPicker
+            addedExclusiveIds={addedExclusiveIds}
             draft={draft}
             error={harnessError}
             isDiscovering={isDiscoveringHarnesses}
@@ -384,6 +454,7 @@ export function WhereToRunSection({
  * runs there.
  */
 function RemoteHarnessPicker({
+  addedExclusiveIds,
   draft,
   error,
   isDiscovering,
@@ -391,6 +462,12 @@ function RemoteHarnessPicker({
   onDiscover,
   onSelect,
 }: {
+  /**
+   * Catalog entries that name a persistent identity on the host which an
+   * existing agent already drives. Rendered disabled with an "(added)" suffix —
+   * the component neither knows nor asks what makes an entry exclusive.
+   */
+  addedExclusiveIds: ReadonlySet<string>;
   draft: WhereToRunDraft;
   error: string | null;
   isDiscovering: boolean;
@@ -400,7 +477,7 @@ function RemoteHarnessPicker({
 }) {
   const canDiscover = providerConfigComplete(draft) && !isPending;
   const harnesses = draft.remoteHarnesses;
-  const available = (harnesses ?? []).filter((harness) => harness.available);
+  const options = remoteHarnessOptions(harnesses, addedExclusiveIds);
 
   return (
     <div className="space-y-1.5">
@@ -411,7 +488,7 @@ function RemoteHarnessPicker({
         <p className="text-sm text-muted-foreground">
           Agents run the harness installed on the host, not on this computer.
         </p>
-      ) : available.length === 0 ? (
+      ) : options.length === 0 ? (
         <p className="rounded-2xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
           No supported harness is installed on that host. Install one (for
           example <span className="font-mono">goose</span>) and check again.
@@ -421,12 +498,7 @@ function RemoteHarnessPicker({
           disabled={isPending}
           id="agent-remote-harness"
           onValueChange={onSelect}
-          options={available.map((harness) => ({
-            label: `${harness.label}${
-              harness.version ? ` (${harness.version})` : ""
-            }`,
-            value: harness.id,
-          }))}
+          options={options}
           placeholder="Select a harness"
           value={draft.remoteHarnessId ?? ""}
         />

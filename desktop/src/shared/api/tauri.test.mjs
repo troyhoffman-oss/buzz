@@ -211,6 +211,65 @@ test("fromRawAcpRuntimeCatalogEntry env round-trips through edit payload shape",
   );
 });
 
+// ── fromRawRemoteHarness: the remote catalog wire boundary ───────────────────
+//
+// The provider emits `exclusive: true` only for entries that name a persistent
+// identity on the host. Absent must stay absent: the desktop reads "no field"
+// as "deploy as many as you like", and inventing a `false` would have the app
+// asserting something the provider never said.
+
+const { fromRawRemoteHarness } = await import("./tauri.ts");
+
+test("fromRawRemoteHarness carries an asserted exclusive flag", () => {
+  const harness = fromRawRemoteHarness({
+    id: "hermes-default",
+    label: "Hermes (default)",
+    command: "hermes",
+    args: ["--profile", "default", "acp"],
+    available: true,
+    binaryPath: "/usr/local/bin/hermes",
+    exclusive: true,
+  });
+  assert.equal(harness.exclusive, true);
+  assert.deepStrictEqual(harness.args, ["--profile", "default", "acp"]);
+});
+
+test("fromRawRemoteHarness leaves exclusive absent when the provider is silent", () => {
+  const harness = fromRawRemoteHarness({
+    id: "claude",
+    label: "Claude Code",
+    command: "claude-code-acp",
+    available: true,
+  });
+  assert.equal(
+    Object.hasOwn(harness, "exclusive"),
+    false,
+    "an absent flag must not become a claim the provider never made",
+  );
+  // Everything else still degrades to today's defaults.
+  assert.deepStrictEqual(harness.args, []);
+  assert.deepStrictEqual(harness.env, {});
+  assert.equal(harness.binaryPath, null);
+  assert.equal(harness.version, null);
+});
+
+test("fromRawRemoteHarness treats a false or null exclusive as not exclusive", () => {
+  for (const exclusive of [false, null]) {
+    const harness = fromRawRemoteHarness({
+      id: "codex",
+      command: "codex",
+      available: true,
+      exclusive,
+    });
+    assert.equal(Object.hasOwn(harness, "exclusive"), false);
+    assert.equal(
+      harness.label,
+      "codex",
+      "a missing label falls back to the id",
+    );
+  }
+});
+
 // ── Teardown ──────────────────────────────────────────────────────────────────
 
 test("teardown — restore Date.now", () => {

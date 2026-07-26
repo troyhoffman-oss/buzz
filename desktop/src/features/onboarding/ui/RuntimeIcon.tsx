@@ -38,9 +38,39 @@ export function getRuntimeDisplayLabel(
   return isBuzzRuntime(runtime) ? "Buzz" : runtime.label;
 }
 
-function getRuntimeLogoUrl(runtime: AcpRuntimeCatalogEntry): string | null {
-  const id = runtime.id.trim().toLowerCase();
-  return RUNTIME_LOGOS[id] ?? PRESET_LOGOS[id] ?? null;
+/**
+ * The logo for a harness id, and the id that logo BELONGS to.
+ *
+ * A remote catalog advertises one entry per identity on the host — `hermes-matt`
+ * beside `hermes` — and an exact-id lookup renders every one of them as the
+ * generic TerminalSquare next to the plain entry's real mark. So a full id that
+ * maps nothing falls back to its base: the text before the FIRST hyphen, and
+ * only when that base is itself a mapped id, so `buzz-agent` (base `buzz`,
+ * unmapped) is untouched and no id can be shortened into a logo it did not earn.
+ *
+ * The resolved id is returned alongside the url because the per-logo backdrop
+ * classes below belong to the logo, not to the entry: a variant that borrows
+ * `omp`'s white-on-black mark needs `omp`'s dark plate with it.
+ *
+ * Deliberately generic: nothing here knows what a Hermes profile is. Any
+ * `<known>-<variant>` id gets the known harness's mark.
+ */
+function resolveHarnessLogo(
+  harnessId: string,
+): { id: string; url: string } | null {
+  const id = harnessId.trim().toLowerCase();
+  const exact = RUNTIME_LOGOS[id] ?? PRESET_LOGOS[id];
+  if (exact) return { id, url: exact };
+  const separator = id.indexOf("-");
+  if (separator <= 0) return null;
+  const base = id.slice(0, separator);
+  const inherited = RUNTIME_LOGOS[base] ?? PRESET_LOGOS[base];
+  return inherited ? { id: base, url: inherited } : null;
+}
+
+/** The logo url for a harness id. See `resolveHarnessLogo`. */
+export function getHarnessLogoUrl(harnessId: string): string | null {
+  return resolveHarnessLogo(harnessId)?.url ?? null;
 }
 
 export function RuntimeIcon({
@@ -54,8 +84,12 @@ export function RuntimeIcon({
   const { isDark } = useTheme();
   // Only use bundled logo maps — never render user-supplied avatar URLs for
   // custom/preset entries (tracking pixel / spoofing vector, security line).
-  const id = runtime.id.trim().toLowerCase();
-  const imageUrl = getRuntimeLogoUrl(runtime);
+  const logo = resolveHarnessLogo(runtime.id);
+  // The id the LOGO belongs to, so a variant entry gets its base's backdrop.
+  // With no logo there is nothing to plate, and the id itself is what decides
+  // the monochrome fallback treatment.
+  const id = logo?.id ?? runtime.id.trim().toLowerCase();
+  const imageUrl = logo?.url ?? null;
   const shouldForceForegroundColor = !imageUrl && id === "goose";
 
   if (isBuzzRuntime(runtime)) {
