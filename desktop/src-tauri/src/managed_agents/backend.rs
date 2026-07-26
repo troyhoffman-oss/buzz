@@ -477,6 +477,10 @@ const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
 /// Taking the intersection means a machine whose `PATHEXT` drops an extension
 /// drops it here too, while `.cmd`/`.bat` can never re-enter through a
 /// user-configured `PATHEXT`.
+///
+/// `PATHEXT` order is preserved: it is the order Windows itself resolves a
+/// bare command name in, and [`ExecNaming::rank`] reuses it to break ties
+/// between two files in one directory.
 #[cfg(any(windows, test))]
 fn allowed_exec_extensions_from(pathext: Option<&str>) -> Vec<String> {
     let raw = pathext
@@ -509,12 +513,20 @@ enum ExecNaming {
 }
 
 impl ExecNaming {
+    /// Where `ext` (no leading dot) sits in this platform's preference order,
+    /// or `None` when it does not name an executable at all.
+    fn rank(&self, ext: &str) -> Option<usize> {
+        match self {
+            ExecNaming::NoExtension => None,
+            ExecNaming::Extensions(allowed) => {
+                allowed.iter().position(|a| a.eq_ignore_ascii_case(ext))
+            }
+        }
+    }
+
     /// Does `ext` (no leading dot) name an executable on this platform?
     fn allows(&self, ext: &str) -> bool {
-        match self {
-            ExecNaming::NoExtension => false,
-            ExecNaming::Extensions(allowed) => allowed.iter().any(|a| a.eq_ignore_ascii_case(ext)),
-        }
+        self.rank(ext).is_some()
     }
 }
 
@@ -608,19 +620,36 @@ pub fn discover_provider_candidates() -> Vec<(String, PathBuf)> {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let Some(id) = provider_id_from_file_name(&name, &naming) else {
-                continue;
-            };
-            // Dedupe on the id, not the file name: on Windows two extensions
-            // map to one id, and the earlier PATH entry must win as it would
-            // for any other command lookup. Ids that `resolve_provider_binary`
-            // would reject are dropped here so the catalog never advertises a
-            // provider that can never be executed.
-            if provider_id_is_valid(&id) && !seen.contains(&id) && is_executable(&entry.path()) {
-                seen.insert(id.clone());
-                results.push((id, entry.path()));
+        // Collect this directory's matches before taking any, so the winner of
+        // an in-directory tie is chosen by `PATHEXT` rank rather than by
+        // `read_dir` order — which is filesystem-dependent, so `foo.exe` and
+        // `foo.com` side by side would otherwise resolve differently run to
+        // run. Sorting by name as well keeps the whole result reproducible.
+        let mut found: Vec<(usize, String, PathBuf)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let id = provider_id_from_file_name(&name, &naming)?;
+                let rank = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .and_then(|ext| naming.rank(ext))
+                    .unwrap_or(usize::MAX);
+                // Ids that `resolve_provider_binary` would reject are dropped
+                // here so the catalog never advertises a provider that can
+                // never be executed.
+                (provider_id_is_valid(&id) && is_executable(&path)).then_some((rank, id, path))
+            })
+            .collect();
+        found.sort();
+
+        // Dedupe on the id, not the file name: on Windows two extensions map to
+        // one id, and the earlier PATH entry must win as it would for any other
+        // command lookup.
+        for (_, id, path) in found {
+            if seen.insert(id.clone()) {
+                results.push((id, path));
             }
         }
     }
@@ -974,6 +1003,70 @@ mod tests {
         assert!(!provider_id_is_valid("-leading-dash"));
         assert!(!provider_id_is_valid("_leading_underscore"));
         assert!(!provider_id_is_valid("foo;rm -rf /"));
+    }
+
+    /// The whole discovery path against a real directory: `PATHEXT` ranking,
+    /// id validation, executability and dedupe are unit-tested in isolation
+    /// above, but only running `discover_provider_candidates` proves they
+    /// compose — that a real `read_dir` entry survives all four and comes back
+    /// as a usable (id, path) pair.
+    #[cfg(unix)]
+    #[test]
+    fn discover_provider_candidates_finds_an_executable_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let write = |name: &str, mode: u32| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write file");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("chmod file");
+            path
+        };
+        let provider = write("buzz-backend-zzztest", 0o755);
+        // Non-executable, wrong prefix, and an id the resolver would reject —
+        // each must be filtered by a different guard in the loop.
+        write("buzz-backend-zzznotexec", 0o644);
+        write("some-other-tool", 0o755);
+        write("buzz-backend-ZZZUPPER", 0o755);
+
+        // Prepended, so every other entry the process already had stays
+        // visible and a concurrent test still resolves what it expects.
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{original_path}", dir.path().display()));
+        let found = discover_provider_candidates();
+        // The discovered pair is one `resolve_provider_binary` accepts — the
+        // catalog never advertises a provider that cannot then be executed.
+        let resolved = resolve_provider_binary("zzztest");
+        std::env::set_var("PATH", &original_path);
+
+        let ids: Vec<&str> = found.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&"zzztest"), "{ids:?}");
+        assert!(!ids.contains(&"zzznotexec"), "{ids:?}");
+        assert!(!ids.contains(&"ZZZUPPER"), "{ids:?}");
+        assert_eq!(
+            found.iter().find(|(id, _)| id == "zzztest").map(|(_, p)| p),
+            Some(&provider)
+        );
+        assert_eq!(resolved.ok(), provider.canonicalize().ok());
+    }
+
+    #[test]
+    fn same_directory_ties_are_broken_by_pathext_order_not_read_dir_order() {
+        // `buzz-backend-ssh.exe` and `buzz-backend-ssh.com` in one directory
+        // both yield id "ssh". Which one wins must not depend on the order the
+        // filesystem happens to hand back, so the rank comes from `PATHEXT` —
+        // the same order Windows itself resolves a bare command name in.
+        let naming = windows_naming();
+        assert_eq!(naming.rank("com"), Some(0));
+        assert_eq!(naming.rank("exe"), Some(1));
+        assert_eq!(naming.rank("cmd"), None);
+        // A `PATHEXT` that lists .EXE first flips the preference with it.
+        let exe_first = ExecNaming::Extensions(allowed_exec_extensions_from(Some(".EXE;.COM")));
+        assert_eq!(exe_first.rank("exe"), Some(0));
+        assert_eq!(exe_first.rank("com"), Some(1));
+        // Unix has no extension preference at all.
+        assert_eq!(ExecNaming::NoExtension.rank("exe"), None);
     }
 
     #[test]
