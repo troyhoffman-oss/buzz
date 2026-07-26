@@ -362,7 +362,9 @@ pub fn effective_agent_command(
 }
 
 mod overrides;
-pub use overrides::{apply_agent_command_update, create_time_agent_command_override};
+pub use overrides::{
+    apply_agent_command_update, create_time_agent_args, create_time_agent_command_override,
+};
 
 /// Spawn-time variant of `record_agent_command` that returns a typed error when
 /// a record's `runtime` id or its persona's `runtime` id is set but cannot be

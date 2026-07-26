@@ -10047,6 +10047,20 @@ export function maybeInstallE2eTauriMocks() {
         return [];
       case "probe_backend_provider":
         return { ok: false, error: "mock: no providers available" };
+      // Unreachable while discover_backend_providers returns [] (the UI cannot
+      // reach a provider op without a provider), but mocked so the default
+      // branch throws only on genuinely unhandled commands.
+      case "discover_provider_harnesses":
+        return { ok: true, buzz_acp: null, harnesses: [] };
+      case "probe_provider_models":
+        return {
+          agentName: "unknown",
+          agentVersion: "unknown",
+          models: [],
+          agentDefaultModel: null,
+          selectedModel: null,
+          supportsSwitching: false,
+        };
       case "discover_managed_agent_prereqs":
         return handleDiscoverManagedAgentPrereqs(
           payload as Parameters<typeof handleDiscoverManagedAgentPrereqs>[0],
