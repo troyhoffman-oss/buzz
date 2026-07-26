@@ -20,6 +20,7 @@
 //! `AcpClient` is NOT Clone — ownership moves out on claim and back on return.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -65,6 +66,10 @@ pub struct TaskMeta {
     /// tasks only — all prompt tasks install a steer channel regardless
     /// of the agent's name.
     pub steer_tx: Option<tokio::sync::mpsc::Sender<SteerRequest>>,
+    /// Owner-reply channel for a question the turn parked, and the flag saying
+    /// one is outstanding. Capacity-1: at most one question is parked at a
+    /// time. `None` for heartbeat tasks, which have no channel to ask in.
+    pub elicitation_tx: Option<(Arc<AtomicBool>, tokio::sync::mpsc::Sender<ElicitationReply>)>,
 }
 
 /// Agent-level model capabilities. Populated on first session creation.
@@ -432,6 +437,76 @@ pub enum SteerAck {
     PromptCompletedNeutral,
 }
 
+/// Owner reply to a pending `elicitation/create`, routed from the main loop
+/// into the read loop that owns the agent's stdin for the turn.
+///
+/// The reply is the raw message text; the read loop resolves it against the
+/// form schema it holds, because only the read loop knows which field is
+/// currently being asked.
+pub enum ElicitationReply {
+    /// The owner's message text, to be matched against the form's options.
+    Answer(String),
+    /// `!skip` from the owner — answer `decline` and let the turn continue.
+    Skip,
+}
+
+/// Where the read loop publishes an agent's question and how it tells the main
+/// loop a reply is expected.
+///
+/// `pending` is shared rather than queried through the pool because the main
+/// loop must decide whether an inbound message is an elicitation reply *before*
+/// `queue.push()` moves its content, and the turn task owns the `AcpClient` for
+/// the whole turn — there is nothing to ask.
+pub struct ElicitationAsk {
+    rest: RestClient,
+    channel_id: Uuid,
+    thread_tags: ThreadTags,
+    owner_pubkey: Option<String>,
+    pending: Arc<AtomicBool>,
+}
+
+impl ElicitationAsk {
+    /// Build the per-turn ask surface for `channel_id`, threaded to the event
+    /// that triggered the turn. `pending` is shared with the main loop.
+    pub fn new(
+        rest: RestClient,
+        channel_id: Uuid,
+        thread_tags: ThreadTags,
+        owner_pubkey: Option<String>,
+        pending: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            rest,
+            channel_id,
+            thread_tags,
+            owner_pubkey,
+            pending,
+        }
+    }
+
+    /// Publish `content` as a kind:9 in the turn's channel, threaded to the
+    /// triggering event and p-tagging the owner so the question notifies.
+    ///
+    /// Spawned rather than awaited: the caller is the read loop, and blocking
+    /// it on a relay round trip would stall the agent's stdout for as long as
+    /// the submit takes.
+    pub(crate) fn publish(&self, content: String) {
+        let rest = self.rest.clone();
+        let channel_id = self.channel_id;
+        let thread_tags = self.thread_tags.clone();
+        let owner = self.owner_pubkey.clone();
+        tokio::spawn(async move {
+            let mentions: Vec<&str> = owner.as_deref().into_iter().collect();
+            post_notice(&rest, channel_id, &thread_tags, &content, &mentions).await;
+        });
+    }
+
+    /// Raise or lower the "a reply is expected" flag the main loop reads.
+    pub(crate) fn set_pending(&self, pending: bool) {
+        self.pending.store(pending, Ordering::Relaxed);
+    }
+}
+
 /// Whether a turn was cut by the idle clock or the hard wall-clock cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeoutKind {
@@ -701,6 +776,28 @@ impl AgentPool {
             .ok_or_else(|| SteerError::Transport("steer_tx not installed".into()))?;
         tx.try_send(request)
             .map_err(|e| SteerError::Transport(e.to_string()))
+    }
+
+    /// Route an owner reply to the question parked by `channel_id`'s turn.
+    ///
+    /// Returns `false` when no turn there has a question outstanding, in which
+    /// case the message is an ordinary one and the caller must let it fall
+    /// through to normal dispatch.
+    pub fn send_elicitation_reply(&mut self, channel_id: Uuid, reply: ElicitationReply) -> bool {
+        let Some((pending, tx)) = self
+            .task_map
+            .values()
+            .find(|m| m.channel_id == Some(channel_id))
+            .and_then(|m| m.elicitation_tx.as_ref())
+            .filter(|(pending, _)| pending.load(Ordering::Relaxed))
+        else {
+            return false;
+        };
+        // Lower the flag here rather than waiting for the read loop to consume
+        // the reply, so two messages arriving back-to-back cannot both be
+        // taken as answers to the same question.
+        pending.store(false, Ordering::Relaxed);
+        tx.try_send(reply).is_ok()
     }
 
     pub fn result_tx(&self) -> mpsc::UnboundedSender<PromptResult> {
@@ -1283,17 +1380,17 @@ fn with_canvas(prompt: Option<String>, canvas: Option<&str>) -> Option<String> {
     }
 }
 
-/// Return `agent` to the pool via `result_tx`, clearing any steer receiver first.
+/// Return `agent` to the pool via `result_tx`, clearing any per-turn receiver first.
 ///
 /// Every path that returns an `OwnedAgent` to the pool via `PromptResult` goes
 /// through this function. Panic/abort paths do not — and don't need to, since a
 /// panicked task's agent is never sent back via `PromptResult`.
 ///
-/// Clearing `steer_rx` here — rather than per-arm — makes the `install_steer_rx`
-/// invariant (`steer_rx.is_none()` at dispatch) structurally unviolatable: a receiver
-/// installed for a turn that ends before the read loop's `take()` (e.g. session-create
-/// error) is always dropped before the agent re-enters the pool, so the next dispatch
-/// can never trigger the assert.
+/// Clearing them here — rather than per-arm — makes the `install_steer_rx` /
+/// `install_elicitation` invariants (`is_none()` at dispatch) structurally
+/// unviolatable: state installed for a turn that ends before the read loop's
+/// `take()` (e.g. session-create error) is always dropped before the agent
+/// re-enters the pool, so the next dispatch can never trigger the assert.
 ///
 /// On the happy path the read loop has already called `take()`, so this is a no-op.
 fn send_prompt_result(
@@ -1305,6 +1402,7 @@ fn send_prompt_result(
     batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
+    agent.acp.clear_elicitation();
     let _ = result_tx.send(PromptResult {
         agent,
         source,
@@ -3553,14 +3651,16 @@ pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str
 }
 
 /// Best-effort: post a visible notice (kind:9) to a channel — a dead-letter
-/// warning or an owner-command reply. Replies into the thread of `thread_tags`
-/// when the triggering event was threaded. Errors are logged and swallowed —
-/// the notice must never take down the main loop.
+/// warning, an owner-command reply, or an agent question. Replies into the
+/// thread of `thread_tags` when the triggering event was threaded, and p-tags
+/// `mentions` so a notice that expects an answer notifies its reader. Errors
+/// are logged and swallowed — the notice must never take down the main loop.
 pub(crate) async fn post_notice(
     rest: &crate::relay::RestClient,
     channel_id: Uuid,
     thread_tags: &ThreadTags,
     content: &str,
+    mentions: &[&str],
 ) {
     let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
         let root_id = nostr::EventId::from_hex(root).ok()?;
@@ -3574,14 +3674,20 @@ pub(crate) async fn post_notice(
             parent_event_id: parent_id,
         })
     });
-    let builder =
-        match buzz_sdk::build_message(channel_id, content, thread_ref.as_ref(), &[], false, &[]) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(channel = %channel_id, "notice: build failed: {e}");
-                return;
-            }
-        };
+    let builder = match buzz_sdk::build_message(
+        channel_id,
+        content,
+        thread_ref.as_ref(),
+        mentions,
+        false,
+        &[],
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(channel = %channel_id, "notice: build failed: {e}");
+            return;
+        }
+    };
     let event = match builder.sign_with_keys(&rest.keys) {
         Ok(e) => e,
         Err(e) => {
@@ -5206,6 +5312,47 @@ mod tests {
         let (_steer_tx, steer_rx) = tokio::sync::mpsc::channel::<SteerRequest>(1);
         result.agent.acp.install_steer_rx(steer_rx);
         // Reaching here without a panic is the test.
+    }
+
+    /// Replies are routed only to a channel whose turn actually has a question
+    /// outstanding, and only once — the flag drops as the first reply is sent
+    /// so two messages in a row cannot both answer the same question.
+    #[tokio::test]
+    async fn test_send_elicitation_reply_routes_only_to_a_channel_awaiting_one() {
+        let mut pool = AgentPool::from_slots(Vec::new());
+        let channel_id = Uuid::new_v4();
+        let pending = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ElicitationReply>(1);
+        let abort_handle = pool.join_set.spawn(async {});
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                turn_id: "turn".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                elicitation_tx: Some((Arc::clone(&pending), tx)),
+            },
+        );
+
+        assert!(
+            !pool.send_elicitation_reply(channel_id, ElicitationReply::Skip),
+            "no question outstanding — the message is an ordinary one"
+        );
+
+        pending.store(true, Ordering::Relaxed);
+        assert!(
+            !pool.send_elicitation_reply(Uuid::new_v4(), ElicitationReply::Skip),
+            "another channel's turn must not receive this channel's reply"
+        );
+        assert!(pool.send_elicitation_reply(channel_id, ElicitationReply::Answer("2".into())));
+        assert!(matches!(rx.try_recv(), Ok(ElicitationReply::Answer(a)) if a == "2"));
+        assert!(
+            !pool.send_elicitation_reply(channel_id, ElicitationReply::Skip),
+            "the flag drops with the first reply, so the next message falls through"
+        );
     }
 
     // ── NIP-AM emit-hook unit tests ────────────────────────────────────────

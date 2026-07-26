@@ -146,12 +146,30 @@ The gate applies to **all** inbound events — @mentions, DMs, thread replies, a
 | `!cancel` | Cancels the current in-flight turn for that channel, if any. |
 | `!rotate` | Rotates the ACP session for that channel. If a turn is in-flight, it is cancelled and the channel session is invalidated when the task returns; otherwise the cached idle session is invalidated immediately. The next queued/received event starts a fresh session. |
 | `!model [id]` | Switches the model backing that channel and replies in-channel. If a turn is in-flight, it is cancelled and re-run on the new model; otherwise the model applies on the next turn. With no `id`, lists the available models. |
+| `!skip` | Declines a question the agent is waiting on (see below). The turn continues without an answer. |
 
 Use `!cancel` to stop only the current turn; it is a no-op when the channel is idle. Use `!rotate` when you want the next turn in the channel to start from a fresh ACP session, even if the channel is currently idle.
 
 `!model` matches model IDs exactly — adapters ship near-identical pairs (`opus[1m]` vs `claude-opus-5`, `gpt-5.3-codex` vs `gpt-5.3-codex/low`) where a prefix match would silently pick a different context lane and price point. An unknown ID is rejected with the list and leaves the current model untouched.
 
 Owner control commands must be kind:9 stream messages from the owner, must mention this agent with a `p` tag, and are consumed by the harness instead of being forwarded to the agent.
+
+### Agent questions
+
+`buzz-acp` advertises the ACP `elicitation.form` client capability, so an agent
+may ask a question mid-turn (Claude's `AskUserQuestion`, an MCP server's
+elicitation, or a refusal-fallback consent prompt). The question is posted as a
+numbered list in the turn's channel, threaded to the triggering event and
+p-tagging the owner. The **owner** answers by replying with an option number,
+an option label, or their own text — deliberately not siblings or allowlisted
+users, since the agent is asking a human. `!skip` declines and lets the turn
+continue without an answer.
+
+While a question is outstanding the idle timeout is suspended, so a slow answer
+does not kill the turn; `BUZZ_ACP_MAX_TURN_DURATION` still bounds it, and an
+unanswered question is cancelled when the turn ends. Requires
+`@agentclientprotocol/claude-agent-acp` — older `claude-code-acp` installs strip
+`AskUserQuestion` unconditionally, in which case the capability is simply inert.
 
 > **Note:** The default mode is `owner-only`. Agents without a registered `agent_owner_pubkey` will not respond to any events until the owner is resolved. Set `--respond-to anyone` to disable the gate entirely.
 

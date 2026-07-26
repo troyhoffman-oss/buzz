@@ -195,6 +195,19 @@ pub struct AcpClient {
     /// outside of a goose-native turn — the read loop's steer arm is
     /// disabled in that case.
     steer_rx: Option<tokio::sync::mpsc::Receiver<crate::pool::SteerRequest>>,
+    /// Per-turn surface an agent question is published to. Installed by
+    /// [`install_elicitation`](Self::install_elicitation) at dispatch. `None`
+    /// for heartbeat turns and outside a turn — an `elicitation/create` with
+    /// nowhere to render is answered `cancel` immediately.
+    elicitation: Option<crate::pool::ElicitationAsk>,
+    /// Per-turn channel owner replies arrive on. Consumed (via `take()`) by
+    /// `read_until_response_with_idle_timeout` so it is dropped at scope exit
+    /// alongside the turn it served, exactly like `steer_rx`.
+    elicitation_rx: Option<tokio::sync::mpsc::Receiver<crate::pool::ElicitationReply>>,
+    /// The `elicitation/create` request awaiting an owner reply, if any. Lives
+    /// on the client rather than the read loop, like `pending_permission_id`,
+    /// so [`cancel_with_cleanup`](Self::cancel_with_cleanup) can answer it.
+    pending_elicitation: Option<PendingElicitation>,
     /// Usage tracker — accumulates cumulative token counts from
     /// `_goose/unstable/session/update` notifications and computes per-turn
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
@@ -352,6 +365,13 @@ fn build_client_capabilities() -> serde_json::Value {
         "auth": {
             "terminal": true
         },
+        // Form elicitation: the agent may ask the owner a question mid-turn
+        // and we render it as a channel message. `url` is deliberately absent
+        // — Buzz has no browser-handoff surface, and claiming it would invite
+        // url-mode requests we cannot complete.
+        "elicitation": {
+            "form": {}
+        },
         // Signal to goose that we handle `_goose/unstable/session/update`
         // notifications. Without this the custom notification is suppressed
         // on goose's side and usage data is never emitted.
@@ -495,6 +515,9 @@ impl AcpClient {
             observer_context: ObserverContext::default(),
             active_run_id: None,
             steer_rx: None,
+            elicitation: None,
+            elicitation_rx: None,
+            pending_elicitation: None,
             goose_usage: UsageTracker::default(),
         })
     }
@@ -806,6 +829,60 @@ impl AcpClient {
         self.steer_rx = Some(rx);
     }
 
+    /// Install the per-turn elicitation plumbing: the surface an agent question
+    /// is published to, and the channel the owner's reply arrives on.
+    ///
+    /// Panics for the same reason [`install_steer_rx`](Self::install_steer_rx)
+    /// does — one turn per `AcpClient` at a time, and a stacked channel would
+    /// answer this turn's question into the previous turn's thread.
+    pub fn install_elicitation(
+        &mut self,
+        ask: crate::pool::ElicitationAsk,
+        rx: tokio::sync::mpsc::Receiver<crate::pool::ElicitationReply>,
+    ) {
+        assert!(
+            self.elicitation.is_none(),
+            "install_elicitation: previous turn's ask surface was not cleared — \
+             stacking them would misroute owner replies across turns"
+        );
+        self.elicitation = Some(ask);
+        self.elicitation_rx = Some(rx);
+    }
+
+    /// Drop the per-turn elicitation plumbing and any question parked on it.
+    ///
+    /// Called by `send_prompt_result` alongside [`clear_steer_rx`](Self::clear_steer_rx)
+    /// so `install_elicitation`'s invariant holds for the next dispatch, and so
+    /// a question that outlived its turn can never be answered into the next
+    /// one. Idempotent.
+    pub fn clear_elicitation(&mut self) {
+        self.take_pending_elicitation();
+        self.elicitation = None;
+        self.elicitation_rx = None;
+    }
+
+    /// Take the parked question, lowering the flag the main loop checks before
+    /// it routes an owner message as a reply.
+    fn take_pending_elicitation(&mut self) -> Option<PendingElicitation> {
+        if let Some(ask) = self.elicitation.as_ref() {
+            ask.set_pending(false);
+        }
+        self.pending_elicitation.take()
+    }
+
+    /// Publish the parked question's current field and raise the flag that
+    /// tells the main loop to route the owner's next message here.
+    fn ask_parked_elicitation(&self) {
+        if let (Some(ask), Some(pending)) = (&self.elicitation, &self.pending_elicitation) {
+            ask.publish(render_elicitation_field(
+                &pending.fields[pending.asking],
+                pending.asking,
+                pending.fields.len(),
+            ));
+            ask.set_pending(true);
+        }
+    }
+
     /// Clear any installed steer receiver without consuming it.
     ///
     /// Called by `send_prompt_result` on every exit path of `run_prompt_task`
@@ -919,6 +996,18 @@ impl AcpClient {
             }
             self.pending_permission_id = None;
             self.permission_responded = false;
+        }
+
+        // Step 1b: same for a question the owner never answered. Without this
+        // the agent stays blocked on its `elicitation/create` and never
+        // acknowledges the cancel.
+        if let Some(pending) = self.take_pending_elicitation() {
+            let response = elicitation_response(&pending.id, "cancel", None);
+            self.write_ndjson(&response).await?;
+            tracing::debug!(
+                target: "acp::cancel",
+                "cancelled pending elicitation id={}", pending.id
+            );
         }
 
         // Step 2: send session/cancel notification (no id)
@@ -1143,6 +1232,12 @@ impl AcpClient {
                     "session/request_permission" => {
                         self.handle_permission_request(&msg).await?;
                     }
+                    // Nothing polls a parked question outside the prompt loop —
+                    // `initialize` and `session/new` run here — so the request
+                    // is never answerable and is cancelled immediately.
+                    "elicitation/create" => {
+                        self.handle_elicitation_request(&msg, false).await?;
+                    }
                     other => {
                         // If the unknown message has an id, it's a request expecting a reply.
                         // Silence would cause the agent to hang waiting for a response.
@@ -1211,6 +1306,9 @@ impl AcpClient {
         // so the ack_tx oneshot is never leaked silently).
         let mut steer_rx = self.steer_rx.take();
 
+        // Same treatment for the per-turn owner-reply channel.
+        let mut elicitation_rx = self.elicitation_rx.take();
+
         // Tracks the in-flight steer write: `(request_id, ack_tx)`. While
         // `Some`, the steer arm is gated off so we don't stack writes,
         // and a response matching `id` is routed to the ack_tx instead
@@ -1226,9 +1324,17 @@ impl AcpClient {
         let mut last_activity_at = now;
 
         loop {
+            // A parked elicitation waits on a human, not the agent, so the
+            // silent-agent guard is suspended for as long as one is
+            // outstanding — otherwise anyone who thinks for longer than
+            // `idle_timeout` kills the turn. The hard deadline still applies,
+            // so an unanswered question cannot pin an agent slot forever, and
+            // agent death is still caught immediately by reader EOF.
+            let elicitation_parked = self.pending_elicitation.is_some();
+
             // Determine which deadline fires first BEFORE sleeping — this is
             // the classification we'll use on timeout, immune to scheduler jitter.
-            let idle_fires_first = idle_deadline < hard_deadline;
+            let idle_fires_first = idle_deadline < hard_deadline && !elicitation_parked;
             let next_deadline = if idle_fires_first {
                 idle_deadline
             } else {
@@ -1336,6 +1442,23 @@ impl AcpClient {
                     // Loop back to the next iteration without consuming a
                     // reader line; we'll wait for either the prompt
                     // response or the steer response next.
+                    None
+                }
+                // Elicitation arm: gated on a parked question so an owner
+                // message that races the agent's request is never consumed as
+                // an answer to it. Same `async {}` no-receiver wrapper and
+                // cancel-safety as the steer arm above.
+                Some(reply) = async {
+                    match elicitation_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => None,
+                    }
+                }, if elicitation_parked => {
+                    self.apply_elicitation_reply(reply).await?;
+                    // The human is no longer holding the turn open, so restart
+                    // the silent-agent guard from now rather than from the
+                    // stale pre-question deadline.
+                    idle_deadline = Instant::now() + idle_timeout;
                     None
                 }
                 _ = tokio::time::sleep_until(next_deadline) => {
@@ -1490,6 +1613,20 @@ impl AcpClient {
                             "session/request_permission" => {
                                 self.handle_permission_request(&msg).await?;
                             }
+                            "elicitation/create" => {
+                                // Discard a reply still queued for an earlier
+                                // question — one the agent cancelled after the
+                                // main loop had already sent the answer. The
+                                // arm is gated on a parked question, so such a
+                                // reply is never read, and it must not be
+                                // misattributed to this new one.
+                                if let Some(rx) = elicitation_rx.as_mut() {
+                                    while rx.try_recv().is_ok() {}
+                                }
+                                self.handle_elicitation_request(&msg, elicitation_rx.is_some())
+                                    .await?;
+                            }
+                            "$/cancel_request" => self.handle_cancel_request(&msg),
                             other => {
                                 // If the unknown message has an id, it's a request expecting a reply.
                                 // Silence would cause the agent to hang waiting for a response.
@@ -1754,6 +1891,109 @@ impl AcpClient {
         Ok(())
     }
 
+    /// Ask the channel owner an `elicitation/create` form question.
+    ///
+    /// Publishes the first field as a channel message and parks the request;
+    /// the read loop's elicitation arm folds replies in and answers when the
+    /// last field is done. Requests we cannot render — a non-form mode, an
+    /// empty form, a turn with no channel to publish into or no live reply
+    /// channel to answer on (`answerable`), or a second request while one is
+    /// already parked — are answered `cancel` here, which the agent surfaces
+    /// as an aborted tool call rather than a hang.
+    async fn handle_elicitation_request(
+        &mut self,
+        msg: &serde_json::Value,
+        answerable: bool,
+    ) -> Result<(), AcpError> {
+        let id = msg
+            .get("id")
+            .cloned()
+            .ok_or_else(|| AcpError::Protocol("elicitation request missing id".into()))?;
+
+        let fields = parse_elicitation_fields(&msg["params"]).filter(|_| {
+            answerable && self.elicitation.is_some() && self.pending_elicitation.is_none()
+        });
+        let Some(fields) = fields else {
+            tracing::warn!(
+                target: "acp::elicitation",
+                "cancelling unanswerable elicitation id={id}"
+            );
+            return self
+                .write_ndjson(&elicitation_response(&id, "cancel", None))
+                .await;
+        };
+
+        tracing::info!(
+            target: "acp::elicitation",
+            "asking owner {} question(s) for elicitation id={id}",
+            fields.len()
+        );
+        self.pending_elicitation = Some(PendingElicitation {
+            id,
+            fields,
+            asking: 0,
+            answers: serde_json::Map::new(),
+        });
+        self.ask_parked_elicitation();
+        Ok(())
+    }
+
+    /// Fold an owner reply into the parked elicitation, answering the agent
+    /// once every field has been asked.
+    async fn apply_elicitation_reply(
+        &mut self,
+        reply: crate::pool::ElicitationReply,
+    ) -> Result<(), AcpError> {
+        let Some(pending) = self.pending_elicitation.as_mut() else {
+            return Ok(());
+        };
+        let response = match reply {
+            crate::pool::ElicitationReply::Skip => {
+                tracing::info!(
+                    target: "acp::elicitation",
+                    "owner skipped elicitation id={}", pending.id
+                );
+                elicitation_response(&pending.id, "decline", None)
+            }
+            crate::pool::ElicitationReply::Answer(text) => {
+                answer_elicitation_field(
+                    &pending.fields[pending.asking],
+                    &text,
+                    &mut pending.answers,
+                );
+                pending.asking += 1;
+                if pending.asking < pending.fields.len() {
+                    self.ask_parked_elicitation();
+                    return Ok(());
+                }
+                let answers = std::mem::take(&mut pending.answers);
+                elicitation_response(&pending.id, "accept", Some(answers))
+            }
+        };
+        // Write before dropping the parked request, for the reason documented on
+        // `handle_permission_request`: a failed write must leave the agent
+        // answerable by teardown rather than waiting forever.
+        self.write_ndjson(&response).await?;
+        self.take_pending_elicitation();
+        Ok(())
+    }
+
+    /// Drop a parked elicitation the agent has cancelled.
+    ///
+    /// `$/cancel_request` is a notification naming a request the peer has
+    /// abandoned; per JSON-RPC that request is gone, so we must not respond to
+    /// it. Cancellations for anything else are ignored — the read loop's own
+    /// deadlines bound every other request we serve.
+    fn handle_cancel_request(&mut self, msg: &serde_json::Value) {
+        let Some(parked) = self.pending_elicitation.as_ref() else {
+            return;
+        };
+        if msg["params"].get("requestId") == Some(&parked.id) {
+            tracing::info!(target: "acp::elicitation", "agent cancelled elicitation id={}", parked.id);
+            self.take_pending_elicitation();
+        }
+    }
+
     /// Parse `stopReason` from a `session/prompt` result value.
     fn parse_stop_reason(&self, result: &serde_json::Value) -> Result<StopReason, AcpError> {
         let raw = result["stopReason"].as_str().ok_or_else(|| {
@@ -1820,6 +2060,230 @@ fn permission_response_cancelled(id: &serde_json::Value) -> serde_json::Value {
         "id": id,
         "result": { "outcome": { "outcome": "cancelled" } }
     })
+}
+
+/// Marks a kind:9 whose body is an agent question, so richer clients can render
+/// it as a card. Clients that don't know the marker show the plain-text body
+/// below it, which is directly answerable — the same graceful-degradation
+/// contract `<!-- buzz:wave:v1 -->` already carries.
+const ELICITATION_MARKER: &str = "<!-- buzz:ask:v1 -->";
+
+/// One selectable answer to an elicitation form field.
+struct ElicitationOption {
+    /// The value written back in the response.
+    value: String,
+    /// Human-readable label; equals `value` for untitled enums.
+    title: String,
+    description: Option<String>,
+}
+
+/// One question from an elicitation form's `requestedSchema`.
+struct ElicitationField {
+    /// Property key the answer is written back under.
+    name: String,
+    /// JSON Schema `type` — drives coercion of the owner's plain-text reply.
+    ty: String,
+    /// The free-text sibling property (`<name>_custom`), when the form pairs
+    /// one with this field. Holds answers that name no option.
+    custom: Option<String>,
+    prompt: String,
+    /// Empty for free-text fields.
+    options: Vec<ElicitationOption>,
+}
+
+impl ElicitationField {
+    /// Match one reply token against this field's options: a 1-based index, or
+    /// an option value/title compared case-insensitively.
+    fn select(&self, token: &str) -> Option<&ElicitationOption> {
+        let token = token.trim();
+        if let Some(option) = token
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| self.options.get(index.checked_sub(1)?))
+        {
+            return Some(option);
+        }
+        self.options
+            .iter()
+            .find(|o| o.value.eq_ignore_ascii_case(token) || o.title.eq_ignore_ascii_case(token))
+    }
+}
+
+/// An `elicitation/create` request parked awaiting owner replies.
+struct PendingElicitation {
+    /// Stored as a `serde_json::Value` because JSON-RPC 2.0 permits both
+    /// numeric and string IDs from the agent.
+    id: serde_json::Value,
+    fields: Vec<ElicitationField>,
+    /// Index into `fields` of the question currently published.
+    asking: usize,
+    /// Answers gathered so far — becomes the `content` of the accept response.
+    answers: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Flatten an elicitation form into the questions to ask, in schema key order
+/// (lexicographic — this workspace builds `serde_json` without
+/// `preserve_order`; the keys are `question_<n>`, so it reads naturally).
+/// Returns `None` for a non-form request or a form with no askable field.
+///
+/// A `<name>_custom` property whose sibling `<name>` also exists is the
+/// per-question free-text box adapters pair with a select field, not a question
+/// of its own — it holds an answer that names no option.
+fn parse_elicitation_fields(params: &serde_json::Value) -> Option<Vec<ElicitationField>> {
+    if params.get("mode").and_then(|m| m.as_str()) != Some("form") {
+        return None;
+    }
+    let properties = params["requestedSchema"]["properties"].as_object()?;
+    let message = params["message"].as_str().unwrap_or_default();
+    let fields: Vec<ElicitationField> = properties
+        .iter()
+        .filter(|(name, _)| {
+            !name
+                .strip_suffix("_custom")
+                .is_some_and(|base| properties.contains_key(base))
+        })
+        .map(|(name, schema)| ElicitationField {
+            custom: Some(format!("{name}_custom")).filter(|key| properties.contains_key(key)),
+            prompt: schema["description"]
+                .as_str()
+                .or_else(|| schema["title"].as_str())
+                .unwrap_or(message)
+                .to_owned(),
+            options: elicitation_options(schema),
+            ty: schema["type"].as_str().unwrap_or("string").to_owned(),
+            name: name.clone(),
+        })
+        .collect();
+    (!fields.is_empty()).then_some(fields)
+}
+
+/// Selectable values for a field: titled `oneOf`/`anyOf` options or a bare
+/// `enum`, read off the field itself or — for `type: "array"` — off its `items`.
+fn elicitation_options(schema: &serde_json::Value) -> Vec<ElicitationOption> {
+    let source = if schema["type"] == "array" {
+        &schema["items"]
+    } else {
+        schema
+    };
+    if let Some(list) = source["oneOf"]
+        .as_array()
+        .or_else(|| source["anyOf"].as_array())
+    {
+        return list
+            .iter()
+            .filter_map(|option| {
+                let value = option["const"].as_str()?.to_owned();
+                Some(ElicitationOption {
+                    title: option["title"].as_str().unwrap_or(&value).to_owned(),
+                    description: option["description"].as_str().map(str::to_owned),
+                    value,
+                })
+            })
+            .collect();
+    }
+    source["enum"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(|value| ElicitationOption {
+            value: value.to_owned(),
+            title: value.to_owned(),
+            description: None,
+        })
+        .collect()
+}
+
+/// Render one question as the channel message body the owner answers.
+fn render_elicitation_field(field: &ElicitationField, index: usize, total: usize) -> String {
+    use std::fmt::Write;
+
+    let mut body = String::from(ELICITATION_MARKER);
+    if total > 1 {
+        let _ = write!(body, "\n_Question {} of {total}_", index + 1);
+    }
+    let _ = write!(body, "\n**{}**", field.prompt);
+    for (position, option) in field.options.iter().enumerate() {
+        let _ = write!(body, "\n{}. {}", position + 1, option.title);
+        if let Some(description) = &option.description {
+            let _ = write!(body, " — {description}");
+        }
+    }
+    body.push_str(if field.options.is_empty() {
+        "\n\nReply with your answer, or `!skip`."
+    } else if field.ty == "array" {
+        "\n\nReply with the numbers (comma-separated), your own answer, or `!skip`."
+    } else {
+        "\n\nReply with the number, your own answer, or `!skip`."
+    });
+    body
+}
+
+/// Fold the owner's plain-text `reply` into `answers` under `field`'s key, or
+/// under its free-text sibling when the reply names no option.
+fn answer_elicitation_field(
+    field: &ElicitationField,
+    reply: &str,
+    answers: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let reply = reply.trim();
+    let selected: Vec<&ElicitationOption> = if field.ty == "array" {
+        reply
+            .split(',')
+            .filter_map(|token| field.select(token))
+            .collect()
+    } else {
+        field.select(reply).into_iter().collect()
+    };
+    if let Some(key) = field.custom.clone().filter(|_| selected.is_empty()) {
+        answers.insert(key, serde_json::json!(reply));
+    } else if selected.is_empty() {
+        answers.insert(
+            field.name.clone(),
+            coerce_elicitation_answer(&field.ty, reply),
+        );
+    } else if field.ty == "array" {
+        let values: Vec<&str> = selected.iter().map(|o| o.value.as_str()).collect();
+        answers.insert(field.name.clone(), serde_json::json!(values));
+    } else {
+        answers.insert(field.name.clone(), serde_json::json!(selected[0].value));
+    }
+}
+
+/// Coerce a plain-text reply to the JSON type the form asked for, falling back
+/// to the raw string when it doesn't parse — losing the owner's words is worse
+/// than handing the agent a loosely-typed answer.
+fn coerce_elicitation_answer(ty: &str, reply: &str) -> serde_json::Value {
+    match ty {
+        "boolean" => match reply.to_ascii_lowercase().as_str() {
+            "y" | "yes" | "true" => serde_json::json!(true),
+            "n" | "no" | "false" => serde_json::json!(false),
+            _ => serde_json::json!(reply),
+        },
+        "integer" => reply
+            .parse::<i64>()
+            .map_or_else(|_| serde_json::json!(reply), |n| serde_json::json!(n)),
+        "number" => reply
+            .parse::<f64>()
+            .map_or_else(|_| serde_json::json!(reply), |n| serde_json::json!(n)),
+        "array" => serde_json::json!(reply.split(',').map(str::trim).collect::<Vec<_>>()),
+        _ => serde_json::json!(reply),
+    }
+}
+
+/// Build a JSON-RPC `elicitation/create` response. `content` is only ever
+/// carried by `accept`; `decline` tells the agent the owner skipped (the turn
+/// continues) and `cancel` aborts the asking tool call.
+fn elicitation_response(
+    id: &serde_json::Value,
+    action: &str,
+    content: Option<serde_json::Map<String, serde_json::Value>>,
+) -> serde_json::Value {
+    let mut result = serde_json::json!({ "action": action });
+    if let Some(content) = content {
+        result["content"] = serde_json::Value::Object(content);
+    }
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
 /// Full `session/new` response — session ID plus the raw JSON result.
@@ -2030,6 +2494,8 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn stop_reason_parses_all_known_values() {
@@ -2197,6 +2663,16 @@ mod tests {
             msg["params"]["clientCapabilities"]["_meta"]["goose"]["customNotifications"].as_bool(),
             Some(true),
             "goose customNotifications capability must be advertised"
+        );
+        let elicitation = &msg["params"]["clientCapabilities"]["elicitation"];
+        assert_eq!(
+            elicitation["form"],
+            serde_json::json!({}),
+            "form elicitation must be advertised or adapters strip AskUserQuestion"
+        );
+        assert!(
+            elicitation.get("url").is_none(),
+            "url elicitation must stay undeclared — there is no browser-handoff surface"
         );
     }
 
@@ -3441,6 +3917,409 @@ mod tests {
             crate::pool::SteerAck::Success => {}
             other => panic!("expected SteerAck::Success, got {other:?}"),
         }
+    }
+
+    // ── Elicitation ───────────────────────────────────────────────────────
+
+    /// An `elicitation/create` params object in the shape adapters send for a
+    /// single-select AskUserQuestion: a titled `oneOf` enum plus its
+    /// per-question free-text sibling.
+    fn ask_params() -> serde_json::Value {
+        serde_json::json!({
+            "mode": "form",
+            "sessionId": "sess-test",
+            "message": "Which database?",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "question_0": {
+                        "type": "string",
+                        "oneOf": [
+                            {"const": "Postgres", "title": "Postgres", "description": "mature"},
+                            {"const": "SQLite", "title": "SQLite"},
+                        ],
+                    },
+                    "question_0_custom": {"type": "string", "title": "Other"},
+                },
+            },
+        })
+    }
+
+    /// An ask surface pointed at an unroutable relay, plus the flag it raises:
+    /// questions are published best-effort on a spawned task, so a failing
+    /// submit is invisible to the read loop and these tests assert on the wire
+    /// response instead.
+    fn test_ask() -> (crate::pool::ElicitationAsk, Arc<AtomicBool>) {
+        let pending = Arc::new(AtomicBool::new(false));
+        let ask = crate::pool::ElicitationAsk::new(
+            crate::relay::RestClient {
+                http: reqwest::Client::new(),
+                base_url: "http://127.0.0.1:0".to_string(),
+                keys: nostr::Keys::generate(),
+                auth_tag_json: None,
+            },
+            uuid::Uuid::nil(),
+            crate::queue::ThreadTags::default(),
+            None,
+            Arc::clone(&pending),
+        );
+        (ask, pending)
+    }
+
+    /// Send `reply` the way the main loop does: only once the read loop has
+    /// raised the flag saying a question is outstanding.
+    async fn reply_when_asked(
+        pending: Arc<AtomicBool>,
+        tx: tokio::sync::mpsc::Sender<crate::pool::ElicitationReply>,
+        reply: crate::pool::ElicitationReply,
+    ) {
+        while !pending.load(Ordering::Relaxed) {
+            tokio::task::yield_now().await;
+        }
+        tx.send(reply).await.expect("reply send should succeed");
+    }
+
+    fn ask_fields() -> Vec<ElicitationField> {
+        parse_elicitation_fields(&ask_params()).expect("form must parse")
+    }
+
+    fn answer(fields: &[ElicitationField], reply: &str) -> serde_json::Value {
+        let mut answers = serde_json::Map::new();
+        answer_elicitation_field(&fields[0], reply, &mut answers);
+        serde_json::Value::Object(answers)
+    }
+
+    #[test]
+    fn elicitation_form_parses_questions_and_pairs_custom_fields() {
+        let fields = ask_fields();
+        assert_eq!(
+            fields.len(),
+            1,
+            "`question_0_custom` is not its own question"
+        );
+        assert_eq!(fields[0].name, "question_0");
+        assert_eq!(fields[0].custom.as_deref(), Some("question_0_custom"));
+        // A single-question form carries the prompt on `message`, not the field.
+        assert_eq!(fields[0].prompt, "Which database?");
+        assert_eq!(fields[0].options.len(), 2);
+        assert_eq!(fields[0].options[0].description.as_deref(), Some("mature"));
+    }
+
+    #[test]
+    fn elicitation_non_form_mode_is_not_answerable() {
+        let params = serde_json::json!({
+            "mode": "url",
+            "sessionId": "sess-test",
+            "message": "Log in",
+            "url": "https://example.test/login",
+        });
+        assert!(parse_elicitation_fields(&params).is_none());
+    }
+
+    #[test]
+    fn elicitation_reply_selects_by_index_or_label() {
+        let fields = ask_fields();
+        assert_eq!(
+            answer(&fields, "2"),
+            serde_json::json!({"question_0": "SQLite"})
+        );
+        assert_eq!(
+            answer(&fields, "  postgres "),
+            serde_json::json!({"question_0": "Postgres"}),
+            "labels match case-insensitively and ignore padding"
+        );
+        assert_eq!(
+            answer(&fields, "3"),
+            serde_json::json!({"question_0_custom": "3"}),
+            "an out-of-range index is free text, not a panic"
+        );
+    }
+
+    #[test]
+    fn elicitation_reply_naming_no_option_goes_to_the_custom_field() {
+        assert_eq!(
+            answer(&ask_fields(), "DuckDB"),
+            serde_json::json!({"question_0_custom": "DuckDB"})
+        );
+    }
+
+    #[test]
+    fn elicitation_reply_without_a_custom_field_answers_the_field_itself() {
+        // A bare MCP-shaped form: no options, no free-text sibling, and a
+        // non-string type to coerce. Guards the non-AskUserQuestion paths that
+        // the same capability lights up.
+        let params = serde_json::json!({
+            "mode": "form",
+            "sessionId": "sess-test",
+            "message": "Proceed?",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {"confirm": {"type": "boolean"}},
+            },
+        });
+        let fields = parse_elicitation_fields(&params).expect("form must parse");
+        assert!(fields[0].custom.is_none());
+        assert_eq!(answer(&fields, "yes"), serde_json::json!({"confirm": true}));
+        assert_eq!(
+            answer(&fields, "maybe"),
+            serde_json::json!({"confirm": "maybe"}),
+            "an uncoercible reply is kept verbatim rather than dropped"
+        );
+    }
+
+    #[test]
+    fn elicitation_multi_select_reply_is_a_list_of_option_values() {
+        let params = serde_json::json!({
+            "mode": "form",
+            "sessionId": "sess-test",
+            "message": "Which languages?",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "question_0": {
+                        "type": "array",
+                        "items": {"anyOf": [
+                            {"const": "Rust", "title": "Rust"},
+                            {"const": "Go", "title": "Go"},
+                            {"const": "Zig", "title": "Zig"},
+                        ]},
+                    },
+                },
+            },
+        });
+        let fields = parse_elicitation_fields(&params).expect("form must parse");
+        assert_eq!(
+            answer(&fields, "1, zig"),
+            serde_json::json!({"question_0": ["Rust", "Zig"]})
+        );
+    }
+
+    #[test]
+    fn elicitation_question_renders_an_actionable_fallback() {
+        let fields = ask_fields();
+        let body = render_elicitation_field(&fields[0], 0, 1);
+        assert!(body.starts_with(ELICITATION_MARKER));
+        assert!(body.contains("**Which database?**"));
+        assert!(body.contains("1. Postgres — mature"));
+        assert!(body.contains("2. SQLite"));
+        assert!(
+            body.contains("Reply with the number"),
+            "a marker-blind client must still show how to answer: {body}"
+        );
+        assert!(
+            !render_elicitation_field(&fields[0], 1, 3).contains("Question 1 of"),
+            "multi-question forms number the question the owner is on"
+        );
+    }
+
+    /// A `session/prompt` turn in which the agent asks one question, waits for
+    /// the answer, and only then completes. Proves the whole loop: publish,
+    /// park, route the owner's reply, and write the accept response.
+    #[tokio::test]
+    async fn elicitation_round_trip_answers_the_agent_and_completes_the_turn() {
+        // The agent blocks on its own stdin: the prompt response is only
+        // emitted once the elicitation response line arrives, so a hang here
+        // means the harness never answered.
+        let script = "echo '{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"elicitation/create\",\
+                      \"params\":{\"mode\":\"form\",\"sessionId\":\"s\",\"message\":\"Which database?\",\
+                      \"requestedSchema\":{\"type\":\"object\",\"properties\":{\
+                      \"question_0\":{\"type\":\"string\",\"oneOf\":[{\"const\":\"Postgres\",\"title\":\"Postgres\"},\
+                      {\"const\":\"SQLite\",\"title\":\"SQLite\"}]},\
+                      \"question_0_custom\":{\"type\":\"string\",\"title\":\"Other\"}}}}}'; \
+                      read -r response; \
+                      echo \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":999,\\\"result\\\":{\\\"answered\\\":$response}}\"";
+        let mut client = spawn_script(script).await;
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(1);
+        let (ask, pending) = test_ask();
+        client.install_elicitation(ask, reply_rx);
+
+        let reply_task = tokio::spawn(reply_when_asked(
+            pending,
+            reply_tx,
+            crate::pool::ElicitationReply::Answer("2".into()),
+        ));
+
+        let idle = std::time::Duration::from_secs(5);
+        let result = client
+            .read_until_response_with_idle_timeout(
+                "s",
+                999,
+                idle,
+                tokio::time::Instant::now() + idle,
+                idle,
+            )
+            .await
+            .expect("turn should complete once the question is answered");
+        reply_task.await.expect("reply task should complete");
+
+        assert_eq!(
+            result["answered"],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "result": {"action": "accept", "content": {"question_0": "SQLite"}}
+            })
+        );
+    }
+
+    /// `!skip` declines, which the agent reads as "the user skipped" and the
+    /// turn continues — distinct from the cancel that teardown writes.
+    #[tokio::test]
+    async fn elicitation_skip_declines() {
+        let script = "echo '{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"elicitation/create\",\
+                      \"params\":{\"mode\":\"form\",\"sessionId\":\"s\",\"message\":\"Which database?\",\
+                      \"requestedSchema\":{\"type\":\"object\",\"properties\":{\
+                      \"question_0\":{\"type\":\"string\",\"enum\":[\"Postgres\"]}}}}}'; \
+                      read -r response; \
+                      echo \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":999,\\\"result\\\":{\\\"answered\\\":$response}}\"";
+        let mut client = spawn_script(script).await;
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(1);
+        let (ask, pending) = test_ask();
+        client.install_elicitation(ask, reply_rx);
+
+        let reply_task = tokio::spawn(reply_when_asked(
+            pending,
+            reply_tx,
+            crate::pool::ElicitationReply::Skip,
+        ));
+
+        let idle = std::time::Duration::from_secs(5);
+        let result = client
+            .read_until_response_with_idle_timeout(
+                "s",
+                999,
+                idle,
+                tokio::time::Instant::now() + idle,
+                idle,
+            )
+            .await
+            .expect("turn should complete once the question is skipped");
+        reply_task.await.expect("reply task should complete");
+
+        assert_eq!(
+            result["answered"]["result"],
+            serde_json::json!({"action": "decline"})
+        );
+    }
+
+    /// A request with nowhere to render — no ask surface installed, as on the
+    /// `initialize` / `session/new` path — is cancelled rather than parked, so
+    /// the agent is never left waiting on a question nobody will see.
+    #[tokio::test]
+    async fn elicitation_without_an_ask_surface_is_cancelled() {
+        let script = "echo '{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"elicitation/create\",\
+                      \"params\":{\"mode\":\"form\",\"sessionId\":\"s\",\"message\":\"Which database?\",\
+                      \"requestedSchema\":{\"type\":\"object\",\"properties\":{\
+                      \"question_0\":{\"type\":\"string\",\"enum\":[\"Postgres\"]}}}}}'; \
+                      read -r response; \
+                      echo \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":999,\\\"result\\\":{\\\"answered\\\":$response}}\"";
+        let mut client = spawn_script(script).await;
+
+        let idle = std::time::Duration::from_secs(5);
+        let result = client
+            .read_until_response_with_idle_timeout(
+                "s",
+                999,
+                idle,
+                tokio::time::Instant::now() + idle,
+                idle,
+            )
+            .await
+            .expect("turn should complete without a human in the loop");
+
+        assert_eq!(
+            result["answered"]["result"],
+            serde_json::json!({"action": "cancel"})
+        );
+        assert!(client.pending_elicitation.is_none());
+    }
+
+    /// The silent-agent guard is suspended while a question is outstanding —
+    /// a human may think for longer than `idle_timeout` — but the hard
+    /// deadline keeps bounding the turn.
+    #[tokio::test]
+    async fn parked_elicitation_suspends_the_idle_clock_but_not_the_hard_deadline() {
+        let script = "echo '{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"elicitation/create\",\
+                      \"params\":{\"mode\":\"form\",\"sessionId\":\"s\",\"message\":\"Which database?\",\
+                      \"requestedSchema\":{\"type\":\"object\",\"properties\":{\
+                      \"question_0\":{\"type\":\"string\",\"enum\":[\"Postgres\"]}}}}}'; \
+                      sleep 30";
+        let mut client = spawn_script(script).await;
+        let (_reply_tx, reply_rx) = tokio::sync::mpsc::channel(1);
+        client.install_elicitation(test_ask().0, reply_rx);
+
+        let idle = std::time::Duration::from_millis(200);
+        let max_duration = std::time::Duration::from_secs(2);
+        let result = client
+            .read_until_response_with_idle_timeout(
+                "s",
+                999,
+                idle,
+                tokio::time::Instant::now() + max_duration,
+                max_duration,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(AcpError::HardTimeout { .. })),
+            "expected the hard deadline to fire, not the suspended idle clock, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_request_drops_the_parked_elicitation_without_responding() {
+        let mut client = spawn_script("sleep 10").await;
+        let (_reply_tx, reply_rx) = tokio::sync::mpsc::channel(1);
+        client.install_elicitation(test_ask().0, reply_rx);
+        client
+            .handle_elicitation_request(&serde_json::json!({"id": 7, "params": ask_params()}), true)
+            .await
+            .expect("the question should park");
+        assert!(client.pending_elicitation.is_some());
+
+        client.handle_cancel_request(&serde_json::json!({"params": {"requestId": 8}}));
+        assert!(
+            client.pending_elicitation.is_some(),
+            "a cancel naming another request must not drop this one"
+        );
+        client.handle_cancel_request(&serde_json::json!({"params": {"requestId": 7}}));
+        assert!(client.pending_elicitation.is_none());
+    }
+
+    /// A reply the main loop sent for a question the agent then cancelled sits
+    /// unread in the channel. The next question must discard it rather than
+    /// answer itself with the previous question's text.
+    #[tokio::test]
+    async fn stale_reply_does_not_answer_the_next_question() {
+        let script = "echo '{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"elicitation/create\",\
+                      \"params\":{\"mode\":\"form\",\"sessionId\":\"s\",\"message\":\"Which database?\",\
+                      \"requestedSchema\":{\"type\":\"object\",\"properties\":{\
+                      \"question_0\":{\"type\":\"string\",\"enum\":[\"Postgres\"]}}}}}'; \
+                      sleep 30";
+        let mut client = spawn_script(script).await;
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(1);
+        client.install_elicitation(test_ask().0, reply_rx);
+        reply_tx
+            .send(crate::pool::ElicitationReply::Answer("Postgres".into()))
+            .await
+            .expect("the stale reply should queue");
+
+        let idle = std::time::Duration::from_millis(200);
+        let max_duration = std::time::Duration::from_secs(2);
+        let result = client
+            .read_until_response_with_idle_timeout(
+                "s",
+                999,
+                idle,
+                tokio::time::Instant::now() + max_duration,
+                max_duration,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(AcpError::HardTimeout { .. })),
+            "the stale reply must be dropped, leaving the question parked, got {result:?}"
+        );
     }
 
     // ── Goose usage notification integration ──────────────────────────────
