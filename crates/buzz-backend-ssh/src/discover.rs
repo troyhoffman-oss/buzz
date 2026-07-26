@@ -119,15 +119,15 @@ const CANDIDATES: &[Candidate] = &[
 
 /// Preamble shared by every remote script.
 ///
-/// `probe` writes one tab-separated record per resolved command. A
-/// tab-delimited record rather than JSON assembled in `sh`: quoting arbitrary
-/// `--version` output into valid JSON from a POSIX shell is a bug farm, and the
-/// parsing belongs on the Rust side where it is testable.
+/// `probe` writes one tab-separated record per resolved command, rather than
+/// JSON assembled in `sh`: quoting arbitrary `--version` output into valid JSON
+/// from a POSIX shell is a bug farm, and the parsing belongs on the Rust side
+/// where it is testable.
 ///
-/// Two details are load-bearing. `</dev/null` on every probed child: the
-/// script itself arrives on the remote shell's stdin, so a child that reads
-/// stdin would swallow the rest of the script. And `timeout` when the host has
-/// it: a harness whose `--version` opens a REPL must not hold the budget.
+/// Two details are load-bearing. `</dev/null` on every probed child, because
+/// the script itself arrives on the remote shell's stdin and a child that reads
+/// stdin would swallow the rest of it. And `timeout` where the host has it, so
+/// a harness whose `--version` opens a REPL cannot hold the budget.
 const PROBE_PREAMBLE: &str = r#"set -u
 if command -v timeout >/dev/null 2>&1; then _t="timeout 5"; else _t=""; fi
 probe() {
@@ -168,16 +168,13 @@ fn parse_probes(stdout: &str) -> Vec<Probe<'_>> {
         .lines()
         .filter_map(|line| {
             let mut fields = line.splitn(4, '\t');
-            let key = fields.next()?;
-            let command = fields.next()?;
-            let path = fields.next()?;
-            let version = fields.next().unwrap_or("");
-            (!key.is_empty() && !path.is_empty()).then_some(Probe {
-                key,
-                command,
-                path,
-                version,
-            })
+            let probe = Probe {
+                key: fields.next()?,
+                command: fields.next()?,
+                path: fields.next()?,
+                version: fields.next().unwrap_or(""),
+            };
+            (!probe.key.is_empty() && !probe.path.is_empty()).then_some(probe)
         })
         .collect()
 }
@@ -228,11 +225,9 @@ fn harnesses_response(stdout: &str) -> serde_json::Value {
 }
 
 pub fn discover_harnesses(
-    request: &serde_json::Value,
     config: &SshConfig,
     session: &Session,
 ) -> Result<serde_json::Value, String> {
-    let _ = request;
     let output = session.run(&discover_script(config), Duration::from_secs(40))?;
     if !output.ok() {
         return Err(output.failure());
@@ -250,20 +245,21 @@ pub fn check(session: &Session) -> Result<serde_json::Value, String> {
 }
 
 /// Turn ssh's own diagnosis into something the user can act on. The classified
-/// cases are the ones that actually happen; everything else passes through
+/// causes are the ones that actually happen; everything else passes through
 /// verbatim rather than being flattened into a generic message.
 fn guidance(failure: &str) -> String {
+    const GUIDANCE: &[(&str, &str)] = &[
+        ("permission denied", "add your public key to ~/.ssh/authorized_keys on the server, or run `tailscale set --ssh` there."),
+        ("host key verification failed", "the server's host key is not in your known_hosts. Connect once with `ssh` to review and accept it."),
+        ("could not resolve hostname", "check the address, or confirm the device is on your tailnet."),
+        ("connection refused", "confirm the server is reachable and running an SSH daemon."),
+        ("connection timed out", "confirm the server is reachable and running an SSH daemon."),
+    ];
+
     let lower = failure.to_lowercase();
-    if lower.contains("permission denied") {
-        format!("{failure} — add your public key to ~/.ssh/authorized_keys on the server, or run `tailscale set --ssh` there.")
-    } else if lower.contains("host key verification failed") {
-        format!("{failure} — the server's host key is not in your known_hosts. Connect once with `ssh` to review and accept it.")
-    } else if lower.contains("could not resolve hostname") {
-        format!("{failure} — check the address, or confirm the device is on your tailnet.")
-    } else if lower.contains("connection refused") || lower.contains("connection timed out") {
-        format!("{failure} — confirm the server is reachable and running an SSH daemon.")
-    } else {
-        failure.to_string()
+    match GUIDANCE.iter().find(|(cause, _)| lower.contains(cause)) {
+        Some((_, advice)) => format!("{failure} — {advice}"),
+        None => failure.to_string(),
     }
 }
 
@@ -304,24 +300,23 @@ fn models_script(request: &serde_json::Value, config: &SshConfig) -> Result<Stri
         .ok_or("probe_models harness is missing 'command'")?;
     let args = string_list(harness.get("args"));
 
-    // Nested under `agent.env_vars` because that is the only place
-    // `env_secrets_from_request` (backend.rs) looks when scrubbing these values
-    // out of an error surface — a top-level `model_env` would travel unredacted
-    // through any failure message. Accepted there too, since the values are
-    // still safe in the transport; they just lose that second layer.
+    // `agent.env_vars` is the only place `env_secrets_from_request`
+    // (backend.rs) looks when scrubbing these values out of an error surface,
+    // so a top-level `model_env` would travel unredacted through any failure
+    // message. Still accepted, since the transport is safe either way; it just
+    // loses that second layer.
     let model_env = request
         .get("agent")
         .and_then(|agent| agent.get("env_vars"))
         .or_else(|| request.get("model_env"));
 
     let mut script = String::from("set -u\n");
-    // Model-probe env carries provider API keys. They are set inside the
-    // stdin-delivered script, so they never appear in the remote argv.
+    // Model-probe env carries provider API keys, set inside the
+    // stdin-delivered script so they never appear in the remote argv.
     //
-    // The *name* is validated rather than quoted: it is the left side of an
-    // assignment, where quoting has no effect, so an unchecked name is a
-    // straight command injection (`X=1; touch /tmp/pwn`). Values are quoted,
-    // which is sufficient for them.
+    // Names are validated rather than quoted: on the left of an assignment
+    // quoting has no effect, so an unchecked name is a straight command
+    // injection (`X=1; touch /tmp/pwn`). Quoting is sufficient for values.
     for (key, value) in crate::deploy::env_map(model_env) {
         if !crate::deploy::is_well_formed_env_key(&key) {
             return Err(format!("env var name '{key}' is not a valid identifier"));

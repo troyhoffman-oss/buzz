@@ -1,16 +1,16 @@
 //! Tailscale device enumeration, via the `tailscale` CLI.
 //!
-//! The CLI is used deliberately in place of the LocalAPI. LocalAPI means three
-//! transports (unix socket on Linux, a named pipe on Windows, and a localhost
-//! TCP port plus a `sameuserproof` token scavenged from `/Library/Tailscale`
-//! on macOS GUI builds) plus a Host-header gate that 403s on the obvious
-//! guesses. The CLI is one `Command::new`, one JSON parse, one code path.
+//! The CLI rather than the LocalAPI: LocalAPI means three transports (unix
+//! socket on Linux, named pipe on Windows, and a localhost TCP port plus a
+//! `sameuserproof` token scavenged from `/Library/Tailscale` on macOS GUI
+//! builds) plus a Host-header gate that 403s on the obvious guesses. The CLI is
+//! one `Command::new`, one JSON parse, one code path.
 //!
-//! Everything here degrades silently. Tailscale being absent, logged out, or
-//! stopped must leave the remote flow exactly as good as it is without
-//! Tailscale — which is why every failure maps to "no devices" and never to an
-//! error. `tailscale status --help` warns that `--json` "format [is] subject to
-//! change", so every field is optional and a parse failure is just as quiet.
+//! Everything here degrades silently: Tailscale absent, logged out, or stopped
+//! must leave the remote flow exactly as good as it is without Tailscale, so
+//! every failure maps to "no devices" and never to an error. `tailscale status
+//! --help` warns that the `--json` "format [is] subject to change", so every
+//! field is optional and a parse failure is just as quiet.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -18,23 +18,23 @@ use std::process::Command;
 use serde::Deserialize;
 
 /// `tailscale status --json`, reduced to the fields we consume.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Deserialize)]
 struct StatusDoc {
     #[serde(rename = "BackendState")]
     backend_state: Option<String>,
     #[serde(rename = "CurrentTailnet")]
-    current_tailnet: Option<Tailnet_>,
+    current_tailnet: Option<CurrentTailnet>,
     #[serde(rename = "Peer")]
     peer: Option<std::collections::BTreeMap<String, Peer>>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct Tailnet_ {
+#[derive(Deserialize)]
+struct CurrentTailnet {
     #[serde(rename = "MagicDNSEnabled")]
     magic_dns_enabled: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Deserialize)]
 struct Peer {
     #[serde(rename = "HostName")]
     host_name: Option<String>,
@@ -53,7 +53,6 @@ struct Peer {
 }
 
 /// A peer that could plausibly host an agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Device {
     /// The address to hand to `ssh`: MagicDNS FQDN when available, else the
     /// first Tailscale IP.
@@ -69,7 +68,7 @@ pub struct Device {
 
 /// The set of tailnet peers usable as SSH targets. Empty whenever Tailscale is
 /// missing, logged out, stopped, or has nothing that can host an agent.
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub struct Tailnet {
     devices: Vec<Device>,
 }
@@ -77,12 +76,12 @@ pub struct Tailnet {
 impl Tailnet {
     /// Run `tailscale status --json` and parse it. Never fails.
     pub fn detect() -> Self {
-        let Some(binary) = resolve_cli(&cli_candidates(), &|path: &PathBuf| path.is_file()) else {
+        let Some(binary) = cli_candidates().into_iter().find(|path| path.is_file()) else {
             return Self::default();
         };
         let mut command = Command::new(binary);
         command.arg("status").arg("--json");
-        crate::ssh::hide_console_window(&mut command);
+        crate::ssh::configure_no_window(&mut command);
         // We never branch on the exit code: a logged-out daemon exits 0 with
         // `BackendState: "NeedsLogin"` and `Peer: null`, while a missing daemon
         // socket exits 1. `parse` handles both by looking at the document.
@@ -115,8 +114,8 @@ impl Tailnet {
             .filter_map(|peer| device_from_peer(&peer, magic_dns))
             .collect();
         // Online first, then by label, so the list opens on what is usable now.
-        // Ordering reads the `online` flag rather than sniffing the rendered
-        // label: a host named "· offline" would otherwise sort itself last.
+        // Sorting on the flag rather than the rendered label: a host actually
+        // named "· offline" would otherwise sort itself last.
         devices.sort_by(|a, b| {
             a.online
                 .cmp(&b.online)
@@ -135,8 +134,8 @@ impl Tailnet {
     ///
     /// This gates `StrictHostKeyChecking=accept-new`: a tailnet address is
     /// reached over an already-WireGuard-authenticated transport, so TOFU adds
-    /// nothing. A manually typed host keeps the user's own known-hosts
-    /// semantics, where an unknown key is a decision, not a default.
+    /// nothing there. A manually typed host keeps the user's own known-hosts
+    /// semantics, where an unknown key is a decision rather than a default.
     pub fn contains(&self, host: &str) -> bool {
         self.devices
             .iter()
@@ -171,13 +170,8 @@ fn device_from_peer(peer: &Peer, magic_dns: bool) -> Option<Device> {
         .as_ref()
         .and_then(|ips| ips.first())
         .map(String::as_str);
-    let address = match (magic_dns, fqdn, ip) {
-        (true, Some(fqdn), _) => fqdn,
-        (_, _, Some(ip)) => ip,
-        (false, Some(fqdn), None) => fqdn,
-        _ => return None,
-    }
-    .to_string();
+    // MagicDNS name when it is resolvable, else the raw tailnet IP.
+    let address = if magic_dns { fqdn.or(ip) } else { ip.or(fqdn) }?.to_string();
 
     let name = peer
         .host_name
@@ -208,10 +202,8 @@ fn device_from_peer(peer: &Peer, magic_dns: bool) -> Option<Device> {
 }
 
 /// Where the `tailscale` CLI lives when PATH does not have it. macOS GUI apps
-/// inherit a minimal launchd PATH and the App Store build only ships the CLI
+/// inherit a minimal launchd PATH and the App Store build ships the CLI only
 /// inside the bundle; Windows registers an install dir but not a PATH entry.
-/// Mirrors the explicit-candidates pattern the desktop already uses for
-/// provider discovery.
 fn cli_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let exe = if cfg!(windows) {
@@ -235,13 +227,6 @@ fn cli_candidates() -> Vec<PathBuf> {
         ));
     }
     candidates
-}
-
-/// First existing candidate. `exists` is injected so path resolution is
-/// testable off-platform — a Windows install dir is data here, not a
-/// filesystem fact.
-fn resolve_cli(candidates: &[PathBuf], exists: &dyn Fn(&PathBuf) -> bool) -> Option<PathBuf> {
-    candidates.iter().find(|path| exists(path)).cloned()
 }
 
 #[cfg(test)]
@@ -374,20 +359,6 @@ mod tests {
         assert!(tailnet.contains("VPS-PROD.tailcfd703.ts.net"));
         assert!(!tailnet.contains("vps.example.com"));
         assert!(!Tailnet::parse(NEEDS_LOGIN).contains("vps-prod.tailcfd703.ts.net"));
-    }
-
-    #[test]
-    fn cli_resolution_prefers_the_first_existing_candidate() {
-        let candidates = vec![
-            PathBuf::from("/nope/tailscale"),
-            PathBuf::from(r"C:\Program Files\Tailscale\tailscale.exe"),
-            PathBuf::from("/usr/bin/tailscale"),
-        ];
-        let found = resolve_cli(&candidates, &|path| {
-            path.to_string_lossy().contains("Program Files")
-        });
-        assert_eq!(found, Some(candidates[1].clone()));
-        assert_eq!(resolve_cli(&candidates, &|_| false), None);
     }
 
     #[test]

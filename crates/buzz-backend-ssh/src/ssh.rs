@@ -6,13 +6,12 @@
 //! place. The system client already has all of it, configured the way the user
 //! configured it.
 //!
-//! **Every op sends its script over stdin to a remote `sh -s`.** That is the
-//! one mechanism that keeps this crate's central invariant true by
-//! construction: the remote host's `ps` is world-readable, so a secret on the
-//! remote argv leaks the agent identity to every user on the box, and the
-//! desktop's stderr redaction does nothing about a remote process table. With
-//! the script on stdin, the remote argv is the literal string `sh -s` and the
-//! local argv is the ssh options — neither ever carries a credential.
+//! **Every op sends its script over stdin to a remote `sh -s`.** That is what
+//! makes the crate's central invariant true by construction: the remote `ps` is
+//! world-readable and the desktop's redaction has no reach there, so a secret
+//! on the remote argv would leak the agent identity to every user on the box.
+//! With the script on stdin the remote argv is the literal string `sh -s` and
+//! the local argv is the ssh options — neither ever carries a credential.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -70,9 +69,9 @@ impl Session {
     pub fn new(config: &SshConfig, accept_new_host_key: bool) -> Result<Self, String> {
         let binary = resolve_ssh().ok_or("ssh client not found on PATH")?;
         let mut args = vec![
-            // Structurally removes every interactive prompt: with BatchMode on,
-            // "this provider never asks for, transmits, or stores a password"
-            // is a property of the code rather than a promise.
+            // Removes every interactive prompt structurally, which is what
+            // makes "this provider never asks for, transmits, or stores a
+            // password" a property of the code rather than a promise.
             "-o".into(),
             "BatchMode=yes".into(),
             "-o".into(),
@@ -114,7 +113,7 @@ impl Session {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        hide_console_window(&mut command);
+        configure_no_window(&mut command);
         let mut child = command
             .spawn()
             .map_err(|e| format!("failed to run {}: {e}", self.binary.display()))?;
@@ -133,29 +132,29 @@ impl Session {
         let stdout = drain(child.stdout.take());
         let stderr = drain(child.stderr.take());
 
+        // Poll to a deadline rather than blocking on `wait`, the repo's standard
+        // pattern (`discovery::probe_codex_acp_major_version`).
         let deadline = Instant::now() + timeout;
-        let status = loop {
+        let outcome = loop {
             match child.try_wait() {
-                Ok(Some(status)) => break status.code(),
-                Ok(None) if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = writer.join();
-                    return Err(format!("ssh timed out after {}s", timeout.as_secs()));
+                Ok(Some(status)) => break Ok(status.code()),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(25));
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-                Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = writer.join();
-                    return Err(format!("ssh wait failed: {e}"));
-                }
+                Ok(None) => break Err(format!("ssh timed out after {}s", timeout.as_secs())),
+                Err(e) => break Err(format!("ssh wait failed: {e}")),
             }
         };
+        if outcome.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // Joined before the error is returned either way: the writer holds the
+        // stdin handle, and a live handle keeps a killed child's pipe open.
         let _ = writer.join();
 
         Ok(Output {
-            status,
+            status: outcome?,
             stdout: stdout.join().unwrap_or_default(),
             stderr: stderr.join().unwrap_or_default(),
         })
@@ -199,20 +198,19 @@ fn resolve_ssh() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
-/// Suppress the console window Windows would otherwise flash for each child.
-/// The desktop applies this to its own spawn of the provider, and that flag
-/// does not inherit to the provider's children.
-pub fn hide_console_window(command: &mut Command) {
+/// The desktop's `util::configure_no_window`, transcribed. The desktop applies
+/// it to its own spawn of this provider, but `CREATE_NO_WINDOW` does not
+/// inherit, so every child spawned here must set it again or Windows flashes a
+/// console window per op.
+pub fn configure_no_window(command: &mut Command) {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
+        use std::os::windows::process::CommandExt as _;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
     #[cfg(not(windows))]
-    {
-        let _ = command;
-    }
+    let _ = command;
 }
 
 /// Quote a value for POSIX `sh`. Single quotes suppress every expansion; the

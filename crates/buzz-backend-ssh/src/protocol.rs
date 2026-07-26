@@ -145,7 +145,9 @@ impl SshConfig {
 
     /// The host without any `user@` prefix, for tailnet membership lookups.
     pub fn bare_host(&self) -> &str {
-        self.host.rsplit('@').next().unwrap_or(&self.host)
+        self.host
+            .rsplit_once('@')
+            .map_or(self.host.as_str(), |(_, host)| host)
     }
 }
 

@@ -1,15 +1,11 @@
 //! `deploy`: provision the agent as a `systemd --user` unit on the host.
 //!
-//! `systemd --user` rather than a system unit is the faithful analog of what
-//! the desktop does locally — it supervises a child process owned by the user
-//! who started it. It also keeps the whole flow root-free, leaves the env file
-//! under the deploying user's own ownership, and puts it beside the harness
-//! credentials that already live there (`~/.claude`, `~/.config/goose`).
+//! `--user` rather than a system unit keeps the flow root-free and puts the env
+//! file beside the harness credentials that already live in the deploying
+//! user's home (`~/.claude`, `~/.config/goose`).
 //!
-//! Deploy is also the *start* path: `start_managed_agent` re-enters
-//! `deploy_to_provider`, so start and redeploy are one code path. Everything
-//! here is therefore idempotent, and non-idempotence would surface as duplicate
-//! units rather than as an error.
+//! Deploy is also the *start* path — `start_managed_agent` re-enters
+//! `deploy_to_provider` — so everything here must be idempotent.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -20,9 +16,10 @@ use crate::ssh::{quote, Session};
 /// The templated unit, installed once per host and instantiated per agent.
 const UNIT_TEMPLATE: &str = include_str!("../assets/buzz-acp@.service");
 
-/// Env keys the desktop reserves for itself (`managed_agents::env_vars`). The
-/// desktop already strips these from user env, but this is a separate trust
-/// boundary and the cost of re-checking is four lines.
+/// Verbatim copy of the desktop's `env_vars::RESERVED_ENV_KEYS`. The desktop
+/// already strips these from user env; re-checking here means a leak needs two
+/// independent failures rather than one, and this binary ships and updates
+/// separately from the desktop that fills the payload.
 const RESERVED_ENV_KEYS: &[&str] = &[
     "BUZZ_PRIVATE_KEY",
     "NOSTR_PRIVATE_KEY",
@@ -96,13 +93,11 @@ impl Agent {
             );
         }
 
-        // Correction C1. The remote harness choice reaches the host ONLY as
-        // this pin — the desktop resolves it from the remote catalog at create
-        // time and ships it verbatim. A blank value means the pin was lost
-        // upstream and the host would silently run `buzz-agent` instead of the
-        // harness the user picked, so refuse rather than substitute. The pin is
-        // then made durable by writing it into the env file systemd re-reads on
-        // every restart.
+        // The remote harness choice reaches the host ONLY as this pin — the
+        // desktop resolves it from the remote catalog at create time and ships
+        // it verbatim. A blank value means the pin was lost on the way, and the
+        // host would silently run `buzz-agent` instead of the harness the user
+        // picked, so refuse rather than substitute.
         let agent_command = string("agent_command").ok_or(
             "deploy payload carries no 'agent_command': the harness pin was lost before it \
              reached the host (see instanceInputForDefinition provider branch)",
@@ -114,11 +109,11 @@ impl Agent {
             private_key_nsec,
             auth_tag: string("auth_tag"),
             agent_command,
-            // Also part of C1: `agent_args` must be the remote entry's default
-            // args. The desktop's local branch sends `[]` on purpose so spawn
-            // re-resolves them live, but a provider-backed record never spawns
-            // locally, so `[]` here would mean "no args" for any harness the
-            // local default-args table does not know.
+            // `agent_args` must be the remote entry's default args. The
+            // desktop's local branch sends `[]` on purpose so spawn re-resolves
+            // them live, but a provider-backed record never spawns locally, so
+            // `[]` here would mean "no args" for any harness the local
+            // default-args table does not know.
             agent_args: crate::discover::string_list(agent.get("agent_args")),
             system_prompt: string("system_prompt"),
             model: string("model"),
@@ -140,22 +135,21 @@ impl Agent {
     /// The systemd instance name, and the `agent_id` the desktop persists in
     /// `record.backend_agent_id`.
     ///
-    /// It becomes both a filename and a unit instance name, so it is
-    /// constrained to `[a-z0-9-]`. The hash suffix is not decoration: the
-    /// payload carries no stable agent identifier, and without it two agents
-    /// whose names differ only in punctuation would sanitize to the same slug
-    /// and silently share one unit and one env file.
+    /// It becomes both a filename and a unit instance name, so it follows the
+    /// desktop's own `util::slugify` rule. The hash suffix is not decoration:
+    /// the payload carries no stable agent identifier, and without it two
+    /// agents whose names differ only in punctuation would share one unit and
+    /// one env file.
     pub fn slug(&self) -> String {
-        let mut sanitized = String::new();
-        for ch in self.name.to_lowercase().chars() {
-            if ch.is_ascii_alphanumeric() {
-                sanitized.push(ch);
-            } else if !sanitized.ends_with('-') {
-                sanitized.push('-');
-            }
-        }
-        let sanitized = sanitized.trim_matches('-');
-        let stem: String = sanitized.chars().take(32).collect();
+        let sanitized: String = self
+            .name
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        // ASCII by construction, so a byte slice cannot split a character.
+        let stem = sanitized.trim_matches('-');
+        let stem = &stem[..stem.len().min(32)];
         let stem = stem.trim_end_matches('-');
         let stem = if stem.is_empty() { "agent" } else { stem };
         format!("{stem}-{}", short_hash(&self.name))
@@ -166,8 +160,7 @@ impl Agent {
     }
 }
 
-/// FNV-1a, truncated. Only ever used to keep distinct names on distinct units —
-/// never for anything a security property depends on.
+/// FNV-1a, truncated. Only ever used to keep distinct names on distinct units.
 fn short_hash(value: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in value.as_bytes() {
@@ -233,13 +226,13 @@ fn env_file_body(agent: &Agent) -> Result<String, String> {
         push("BUZZ_AUTH_TAG", auth_tag)?;
     }
     push("BUZZ_ACP_AGENT_ARGS", &agent.agent_args.join(","))?;
-    // v1 does not carry MCP to the host: `mcp_command` is local catalog
-    // metadata and mirroring that table here would drift. Emitted empty rather
-    // than omitted, matching what local spawn writes when it does not apply.
+    // MCP does not reach the host yet: `mcp_command` is local catalog metadata,
+    // and mirroring that table here would drift. Empty rather than omitted,
+    // matching what local spawn writes when it does not apply.
     push("BUZZ_ACP_MCP_COMMAND", "")?;
-    // Always eager. `BUZZ_ACP_LAZY_POOL=true` is the desktop's lazy pair-start
-    // concept, which has no meaning for a unit systemd starts unconditionally.
-    // Written explicitly so the harness default cannot drift underneath us.
+    // `BUZZ_ACP_LAZY_POOL=true` is the desktop's lazy pair-start concept, which
+    // has no meaning for a unit systemd starts unconditionally. Written
+    // explicitly so the harness default cannot drift underneath us.
     push("BUZZ_ACP_LAZY_POOL", "false")?;
     push("BUZZ_ACP_AGENTS", &agent.parallelism.to_string())?;
     push("BUZZ_ACP_MULTIPLE_EVENT_HANDLING", "steer")?;
@@ -264,8 +257,7 @@ fn env_file_body(agent: &Agent) -> Result<String, String> {
     if let Some(model) = &agent.model {
         push("BUZZ_ACP_MODEL", model)?;
     }
-    // Emitted only when the user set them, so the harness's own defaults win
-    // otherwise — same rule local spawn follows.
+    // Only when the user set them, so the harness's own defaults win otherwise.
     if let Some(idle) = agent.idle_timeout_seconds {
         push("BUZZ_ACP_IDLE_TIMEOUT", &idle.to_string())?;
     }
@@ -273,9 +265,8 @@ fn env_file_body(agent: &Agent) -> Result<String, String> {
         push("BUZZ_ACP_MAX_TURN_DURATION", &max_turn.to_string())?;
     }
 
-    // `BUZZ_MANAGED_AGENT` is deliberately absent: it is the desktop's
-    // process-ownership marker, used to reclaim orphaned local children. On a
-    // host where systemd owns the lifecycle it would be actively misleading.
+    // `BUZZ_MANAGED_AGENT` is deliberately absent: it is the desktop's marker
+    // for reclaiming orphaned local children, and systemd owns this lifecycle.
 
     // User env last, so it overrides everything above — systemd applies the
     // later assignment for a repeated key, matching the local layering.
@@ -312,21 +303,21 @@ fn relay_http_base_url(relay_url: &str) -> String {
 ///
 /// Every secret reaches the host inside this script, which travels on the SSH
 /// stdin channel. Nothing secret is ever an argument — not to `ssh`, and not to
-/// any command the script runs — because the remote `ps` is world-readable and
-/// the desktop's redaction has no reach there. The env file is created under
-/// `umask 077`, `chmod 600`, and moved into place atomically.
+/// any command the script runs — because the remote `ps` is world-readable. The
+/// env file is written under `umask 077`, `chmod 600`, and moved into place
+/// atomically.
 fn deploy_script(agent: &Agent, config: &SshConfig, unit: &str) -> Result<String, String> {
     let slug = agent.slug();
-    let acp = config.buzz_acp_path.as_deref().unwrap_or("buzz-acp");
+    let acp = quote(config.buzz_acp_path.as_deref().unwrap_or("buzz-acp"));
+    let command = quote(&agent.agent_command);
     let relay_http = relay_http_base_url(&agent.relay_url);
 
     let mut script = String::from("set -eu\numask 077\n");
-    // The harness name is bound to a variable and only ever referenced as
+    // The harness name is bound once and thereafter referenced only as
     // `"$harness_name"`. Interpolating it into the double-quoted error message
-    // instead would be a command-injection hole: `quote()` makes the value
-    // inert as an *argument*, but inside double quotes its single quotes are
-    // literal and a `$(...)` in the payload would still be executed. Parameter
-    // expansion results are not re-scanned, so this shape is safe.
+    // would be a command-injection hole: `quote()` makes a value inert as an
+    // *argument*, but inside double quotes its single quotes are literal and a
+    // `$(...)` would still run. Expansion results are not re-scanned.
     script.push_str(&format!(
         r#"harness_name={command}
 acp=$(command -v {acp} 2>/dev/null) || {{ echo "buzz-acp not found on the server's PATH — install it, or set 'buzz-acp path on the server'" >&2; exit 90; }}
@@ -337,16 +328,12 @@ units="$HOME/.config/systemd/user"
 mkdir -p "$conf" "$units"
 env_file="$conf/{slug}.env"
 tmp="$env_file.new"
-"#,
-        acp = quote(acp),
-        command = quote(&agent.agent_command),
-        slug = slug,
+"#
     ));
 
-    // The heredoc body cannot terminate the heredoc: every line is `KEY="..."`
-    // and `env_line` refuses control characters, so no line can equal the
-    // delimiter. The quoted delimiter suppresses all expansion, so a value is
-    // never interpreted by the shell.
+    // No body line can terminate the heredoc: every line is `KEY="..."` and
+    // `env_line` refuses control characters. The quoted delimiter suppresses
+    // expansion, so a value is never interpreted by the shell.
     script.push_str("{\n");
     script.push_str("printf 'BUZZ_ACP_AGENT_COMMAND=\"%s\"\\n' \"$harness\"\n");
     script.push_str("printf 'PATH=\"%s\"\\n' \"$HOME/.local/bin:$PATH\"\n");
@@ -355,6 +342,19 @@ tmp="$env_file.new"
     script.push_str("BUZZ_ENV_EOF\n");
     // Git over the relay's NIP-98 endpoint, only when the helper is installed.
     // NOSTR_PRIVATE_KEY mirrors BUZZ_PRIVATE_KEY, as it does locally.
+    let helper_key = format!("credential.{relay_http}/git.helper");
+    let use_http_path_key = format!("credential.{relay_http}/git.useHttpPath");
+    let git_block: String = [
+        ("NOSTR_PRIVATE_KEY", agent.private_key_nsec.expose()),
+        ("GIT_TERMINAL_PROMPT", "0"),
+        ("GIT_CONFIG_COUNT", "2"),
+        ("GIT_CONFIG_KEY_0", helper_key.as_str()),
+        ("GIT_CONFIG_KEY_1", use_http_path_key.as_str()),
+        ("GIT_CONFIG_VALUE_1", "true"),
+    ]
+    .into_iter()
+    .map(|(key, value)| env_line(key, value))
+    .collect::<Result<_, _>>()?;
     script.push_str(&format!(
         r#"if [ -n "$cred" ]; then
 printf 'GIT_CONFIG_VALUE_0="%s"\n' "$cred"
@@ -364,37 +364,17 @@ fi
 }} > "$tmp"
 chmod 600 "$tmp"
 mv "$tmp" "$env_file"
-"#,
-        git_block = {
-            let mut block = String::new();
-            block.push_str(&env_line(
-                "NOSTR_PRIVATE_KEY",
-                agent.private_key_nsec.expose(),
-            )?);
-            block.push_str(&env_line("GIT_TERMINAL_PROMPT", "0")?);
-            block.push_str(&env_line("GIT_CONFIG_COUNT", "2")?);
-            block.push_str(&env_line(
-                "GIT_CONFIG_KEY_0",
-                &format!("credential.{relay_http}/git.helper"),
-            )?);
-            block.push_str(&env_line(
-                "GIT_CONFIG_KEY_1",
-                &format!("credential.{relay_http}/git.useHttpPath"),
-            )?);
-            block.push_str(&env_line("GIT_CONFIG_VALUE_1", "true")?);
-            block
-        },
+"#
     ));
 
-    // Without lingering the agent is killed the moment this SSH session ends —
-    // which reads as a flaky agent, not as a configuration problem. It also
-    // creates `/run/user/$(id -u)`, so it must come before anything that talks
-    // to the user bus. Best-effort: some hosts gate it behind polkit, and
-    // failing it must not fail an otherwise good deploy.
+    // Without lingering the agent dies when this SSH session ends, which reads
+    // as a flaky agent rather than a configuration problem. It also creates
+    // `/run/user/$(id -u)`, so it must precede anything that talks to the user
+    // bus. Best-effort: some hosts gate it behind polkit, and failing it must
+    // not fail an otherwise good deploy.
     //
-    // A non-interactive SSH command often gets no `XDG_RUNTIME_DIR`, and
-    // without it every `systemctl --user` fails with "Failed to connect to
-    // bus". Set it only when the session did not supply one.
+    // A non-interactive SSH command often gets no `XDG_RUNTIME_DIR`, without
+    // which every `systemctl --user` fails with "Failed to connect to bus".
     script.push_str(
         r#"loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
 if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
@@ -404,14 +384,13 @@ fi
 "#,
     );
 
-    // Install the templated unit, reloading only when its content actually
-    // changed — a `daemon-reload` on every start is noise, and a missing one
-    // after a change silently runs the old unit.
+    // Install the templated unit, reloading only when its content changed — a
+    // `daemon-reload` per start is noise, and a missing one after a change
+    // silently runs the old unit.
     //
-    // The `@BUZZ_ACP_BIN@` substitution is shell parameter expansion rather
-    // than `sed`: `sed -i` is a GNU extension that BSD and macOS hosts reject,
-    // and any `sed` s/// would also need a delimiter no resolved path can
-    // contain. This has neither problem.
+    // `@BUZZ_ACP_BIN@` is substituted with parameter expansion rather than
+    // `sed`: `sed -i` is a GNU extension BSD and macOS hosts reject, and any
+    // `s///` would need a delimiter no resolved path can contain.
     script.push_str(&format!(
         r#"unit_file="$units/buzz-acp@.service"
 template=$(cat <<'BUZZ_UNIT_EOF'
@@ -429,7 +408,6 @@ systemctl --user enable --now {service} >/dev/null
 # rewritten env file rather than be left on the old one.
 systemctl --user restart {service}
 "#,
-        unit = unit,
         service = quote(&format!("buzz-acp@{slug}.service")),
     ));
     Ok(script)
@@ -508,8 +486,8 @@ mod tests {
 
     #[test]
     fn deploy_refuses_a_payload_whose_harness_pin_was_lost() {
-        // Correction C1: without the pin the host would fall back to
-        // `buzz-agent` and the user's harness choice would vanish silently.
+        // Without the pin the host would fall back to `buzz-agent` and the
+        // user's harness choice would vanish silently.
         let mut request = request();
         request["agent"]["agent_command"] = serde_json::json!("");
         let error = rejection(&request);
@@ -786,8 +764,8 @@ mod tests {
         let env_file = root.join(".config/buzz-acp").join(format!("{slug}.env"));
         let written = std::fs::read_to_string(&env_file).unwrap();
 
-        // The harness pin, resolved to an absolute path on the host — the
-        // durable form of correction C1.
+        // The harness pin, resolved to an absolute path on the host, and
+        // written where systemd re-reads it on every restart.
         assert!(
             written.contains(&format!(
                 "BUZZ_ACP_AGENT_COMMAND=\"{}\"",

@@ -65,18 +65,12 @@ fn run(request: &serde_json::Value) -> Result<serde_json::Value, String> {
         .ok_or("request is missing 'op'")?;
 
     // `info` is the only op that runs before a host is configured — it is what
-    // *produces* the host field — so it never opens a session.
-    if op == "info" {
-        return Ok(protocol::info_response());
-    }
-
-    // Reject an unknown op before opening a connection, so a typo costs a
-    // parse rather than an SSH handshake.
-    if !matches!(
-        op,
-        "check" | "discover_harnesses" | "probe_models" | "deploy"
-    ) {
-        return Err(format!("unsupported op '{op}'"));
+    // *produces* the host field — so it never opens a session. An unknown op is
+    // rejected here too, so a typo costs a parse rather than an SSH handshake.
+    match op {
+        "info" => return Ok(protocol::info_response()),
+        "check" | "discover_harnesses" | "probe_models" | "deploy" => {}
+        _ => return Err(format!("unsupported op '{op}'")),
     }
 
     let config = SshConfig::from_request(request)?;
@@ -84,7 +78,7 @@ fn run(request: &serde_json::Value) -> Result<serde_json::Value, String> {
 
     match op {
         "check" => discover::check(&session),
-        "discover_harnesses" => discover::discover_harnesses(request, &config, &session),
+        "discover_harnesses" => discover::discover_harnesses(&config, &session),
         "probe_models" => discover::probe_models(request, &config, &session),
         _ => deploy::deploy(request, &config, &session),
     }
