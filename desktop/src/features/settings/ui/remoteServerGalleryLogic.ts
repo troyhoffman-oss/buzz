@@ -41,10 +41,74 @@ export type RemoteServerEntry = {
   error: string | null;
 };
 
+/**
+ * What an unanswered `info` reads as.
+ *
+ * One constant because two different shapes of silence reach it — an explicit
+ * `ok: false`, and a query that settles with no response body at all — and one
+ * fact spelled two ways reads as two faults.
+ */
+export const PROVIDER_INFO_UNANSWERED =
+  "The provider did not answer its info request.";
+
+/**
+ * The part of a probe query this projection reads.
+ *
+ * Structural rather than react-query's own result type so the projection stays
+ * pure: it is the branch that decides whether a row spins, and `pnpm test` is
+ * bare `node --test` with no hook infrastructure to reach it through a
+ * component.
+ */
+export type RemoteServerProbeQuery = {
+  isPending: boolean;
+  error?: unknown;
+  data?: BackendProviderProbeResult | null;
+};
+
+/**
+ * Project each provider's probe query into the gallery's probe map.
+ *
+ * Every settled query lands somewhere. A query that resolves with no response
+ * body — a provider binary that prints bare `null` and exits 0 parses as a
+ * successful `Ok(Value::Null)` in `invoke_provider`, and its `ok` lookup is
+ * `None` rather than `Some(false)`, so nothing upstream rejects it — must read
+ * as a failure rather than fall through: an absent entry is indistinguishable
+ * from a probe still in flight (see `remoteServerEntries`), so the row would
+ * spin forever with no error, no timeout, and no way to learn the provider is
+ * broken.
+ */
+export function remoteServerProbes(
+  providers: readonly BackendProviderCandidate[],
+  results: readonly (RemoteServerProbeQuery | undefined)[],
+): Record<string, RemoteServerProbe> {
+  const probes: Record<string, RemoteServerProbe> = {};
+  providers.forEach((provider, index) => {
+    const result = results[index];
+    if (!result || result.isPending) {
+      probes[provider.id] = { status: "loading" };
+      return;
+    }
+    if (result.error) {
+      probes[provider.id] = {
+        status: "failed",
+        error:
+          result.error instanceof Error
+            ? result.error.message
+            : String(result.error),
+      };
+      return;
+    }
+    probes[provider.id] = result.data
+      ? { status: "ok", result: result.data }
+      : { status: "failed", error: PROVIDER_INFO_UNANSWERED };
+  });
+  return probes;
+}
+
 function probeError(probe: RemoteServerProbe | undefined): string | null {
   if (probe?.status === "failed") return probe.error;
   if (probe?.status === "ok" && !probe.result.ok) {
-    return "The provider did not answer its info request.";
+    return PROVIDER_INFO_UNANSWERED;
   }
   return null;
 }

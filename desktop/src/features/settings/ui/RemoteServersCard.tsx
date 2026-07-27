@@ -11,8 +11,8 @@ import { Spinner } from "@/shared/ui/spinner";
 
 import {
   type RemoteServerEntry,
-  type RemoteServerProbe,
   remoteServerEntries,
+  remoteServerProbes,
 } from "./remoteServerGalleryLogic";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
 
@@ -44,28 +44,10 @@ export function RemoteServersCard() {
   // `useQueries` returns a fresh array every render, so this is derived
   // directly rather than memoized — the projection is a map over a handful of
   // rows, and a memo keyed on an unstable array would never hit anyway.
-  const probes: Record<string, RemoteServerProbe> = {};
-  providers.forEach((provider, index) => {
-    const result = probeResults[index];
-    if (!result || result.isPending) {
-      probes[provider.id] = { status: "loading" };
-      return;
-    }
-    if (result.error) {
-      probes[provider.id] = {
-        status: "failed",
-        error:
-          result.error instanceof Error
-            ? result.error.message
-            : String(result.error),
-      };
-      return;
-    }
-    if (result.data)
-      probes[provider.id] = { status: "ok", result: result.data };
-  });
-
-  const entries = remoteServerEntries(providers, probes);
+  const entries = remoteServerEntries(
+    providers,
+    remoteServerProbes(providers, probeResults),
+  );
 
   return (
     <section

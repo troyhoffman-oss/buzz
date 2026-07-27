@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { remoteServerEntries } from "./remoteServerGalleryLogic.ts";
+import {
+  PROVIDER_INFO_UNANSWERED,
+  remoteServerEntries,
+  remoteServerProbes,
+} from "./remoteServerGalleryLogic.ts";
 
 function provider(id) {
   return { id, binaryPath: `/home/u/.local/bin/buzz-backend-${id}` };
@@ -62,10 +66,7 @@ describe("remoteServerEntries", () => {
       ssh: { status: "ok", result: { ok: false } },
     });
     assert.equal(entries[0].status, "unavailable");
-    assert.equal(
-      entries[0].error,
-      "The provider did not answer its info request.",
-    );
+    assert.equal(entries[0].error, PROVIDER_INFO_UNANSWERED);
   });
 
   it("ignores a name carried on an ok:false answer", () => {
@@ -115,6 +116,94 @@ describe("remoteServerEntries", () => {
       providers.map((entry) => entry.id),
       snapshot,
     );
+  });
+});
+
+describe("remoteServerProbes", () => {
+  it("reads a pending query as still in flight", () => {
+    assert.deepEqual(
+      remoteServerProbes([provider("ssh")], [{ isPending: true }]),
+      {
+        ssh: { status: "loading" },
+      },
+    );
+  });
+
+  it("reads a missing query slot as still in flight", () => {
+    assert.deepEqual(remoteServerProbes([provider("ssh")], []), {
+      ssh: { status: "loading" },
+    });
+  });
+
+  it("carries a settled response through", () => {
+    const result = { ok: true, name: "SSH", version: "0.4.26" };
+    assert.deepEqual(
+      remoteServerProbes(
+        [provider("ssh")],
+        [{ isPending: false, data: result }],
+      ),
+      { ssh: { status: "ok", result } },
+    );
+  });
+
+  it("reports a thrown error's message", () => {
+    assert.deepEqual(
+      remoteServerProbes(
+        [provider("ssh")],
+        [{ isPending: false, error: new Error("spawn ENOENT") }],
+      ),
+      { ssh: { status: "failed", error: "spawn ENOENT" } },
+    );
+  });
+
+  it("stringifies a non-Error rejection rather than dropping it", () => {
+    assert.deepEqual(
+      remoteServerProbes(
+        [provider("ssh")],
+        [{ isPending: false, error: "provider timed out" }],
+      ),
+      { ssh: { status: "failed", error: "provider timed out" } },
+    );
+  });
+
+  it("fails a settled query that carries no response instead of spinning forever", () => {
+    // A provider binary that prints bare `null` and exits 0 parses fine in
+    // `invoke_provider` and its `ok` lookup is not `Some(false)`, so it reaches
+    // here as a success with no body. Writing no entry would be read as
+    // "still probing" by remoteServerEntries — a permanent spinner with no
+    // error and no timeout.
+    for (const data of [null, undefined]) {
+      const probes = remoteServerProbes(
+        [provider("ssh")],
+        [{ data, isPending: false }],
+      );
+      assert.deepEqual(probes, {
+        ssh: { status: "failed", error: PROVIDER_INFO_UNANSWERED },
+      });
+      assert.equal(
+        remoteServerEntries([provider("ssh")], probes)[0].status,
+        "unavailable",
+      );
+    }
+  });
+
+  it("keys each provider to its own query by position", () => {
+    const probes = remoteServerProbes(
+      [provider("ssh"), provider("blox")],
+      [{ isPending: true }, { isPending: false, error: new Error("nope") }],
+    );
+    assert.equal(probes.ssh.status, "loading");
+    assert.equal(probes.blox.status, "failed");
+  });
+
+  it("gives every provider an entry, so no row can be silently absent", () => {
+    const providers = [provider("ssh"), provider("blox"), provider("zeta")];
+    const probes = remoteServerProbes(providers, [
+      { isPending: true },
+      { data: { ok: true }, isPending: false },
+      { data: null, isPending: false },
+    ]);
+    assert.deepEqual(Object.keys(probes).sort(), ["blox", "ssh", "zeta"]);
   });
 });
 
