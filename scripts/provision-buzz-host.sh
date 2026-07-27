@@ -9,12 +9,14 @@
 # assumes: see docs/remote-agents.md, "Host prerequisites". Safe to re-run —
 # every action is idempotent, and a fully provisioned host is a no-op.
 #
-# It does NOT install `buzz-acp` or any harness CLI. Harness CLIs have their own
-# installers and their own authentication, and stay an operator step. `buzz-acp`
-# the deploy op resolves — on the host's PATH or at ~/.local/bin/buzz-acp — and
-# *installs* when it resolves none and the desktop supplied a binary to push
-# (`BUZZ_ACP_PUSH_BINARY`, see docs/remote-agents.md). With no binary supplied,
-# deploy still fails with exit 90 and this preflight is what you run first.
+# It installs nothing itself. Harness CLIs have their own installers and their
+# own authentication, and stay an operator step. The two Buzz tools — `buzz-acp`
+# and the `buzz` CLI — the deploy op resolves on the host's PATH or in
+# ~/.local/bin, and *installs* when it resolves none and the desktop supplied a
+# binary to push (`BUZZ_ACP_PUSH_BINARY` / `BUZZ_CLI_PUSH_BINARY`, see
+# docs/remote-agents.md). With no binary supplied, a missing `buzz-acp` fails
+# the deploy with exit 90 — this preflight is what you run first — while a
+# missing `buzz` CLI only warns and the deploy continues.
 #
 # Exit 0 when the mandatory set is green (lingering, ~/.local/bin, systemd
 # --user); 1 otherwise. Everything else is reported as a note, never a failure.
@@ -124,7 +126,18 @@ else
   add_row "buzz-acp" "MISSING" "copy the release binary to ${LOCAL_BIN}/buzz-acp"
 fi
 
-# ---- 5. Harness CLIs --------------------------------------------------------
+# ---- 5. buzz CLI ------------------------------------------------------------
+# Reported, never installed — and never mandatory. Deploy pushes it when the
+# desktop supplies one, and without it the deploy only warns: agents cannot
+# reply with `buzz messages send` and degrade to slower replies.
+if command -v buzz >/dev/null 2>&1; then
+  add_row "buzz" "OK" "$(command -v buzz)"
+else
+  add_row "buzz" "MISSING" \
+    "deploy will push it, or copy the release binary to ${LOCAL_BIN}/buzz"
+fi
+
+# ---- 6. Harness CLIs --------------------------------------------------------
 # `discover_harnesses` probes the ACP ADAPTER name, not the vendor CLI, and the
 # adapter is what the deploy pins — but the adapter is a shim over the vendor
 # CLI, which carries the authentication. Both must be present, so both are
@@ -149,7 +162,7 @@ check_harness "claude" "claude-agent-acp" "claude" \
 check_harness "codex" "codex-acp" "codex" \
   "npm i -g @agentclientprotocol/codex-acp; curl -fsSL https://chatgpt.com/codex/install.sh | sh"
 
-# ---- 6. Tailscale (optional) ------------------------------------------------
+# ---- 7. Tailscale (optional) ------------------------------------------------
 # An enhancement, never a dependency: absence only costs the desktop's device
 # picker, and manual SSH is the unchanged fallback. So every branch here is a
 # note.
@@ -182,7 +195,7 @@ else
   add_row "tailscale" "NOTE" "not installed (optional; use plain SSH keys)"
 fi
 
-# ---- 7. systemd --user ------------------------------------------------------
+# ---- 8. systemd --user ------------------------------------------------------
 # The deploy's own workaround, mirrored: a non-interactive SSH command often
 # gets no XDG_RUNTIME_DIR, and without it every `systemctl --user` fails with
 # "Failed to connect to bus". Checking under the same assumption is the point —
@@ -216,7 +229,7 @@ printf '\n'
 
 if [ "${BLOCKERS}" -eq 0 ]; then
   note "Mandatory checks green. Deploy a remote agent from the Buzz desktop app."
-  note "Reminder: buzz-acp and the harness CLIs are installed separately."
+  note "Reminder: buzz-acp, the buzz CLI and the harness CLIs are installed separately."
   exit 0
 fi
 
