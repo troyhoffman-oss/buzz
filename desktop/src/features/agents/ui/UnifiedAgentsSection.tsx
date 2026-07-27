@@ -6,6 +6,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 
+import { resolveAgentAvatarUrl } from "@/features/agents/lib/agentAvatarUrl";
 import { resolveAgentCardModelLabel } from "@/features/agents/lib/agentCardModelLabel";
 import { agentLocationLabel } from "@/features/agents/lib/agentLocationLabel";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
@@ -293,9 +294,13 @@ function AgentPersonaCard({
   });
   const isActive = agent ? isManagedAgentActive(agent) : false;
   const profileQuery = useUserProfileQuery(agent?.pubkey);
-  const avatarUrl = agent
-    ? firstAvatarUrl(persona.avatarUrl, profileQuery.data?.avatarUrl)
-    : persona.avatarUrl;
+  const avatarUrl = resolveAgentAvatarUrl({
+    agent,
+    personaAvatarUrl: persona.avatarUrl,
+    // Only a spawned agent has published a profile; a persona alone shows what
+    // its definition carries.
+    profileAvatarUrl: agent ? profileQuery.data?.avatarUrl : null,
+  });
   const friendlyError = agent
     ? friendlyAgentLastError(agent.lastError, agent.lastErrorCode)?.copy
     : null;
@@ -389,6 +394,10 @@ function StandaloneAgentCard({
 }) {
   const title = agent.name;
   const profileQuery = useUserProfileQuery(agent.pubkey);
+  const avatarUrl = resolveAgentAvatarUrl({
+    agent,
+    profileAvatarUrl: profileQuery.data?.avatarUrl,
+  });
   const friendlyError = friendlyAgentLastError(
     agent.lastError,
     agent.lastErrorCode,
@@ -402,7 +411,7 @@ function StandaloneAgentCard({
       avatar={
         <AgentRuntimeAvatarControl
           activeTestId={`agent-runtime-active-${agent.pubkey}`}
-          avatarUrl={profileQuery.data?.avatarUrl}
+          avatarUrl={avatarUrl}
           errorLabel={friendlyError}
           errorTestId={`agent-runtime-error-${agent.pubkey}`}
           isActive={isActive}
@@ -416,7 +425,7 @@ function StandaloneAgentCard({
           onStart={() => onStartAgent(agent.pubkey)}
         />
       }
-      avatarUrl={profileQuery.data?.avatarUrl}
+      avatarUrl={avatarUrl}
       dataTestId={`managed-agent-${agent.pubkey}`}
       label={title}
       locationLabel={agentLocationLabel(agent.backend)}
@@ -446,16 +455,6 @@ function StandaloneAgentCard({
       }
     />
   );
-}
-
-function firstAvatarUrl(
-  ...candidates: Array<string | null | undefined>
-): string | null {
-  for (const candidate of candidates) {
-    const trimmed = candidate?.trim();
-    if (trimmed) return trimmed;
-  }
-  return null;
 }
 
 function NewAgentCard({
