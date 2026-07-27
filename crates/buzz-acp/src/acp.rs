@@ -914,12 +914,11 @@ impl AcpClient {
         let (Some(ask), Some(pending)) = (&self.elicitation, &self.pending_elicitation) else {
             return Ok(());
         };
-        let body = render_elicitation_field(
-            &pending.fields[pending.asking],
-            pending.asking,
-            pending.fields.len(),
-        );
-        if ask.publish(body).await {
+        let field = &pending.fields[pending.asking];
+        let total = pending.fields.len();
+        let body = render_elicitation_field(field, pending.asking, total);
+        let ask_tag = elicitation_ask_tag(field, pending.asking, total);
+        if ask.publish(body, ask_tag).await {
             return Ok(());
         }
         let Some(pending) = self.take_pending_elicitation() else {
@@ -2115,11 +2114,10 @@ fn permission_response_cancelled(id: &serde_json::Value) -> serde_json::Value {
     })
 }
 
-/// Marks a kind:9 whose body is an agent question, so richer clients can render
-/// it as a card. Clients that don't know the marker show the plain-text body
-/// below it, which is directly answerable — the same graceful-degradation
-/// contract `<!-- buzz:wave:v1 -->` already carries.
-const ELICITATION_MARKER: &str = "<!-- buzz:ask:v1 -->";
+/// Cap on the serialized `ask` tag payload. A question whose structure exceeds
+/// this is published body-only: the numbered list is already answerable, so a
+/// card is worth no risk to the event's size.
+const ASK_TAG_MAX_BYTES: usize = 4096;
 
 /// One selectable answer to an elicitation form field.
 struct ElicitationOption {
@@ -2246,15 +2244,58 @@ fn elicitation_options(schema: &serde_json::Value) -> Vec<ElicitationOption> {
         .collect()
 }
 
+/// Serialize one question's structure for the kind:9's `ask` tag, so a richer
+/// client can render it as a card instead of the numbered prose below it.
+///
+/// The tag — not a content marker — carries the machine-readable signal:
+/// a marker in the body renders literally on every client that doesn't know it
+/// (react-markdown turns an unrecognized HTML comment into a text node), while
+/// an unknown tag is simply ignored. The body stays the fallback contract:
+/// clients that ignore the tag show the same answerable numbered list they
+/// always did.
+///
+/// `label` is what a card sends back — `ElicitationField::select` resolves an
+/// option title case-insensitively, so a click needs no harness change.
+/// Returns `None` when the payload would exceed [`ASK_TAG_MAX_BYTES`].
+fn elicitation_ask_tag(
+    field: &ElicitationField,
+    index: usize,
+    total: usize,
+) -> Option<Vec<String>> {
+    let payload = serde_json::json!({
+        "v": 1,
+        "question": field.prompt,
+        "options": field
+            .options
+            .iter()
+            .map(|option| {
+                let mut entry = serde_json::json!({ "label": option.title });
+                if let Some(description) = &option.description {
+                    entry["description"] = serde_json::json!(description);
+                }
+                entry
+            })
+            .collect::<Vec<_>>(),
+        "multiSelect": field.ty == "array",
+        // A field with no options is free-text only; a paired `<name>_custom`
+        // sibling means an answer naming no option is still accepted.
+        "allowFreeText": field.options.is_empty() || field.custom.is_some(),
+        "index": index,
+        "total": total,
+    });
+    let json = serde_json::to_string(&payload).ok()?;
+    (json.len() <= ASK_TAG_MAX_BYTES).then(|| vec!["ask".to_owned(), json])
+}
+
 /// Render one question as the channel message body the owner answers.
 fn render_elicitation_field(field: &ElicitationField, index: usize, total: usize) -> String {
     use std::fmt::Write;
 
-    let mut body = String::from(ELICITATION_MARKER);
+    let mut body = String::new();
     if total > 1 {
-        let _ = write!(body, "\n_Question {} of {total}_", index + 1);
+        let _ = writeln!(body, "_Question {} of {total}_", index + 1);
     }
-    let _ = write!(body, "\n**{}**", field.prompt);
+    let _ = write!(body, "**{}**", field.prompt);
     for (position, option) in field.options.iter().enumerate() {
         let _ = write!(body, "\n{}. {}", position + 1, option.title);
         if let Some(description) = &option.description {
@@ -4237,7 +4278,10 @@ mod tests {
     fn elicitation_question_renders_an_actionable_fallback() {
         let fields = ask_fields();
         let body = render_elicitation_field(&fields[0], 0, 1);
-        assert!(body.starts_with(ELICITATION_MARKER));
+        assert!(
+            !body.contains("<!--"),
+            "no HTML comment may ride the body — a marker-blind client renders it literally: {body}"
+        );
         assert!(body.contains("**Which database?**"));
         assert!(body.contains("1. Postgres — mature"));
         assert!(body.contains("2. SQLite"));
@@ -4253,6 +4297,55 @@ mod tests {
         assert!(
             second_of_three.contains("Question 2 of 3"),
             "multi-question forms number the question the owner is on: {second_of_three}"
+        );
+    }
+
+    #[test]
+    fn elicitation_ask_tag_carries_the_card_structure() {
+        let fields = ask_fields();
+        let tag = elicitation_ask_tag(&fields[0], 1, 3).expect("a small form fits the tag");
+        assert_eq!(tag[0], "ask");
+        let payload: serde_json::Value =
+            serde_json::from_str(&tag[1]).expect("the tag value is JSON");
+        assert_eq!(payload["v"], 1);
+        assert_eq!(payload["question"], "Which database?");
+        // Labels, not wire values: a card echoes the label back and
+        // `ElicitationField::select` resolves it case-insensitively, so the
+        // answer path needs no harness change.
+        assert_eq!(payload["options"][0]["label"], "Postgres");
+        assert_eq!(payload["options"][0]["description"], "mature");
+        assert_eq!(payload["options"][1]["label"], "SQLite");
+        assert!(payload["options"][1].get("description").is_none());
+        assert_eq!(payload["multiSelect"], false);
+        assert_eq!(
+            payload["allowFreeText"], true,
+            "a paired `_custom` sibling accepts an answer naming no option"
+        );
+        assert_eq!(payload["index"], 1);
+        assert_eq!(payload["total"], 3);
+        assert!(
+            fields[0]
+                .select(payload["options"][0]["label"].as_str().unwrap())
+                .is_some(),
+            "every label the card offers must resolve back to an option"
+        );
+    }
+
+    #[test]
+    fn elicitation_ask_tag_is_dropped_when_it_would_bloat_the_event() {
+        let params = serde_json::json!({
+            "mode": "form",
+            "sessionId": "sess-test",
+            "message": "x".repeat(ASK_TAG_MAX_BYTES + 1),
+            "requestedSchema": {
+                "type": "object",
+                "properties": {"question_0": {"type": "string"}},
+            },
+        });
+        let fields = parse_elicitation_fields(&params).expect("form must parse");
+        assert!(
+            elicitation_ask_tag(&fields[0], 0, 1).is_none(),
+            "an oversized question publishes body-only rather than a huge tag"
         );
     }
 

@@ -174,6 +174,13 @@ thread** with an option number, an option label, or their own text —
 deliberately not siblings or allowlisted users, since the agent is asking a
 human. `!skip` declines and lets the turn continue without an answer.
 
+The question also carries an `["ask", <json>]` tag holding its structure
+(`question`, `options[{label, description?}]`, `multiSelect`, `allowFreeText`,
+`index`, `total`), so a richer client can render it as a clickable card. The
+card answers with an option **label**, which resolves exactly like a typed one —
+the numbered body stays the contract for every client that ignores the tag. A
+payload over 4 KiB is dropped and the question publishes body-only.
+
 The thread requirement is what keeps an answer unambiguous: an unthreaded
 message, or one addressed to a different agent in the same channel, reaches the
 agent as an ordinary prompt instead of being swallowed as the answer.

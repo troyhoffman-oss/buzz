@@ -608,12 +608,16 @@ impl ElicitationAsk {
     /// triggering event and p-tagging the owner so the question notifies, and
     /// arm the shared state so the owner's reply is routed back to this turn.
     ///
+    /// `extra_tag` carries the question's structure (the `ask` tag) for clients
+    /// that render a card; `content` remains the answerable fallback for the
+    /// rest.
+    ///
     /// Returns `false` when the question never reached the relay. Awaited
     /// rather than spawned so that failure is observable: a question nobody can
     /// see must abort the tool call within seconds instead of parking the turn
     /// until the hard cap. Stalling the read loop for the submit costs nothing
     /// — the agent is blocked on the answer and produces no output meanwhile.
-    pub(crate) async fn publish(&self, content: String) -> bool {
+    pub(crate) async fn publish(&self, content: String, extra_tag: Option<Vec<String>>) -> bool {
         let mentions: Vec<&str> = self.owner_pubkey.as_deref().into_iter().collect();
         let published = post_notice(
             &self.rest,
@@ -621,6 +625,7 @@ impl ElicitationAsk {
             &self.thread_tags,
             &content,
             &mentions,
+            extra_tag.as_slice(),
         )
         .await;
         match published {
@@ -4004,12 +4009,19 @@ pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str
 /// Returns the published event id (hex) on success and `None` on any failure,
 /// for the one caller that must act on it: an agent question nobody can see
 /// has to abort its tool call rather than park the turn.
+///
+/// `extra_tags` are appended verbatim (the agent question's `ask` structure).
+/// A tag the relay does not recognise is stored and delivered untouched — it
+/// is inside the signed event id, so it cannot be rewritten — while clients
+/// that don't know it ignore it and read `content`. A malformed tag is dropped
+/// rather than failing the notice: the body is the answerable contract.
 pub(crate) async fn post_notice(
     rest: &crate::relay::RestClient,
     channel_id: Uuid,
     thread_tags: &ThreadTags,
     content: &str,
     mentions: &[&str],
+    extra_tags: &[Vec<String>],
 ) -> Option<String> {
     let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
         let root_id = nostr::EventId::from_hex(root).ok()?;
@@ -4037,6 +4049,10 @@ pub(crate) async fn post_notice(
             return None;
         }
     };
+    let builder = extra_tags
+        .iter()
+        .filter_map(|parts| nostr::Tag::parse(parts.iter().map(String::as_str)).ok())
+        .fold(builder, nostr::EventBuilder::tag);
     let event = match builder.sign_with_keys(&rest.keys) {
         Ok(e) => e,
         Err(e) => {

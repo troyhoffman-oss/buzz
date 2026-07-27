@@ -3255,7 +3255,7 @@ fn spawn_notice(
     if let Some(rest) = rest_client {
         let rest = rest.clone();
         tokio::spawn(async move {
-            pool::post_notice(&rest, channel_id, &thread_tags, &content, &[]).await;
+            pool::post_notice(&rest, channel_id, &thread_tags, &content, &[], &[]).await;
         });
     }
 }
