@@ -4,6 +4,13 @@ import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import { cn } from "@/shared/lib/cn";
 import { IdentityInitialsAvatar } from "./IdentityInitialsAvatar";
 
+/**
+ * The card's secondary metadata lines — model, then location. One constant so
+ * the two lines cannot drift into two weights of "secondary".
+ */
+const SECONDARY_LINE_CLASS =
+  "min-w-0 truncate text-xs font-normal text-secondary-foreground/75";
+
 type AgentIdentityCardProps = {
   actions?: ReactNode;
   ariaLabel: string;
@@ -79,13 +86,11 @@ export function AgentIdentityCard({
           {label}
         </span>
         {modelLabel ? (
-          <span className="min-w-0 truncate text-xs font-normal text-secondary-foreground/75">
-            {modelLabel}
-          </span>
+          <span className={SECONDARY_LINE_CLASS}>{modelLabel}</span>
         ) : null}
         {locationLabel ? (
           <span
-            className="min-w-0 truncate text-xs font-normal text-secondary-foreground/75"
+            className={SECONDARY_LINE_CLASS}
             data-testid={`${dataTestId}-location`}
           >
             {locationLabel}

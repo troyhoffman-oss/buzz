@@ -326,6 +326,29 @@ export function personaModelOptionDescription(
     : trimmed;
 }
 
+/**
+ * One model option as the pickers take it.
+ *
+ * The zero-value id becomes `AUTO_MODEL_DROPDOWN_VALUE` because a dropdown
+ * cannot carry an empty value, and `description` is spread rather than assigned
+ * so an option without a secondary line carries no `description` key at all and
+ * stays deep-equal to the plain shape.
+ *
+ * `label` is a parameter because the inherit row is relabelled by its caller
+ * (`Use agent defaults (…)`), which is the only thing that ever differs between
+ * the two projections.
+ */
+export function personaModelDropdownOption(
+  option: PersonaModelOption,
+  label: string = option.label,
+): PersonaDropdownOption {
+  return {
+    label,
+    value: option.id || AUTO_MODEL_DROPDOWN_VALUE,
+    ...(option.description ? { description: option.description } : {}),
+  };
+}
+
 /** Returns the zero-value model option label.
  *
  * When a global model is configured, the empty-model option reads
@@ -364,11 +387,12 @@ export function buildTemplateModelDropdownOptions(
     !hasZeroValue && trimmedInheritedModel.length > 0
       ? [{ id: "", label: inheritedModelLabel }, ...modelOptions]
       : modelOptions;
-  return base.map((option) => ({
-    label: option.id === "" ? inheritedModelLabel : option.label,
-    value: option.id || AUTO_MODEL_DROPDOWN_VALUE,
-    ...(option.description ? { description: option.description } : {}),
-  }));
+  return base.map((option) =>
+    personaModelDropdownOption(
+      option,
+      option.id === "" ? inheritedModelLabel : option.label,
+    ),
+  );
 }
 
 /**

@@ -8,6 +8,7 @@ import {
   PERSONA_FIELD_CONTROL_CLASS,
   PERSONA_FIELD_SHELL_CLASS,
 } from "./agentConfigOptions";
+import { PersonaOptionRow } from "./PersonaOptionRow";
 
 type PersonaModelComboboxProps = {
   disabled?: boolean;
@@ -204,14 +205,7 @@ export function PersonaModelCombobox({
                       )}
                     />
                   </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate">{option.label}</span>
-                    {option.description ? (
-                      <span className="block truncate text-xs text-muted-foreground">
-                        {option.description}
-                      </span>
-                    ) : null}
-                  </span>
+                  <PersonaOptionRow option={option} />
                 </button>
               ))
             ) : (
