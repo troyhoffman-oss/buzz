@@ -1,4 +1,7 @@
-import { backendProviderLabels } from "@/features/agents/lib/backendProviderLabel";
+import {
+  backendProviderLabels,
+  NO_BACKEND_PROVIDER_HINT,
+} from "@/features/agents/lib/backendProviderLabel";
 import type { BackendProviderCandidate } from "@/shared/api/types";
 
 /**
@@ -15,17 +18,6 @@ export type RemoteRunNotice =
   | { kind: "pending" }
   | { kind: "ready"; message: string; providerLabels: string[] }
   | { kind: "hint"; message: string };
-
-/**
- * The hint shown when no provider is installed.
- *
- * Byte-identical to the create dialog's empty-state line
- * (`WhereToRunSection`), because it is the same fact stated in the same
- * vocabulary — a user who meets it twice should not have to work out whether
- * two different sentences describe two different things.
- */
-export const NO_BACKEND_PROVIDER_HINT =
-  "Install a backend provider to run agents on another machine.";
 
 /**
  * Project discovered providers into the setup step's location notice.

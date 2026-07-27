@@ -82,8 +82,3 @@ export function remoteServerEntries(
     return left.label.localeCompare(right.label);
   });
 }
-
-/** `"SSH 0.4.26"` — the label with its version, when there is one. */
-export function remoteServerVersionLabel(entry: RemoteServerEntry): string {
-  return entry.version ? `${entry.label} ${entry.version}` : entry.label;
-}

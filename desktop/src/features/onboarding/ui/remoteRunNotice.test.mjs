@@ -1,10 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import {
-  NO_BACKEND_PROVIDER_HINT,
-  remoteRunNotice,
-} from "./remoteRunNotice.ts";
+import { NO_BACKEND_PROVIDER_HINT } from "../../agents/lib/backendProviderLabel.ts";
+import { remoteRunNotice } from "./remoteRunNotice.ts";
 
 function provider(id) {
   return { id, binaryPath: `/usr/local/bin/buzz-backend-${id}` };

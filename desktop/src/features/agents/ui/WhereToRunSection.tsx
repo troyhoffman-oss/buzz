@@ -5,6 +5,7 @@ import {
   useBackendProvidersQuery,
   useManagedAgentsQuery,
 } from "@/features/agents/hooks";
+import { NO_BACKEND_PROVIDER_HINT } from "@/features/agents/lib/backendProviderLabel";
 import { addedExclusiveHarnessIds } from "@/features/agents/lib/exclusiveRemoteHarness";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import {
@@ -388,7 +389,7 @@ export function WhereToRunSection({
         />
         {!hasProviders ? (
           <p className="text-xs text-muted-foreground">
-            Install a backend provider to run agents on another machine.
+            {NO_BACKEND_PROVIDER_HINT}
           </p>
         ) : null}
       </div>

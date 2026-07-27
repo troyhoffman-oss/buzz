@@ -1,6 +1,16 @@
 import type { BackendProviderCandidate } from "@/shared/api/types";
 
 /**
+ * What every surface says when no provider is installed.
+ *
+ * One constant rather than the same sentence typed into the create dialog, the
+ * onboarding notice and the Settings gallery: a user meets this line in up to
+ * three places, and three spellings of one fact read as three different facts.
+ */
+export const NO_BACKEND_PROVIDER_HINT =
+  "Install a backend provider to run agents on another machine.";
+
+/**
  * How the app names a backend provider — the `buzz-backend-*` binary that runs
  * an agent on a machine other than this computer.
  *

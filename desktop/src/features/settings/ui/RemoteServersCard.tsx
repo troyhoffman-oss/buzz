@@ -5,6 +5,7 @@ import {
   useBackendProviderProbesQuery,
   useBackendProvidersQuery,
 } from "@/features/agents/hooks";
+import { NO_BACKEND_PROVIDER_HINT } from "@/features/agents/lib/backendProviderLabel";
 import { cn } from "@/shared/lib/cn";
 import { Spinner } from "@/shared/ui/spinner";
 
@@ -183,8 +184,9 @@ function RemoteServerCard({ entry }: { entry: RemoteServerEntry }) {
 /**
  * No provider installed — the common case, and the one that has to teach.
  *
- * The hint sentence is byte-identical to the create dialog's empty state and
- * the onboarding notice, so the same fact is stated once in one vocabulary.
+ * The hint sentence is the shared `NO_BACKEND_PROVIDER_HINT` the create dialog
+ * and the onboarding notice render, so the same fact is stated once in one
+ * vocabulary; this surface then adds the detail the others have no room for.
  */
 function RemoteServersEmptyState() {
   return (
@@ -192,7 +194,7 @@ function RemoteServersEmptyState() {
       className="rounded-2xl bg-muted/20 px-4 py-4 text-sm text-muted-foreground"
       data-testid="remote-server-empty"
     >
-      <p>Install a backend provider to run agents on another machine.</p>
+      <p>{NO_BACKEND_PROVIDER_HINT}</p>
       <p className="mt-2 text-xs">
         Providers are separate binaries named{" "}
         <span className="font-mono">buzz-backend-&lt;id&gt;</span>, discovered

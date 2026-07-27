@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import {
-  remoteServerEntries,
-  remoteServerVersionLabel,
-} from "./remoteServerGalleryLogic.ts";
+import { remoteServerEntries } from "./remoteServerGalleryLogic.ts";
 
 function provider(id) {
   return { id, binaryPath: `/home/u/.local/bin/buzz-backend-${id}` };
@@ -121,18 +118,19 @@ describe("remoteServerEntries", () => {
   });
 });
 
-describe("remoteServerVersionLabel", () => {
-  it("appends a version when there is one", () => {
+describe("version reporting", () => {
+  it("carries the probed version through for the row's pill", () => {
     const [entry] = remoteServerEntries([provider("ssh")], {
       ssh: okProbe(),
     });
-    assert.equal(remoteServerVersionLabel(entry), "SSH 0.4.26");
+    assert.equal(entry.version, "0.4.26");
   });
 
-  it("is just the label when the provider reports no version", () => {
+  it("is null when the provider reports no version", () => {
     const [entry] = remoteServerEntries([provider("ssh")], {
       ssh: okProbe({ version: undefined }),
     });
-    assert.equal(remoteServerVersionLabel(entry), "SSH");
+    assert.equal(entry.version, null);
+    assert.equal(entry.status, "ready");
   });
 });
