@@ -209,6 +209,15 @@ pub struct SessionState {
     /// fetch fails — all fail open. Cleared on session invalidation alongside
     /// `core_sections` so the next session picks up any canvas change.
     pub canvas_sections: HashMap<Uuid, String>,
+    /// Sessions dropped from the maps above and not yet released with
+    /// `session/close`.
+    ///
+    /// Invalidation is synchronous and reachable from a dozen call sites, but
+    /// the request that frees the agent's per-session resources is async and
+    /// needs the client exclusively. This queue is the seam: droppers stay
+    /// sync, and [`OwnedAgent::close_pending_sessions`] does the I/O wherever
+    /// an `&mut OwnedAgent` is already in hand.
+    pub pending_close: Vec<String>,
 }
 
 impl SessionState {
@@ -219,7 +228,7 @@ impl SessionState {
                 self.invalidate_channel(cid);
             }
             PromptSource::Heartbeat => {
-                self.heartbeat_session = None;
+                self.pending_close.extend(self.heartbeat_session.take());
                 self.heartbeat_turn_count = 0;
             }
         }
@@ -231,10 +240,20 @@ impl SessionState {
         self.turn_counts.remove(channel_id);
         self.core_sections.remove(channel_id);
         self.canvas_sections.remove(channel_id);
-        self.sessions.remove(channel_id).is_some()
+        match self.sessions.remove(channel_id) {
+            Some(session_id) => {
+                self.pending_close.push(session_id);
+                true
+            }
+            None => false,
+        }
     }
 
-    /// Invalidate all sessions and turn counters (e.g. after agent exit).
+    /// Invalidate all sessions and turn counters after the agent process died.
+    ///
+    /// Every caller reaches here from an exit or a hard timeout, so the
+    /// sessions are gone with the process: they are dropped rather than queued
+    /// for `session/close`, which would only spend a timeout on a dead stream.
     pub fn invalidate_all(&mut self) {
         self.sessions.clear();
         self.turn_counts.clear();
@@ -275,6 +294,10 @@ pub struct OwnedAgent {
     /// durable binding; method-not-found is cached as `Some(false)` so an agent
     /// without resume support (e.g. buzz-agent) costs one RPC per process.
     pub resume_supported: Option<bool>,
+    /// Whether the agent answered `session/close`. `None` probes on the first
+    /// retired session; method-not-found is cached as `Some(false)` so an agent
+    /// without close support costs one RPC per process.
+    pub close_supported: Option<bool>,
     /// Protocol version reported by the agent in its initialize response.
     pub protocol_version: u32,
 }
@@ -310,6 +333,70 @@ impl OwnedAgent {
             &self.agent_name,
             self.goose_system_prompt_supported,
         )
+    }
+
+    /// Release every session retired since the last drain with `session/close`.
+    ///
+    /// Best-effort by construction: a session is dropped from the queue when it
+    /// is taken, so no failure can make this retry forever, and every outcome
+    /// is logged rather than returned. Rotation exists to get a wedged channel
+    /// moving again — making it wait on the cleanup of the session it just
+    /// abandoned would invert that.
+    ///
+    /// A `-32601` answer means the agent has no close support; it is cached so
+    /// such an agent pays exactly one request for the life of the process. Any
+    /// other failure leaves the probe unresolved: it is evidence about this
+    /// request, not about the agent's capabilities.
+    pub async fn close_pending_sessions(&mut self) {
+        if self.close_supported == Some(false) {
+            self.state.pending_close.clear();
+            return;
+        }
+        while let Some(session_id) = self.state.pending_close.pop() {
+            match tokio::time::timeout(SESSION_CLOSE_TIMEOUT, self.acp.session_close(&session_id))
+                .await
+            {
+                Ok(Ok(())) => self.close_supported = Some(true),
+                Ok(Err(AcpError::AgentError { code: -32601, .. })) => {
+                    self.close_supported = Some(false);
+                    tracing::info!(
+                        target: "pool::session",
+                        "agent does not support session/close — retired sessions stay resident until it exits"
+                    );
+                    self.state.pending_close.clear();
+                    return;
+                }
+                // Application-level refusal (an unknown session, say): the
+                // agent is healthy, this one ID is simply not closeable. Drop
+                // it and keep draining the rest.
+                Ok(Err(error @ AcpError::AgentError { .. }))
+                | Ok(Err(error @ AcpError::Json(_))) => {
+                    tracing::warn!(
+                        target: "pool::session",
+                        "failed to close session {session_id}: {error}"
+                    );
+                }
+                // Transport-class: the stream is dead or desynchronized, so
+                // every remaining ID would just buy another timeout. Abandon
+                // the drain — the sessions die with the process either way.
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        target: "pool::session",
+                        "abandoning session close after transport error: {error}"
+                    );
+                    self.state.pending_close.clear();
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        target: "pool::session",
+                        "closing session {session_id} timed out after {SESSION_CLOSE_TIMEOUT:?}"
+                    );
+                    self.state.pending_close.clear();
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -1013,6 +1100,29 @@ impl AgentPool {
         count
     }
 
+    /// Release retired sessions on every idle agent.
+    ///
+    /// [`OwnedAgent::close_pending_sessions`] normally runs at the head of a
+    /// turn, which reaches an agent only when it next works. An agent whose
+    /// sessions were retired while idle — the channel-removal and idle
+    /// `!model`/`!rotate` paths — may not run again for hours, so the caller
+    /// drives this from its maintenance tick to bound how long those sessions
+    /// stay resident.
+    ///
+    /// Slots are swept concurrently because this runs on the main loop: each
+    /// agent is an independent subprocess, so serializing them would let one
+    /// wedged agent's `SESSION_CLOSE_TIMEOUT` stack up across the whole pool.
+    pub async fn close_idle_pending_sessions(&mut self) {
+        futures_util::future::join_all(
+            self.agents
+                .iter_mut()
+                .flatten()
+                .filter(|agent| !agent.state.pending_close.is_empty())
+                .map(OwnedAgent::close_pending_sessions),
+        )
+        .await;
+    }
+
     /// The model override in force for `channel_id`, if the channel's own agent
     /// is idle and carries one.
     ///
@@ -1101,6 +1211,11 @@ const CONTEXT_FETCH_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Timeout for model-switch requests (`session/set_config_option`, `session/set_model`).
 const MODEL_SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Timeout for one `session/close`. Closing cancels the session's in-flight
+/// work agent-side, so it is bounded well below the 60s default: this is
+/// cleanup running between turns, and a wedged agent must not hold the pool.
+const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bounded grace window for the post-cancel drain after a control-signal
 /// cancellation (steer fallback, interrupt, or explicit stop). This is a
@@ -1848,6 +1963,15 @@ pub async fn run_prompt_task(
         .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
         .unwrap_or_default();
     let _reaction_guard = ReactionGuard::new(ctx.rest_client.clone(), reaction_ids.clone());
+
+    // Release the sessions retired since this agent's last turn. Invalidation
+    // happens in a dozen sync places — several of them on the main loop, which
+    // must never block on the agent — so the close lands here instead: the one
+    // point where the agent is exclusively owned, already off the main loop,
+    // and about to talk to the harness anyway. Running it before the session
+    // resolves also means the freed slot is available to the session this turn
+    // is about to bind.
+    agent.close_pending_sessions().await;
 
     //
     // Core memory is delivered inside the system prompt the harness already
@@ -5606,6 +5730,7 @@ mod tests {
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             resume_supported: None,
+            close_supported: None,
             protocol_version: 2,
         };
 
@@ -5664,6 +5789,7 @@ mod tests {
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             resume_supported: None,
+            close_supported: None,
             protocol_version: 2,
         };
 
@@ -6024,6 +6150,7 @@ mod tests {
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             resume_supported: None,
+            close_supported: None,
             protocol_version: 2,
         }
     }
@@ -6331,6 +6458,126 @@ mod tests {
                 .is_some_and(|caps| caps.contains("haiku")),
             "the resumed session's catalog must populate the shared catalog"
         );
+        agent.acp.shutdown().await;
+    }
+
+    // ── close_pending_sessions ───────────────────────────────────────────────
+
+    /// An agent that appends every request it reads to `log` and answers each
+    /// with `reply`, so a test can assert what actually reached the wire.
+    async fn logging_agent(log: &std::path::Path, reply: &str) -> OwnedAgent {
+        scripted_agent(&format!(
+            r#"
+            id=0
+            while read -t 2 REQ; do
+                echo "$REQ" >> '{log}'
+                echo '{{"jsonrpc":"2.0","id":'"$id"',{reply}}}'
+                id=$((id+1))
+            done
+            "#,
+            log = log.display()
+        ))
+        .await
+    }
+
+    fn logged_requests(log: &std::path::Path) -> String {
+        std::fs::read_to_string(log).unwrap_or_default()
+    }
+
+    /// The defect: retiring a session dropped its ID with no `session/close`,
+    /// stranding the harness subprocess behind it for the agent's lifetime.
+    #[tokio::test]
+    async fn retiring_a_session_closes_it_on_the_agent() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("requests");
+        let channel = Uuid::new_v4();
+        let mut agent = logging_agent(&log, r#""result":{}"#).await;
+        agent.state.sessions.insert(channel, "ses_retired".into());
+
+        agent.state.invalidate_channel(&channel);
+        agent.close_pending_sessions().await;
+
+        let sent = logged_requests(&log);
+        assert!(
+            sent.contains(r#""method":"session/close""#) && sent.contains("ses_retired"),
+            "the retired session must be closed on the agent, got: {sent}"
+        );
+        assert_eq!(agent.close_supported, Some(true));
+        assert!(agent.state.pending_close.is_empty());
+        agent.acp.shutdown().await;
+    }
+
+    /// Every drop path funnels through `SessionState`, so the heartbeat session
+    /// and a whole-channel sweep must retire with the same close as a rotation.
+    #[tokio::test]
+    async fn heartbeat_and_channel_sweep_sessions_are_closed_too() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("requests");
+        let channel = Uuid::new_v4();
+        let mut agent = logging_agent(&log, r#""result":{}"#).await;
+        agent.state.sessions.insert(channel, "ses_swept".into());
+        agent.state.heartbeat_session = Some("ses_heartbeat".into());
+
+        agent.state.invalidate(&PromptSource::Heartbeat);
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        assert_eq!(pool.invalidate_channel_sessions(channel), 1);
+        pool.close_idle_pending_sessions().await;
+
+        let sent = logged_requests(&log);
+        assert!(
+            sent.contains("ses_heartbeat") && sent.contains("ses_swept"),
+            "both retired sessions must be closed, got: {sent}"
+        );
+        crate::shutdown_agent_slots(pool.agents_mut()).await;
+    }
+
+    /// An agent process that already exited takes its sessions with it, so the
+    /// `invalidate_all` family must not queue a close: the request would only
+    /// spend a timeout writing down a dead stream.
+    #[tokio::test]
+    async fn sessions_lost_with_the_process_are_not_closed() {
+        let mut state = SessionState::default();
+        state.sessions.insert(Uuid::new_v4(), "ses_gone".into());
+        state.heartbeat_session = Some("ses_hb_gone".into());
+
+        state.invalidate_all();
+
+        assert!(state.pending_close.is_empty());
+    }
+
+    /// An agent without close support must be probed once and never again —
+    /// the same contract `session/resume` holds. The scripted agent answers
+    /// every request, so a second probe would be visible in the log.
+    #[tokio::test]
+    async fn unsupported_close_is_probed_once_then_cached() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("requests");
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut agent = logging_agent(
+            &log,
+            r#""error":{"code":-32601,"message":"Method not found"}"#,
+        )
+        .await;
+        agent.state.sessions.insert(first, "ses_one".into());
+        agent.state.sessions.insert(second, "ses_two".into());
+
+        agent.state.invalidate_channel(&first);
+        agent.close_pending_sessions().await;
+        assert_eq!(
+            agent.close_supported,
+            Some(false),
+            "method-not-found is a normal answer, not an error"
+        );
+
+        agent.state.invalidate_channel(&second);
+        agent.close_pending_sessions().await;
+
+        let sent = logged_requests(&log);
+        assert!(
+            !sent.contains("ses_two"),
+            "the cached probe must suppress later closes, got: {sent}"
+        );
+        assert!(agent.state.pending_close.is_empty());
         agent.acp.shutdown().await;
     }
 
