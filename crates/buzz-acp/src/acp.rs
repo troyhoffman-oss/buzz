@@ -657,6 +657,24 @@ impl AcpClient {
         })
     }
 
+    /// Send `session/close` to release the agent-side resources of a session
+    /// this harness is done with.
+    ///
+    /// Per the ACP spec the agent cancels any in-flight work and frees the
+    /// session; for subprocess-backed adapters that is what terminates the
+    /// per-session harness child. Dropping a session ID without closing it
+    /// strands that child for the adapter's whole lifetime.
+    ///
+    /// Deliberately not `session/delete`: close releases the live session while
+    /// leaving the on-disk transcript intact, so a binding retained across the
+    /// close (a model switch, say) can still be resumed.
+    pub async fn session_close(&mut self, session_id: &str) -> Result<(), AcpError> {
+        let params = serde_json::json!({ "sessionId": session_id });
+        self.send_request("session/close", params).await?;
+        tracing::debug!(target: "acp::session", "session closed: {session_id}");
+        Ok(())
+    }
+
     /// Send Goose's custom system-prompt request after `session/new`.
     pub async fn session_set_goose_system_prompt(
         &mut self,

@@ -1910,6 +1910,11 @@ async fn tokio_main() -> Result<()> {
             last_maintenance = std::time::Instant::now();
             queue.compact_expired_state();
 
+            // Release sessions retired on agents that are idle and may stay
+            // that way. A working agent closes its own at the head of its next
+            // turn; this is the sweep for the ones that never get there.
+            pool.close_idle_pending_sessions().await;
+
             // Slot refill: spawn background tasks for empty slots whose
             // circuit breaker allows it. spawn_and_init runs off the main
             // loop so it never blocks event processing.
@@ -1960,6 +1965,7 @@ async fn tokio_main() -> Result<()> {
                         agent_name,
                         goose_system_prompt_supported: None,
                         resume_supported: None,
+                        close_supported: None,
                         protocol_version,
                     };
                     pool.return_agent(agent);
@@ -4049,6 +4055,7 @@ async fn initialize_agent_pool(
                             agent_name,
                             goose_system_prompt_supported: None,
                             resume_supported: None,
+                            close_supported: None,
                             protocol_version,
                         }));
                     }
@@ -4646,6 +4653,7 @@ mod owner_control_command_tests {
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             resume_supported: None,
+            close_supported: None,
             protocol_version: 2,
         }
     }
@@ -5662,6 +5670,7 @@ mod error_outcome_emission_tests {
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             resume_supported: None,
+            close_supported: None,
             // Error branches under test never read this; 1 is the legacy
             // non-systemPrompt path, the simplest valid value.
             protocol_version: 1,
