@@ -411,6 +411,10 @@ fn model_discovery_ignores_stale_record_for_linked_agent() {
     let global = crate::managed_agents::GlobalAgentConfig::default();
     let discovery = agent_model_discovery_config(&record, &personas, &global)
         .expect("discovery config should resolve for a linked record");
+    // The record carries no runtime id of its own, so the harness must resolve
+    // through the persona — asserted directly so a resolution regression reads
+    // as a wrong command rather than as missing GOOSE_* env below.
+    assert_eq!(discovery.command.as_str(), "goose");
     assert_eq!(discovery.model.as_deref(), Some("persona-model"));
     assert_eq!(discovery.provider.as_deref(), Some("anthropic"));
 
