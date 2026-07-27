@@ -90,7 +90,7 @@ export function RemoteServersCard() {
       )}
 
       {providersQuery.error instanceof Error ? (
-        <p className="rounded-2xl bg-destructive/10 px-4 py-4 text-sm text-destructive">
+        <p className="line-clamp-3 wrap-break-word rounded-2xl bg-destructive/10 px-4 py-4 text-sm text-destructive">
           {providersQuery.error.message}
         </p>
       ) : null}
@@ -147,8 +147,17 @@ function RemoteServerCard({ entry }: { entry: RemoteServerEntry }) {
         <p className="text-xs text-muted-foreground">{entry.description}</p>
       ) : null}
 
+      {/*
+        Clamped: this is the provider's own stderr, capped at 4 KiB by
+        `invoke_provider` and otherwise unbounded. A wrapper script dumping a
+        stack trace into a ~240px column would otherwise grow this card to
+        thousands of pixels and push every section below it off screen. Three
+        lines is the repo's idiom for an untrusted long string.
+      */}
       {entry.error ? (
-        <p className="text-xs text-muted-foreground">{entry.error}</p>
+        <p className="line-clamp-3 wrap-break-word text-xs text-muted-foreground">
+          {entry.error}
+        </p>
       ) : null}
 
       {/*
