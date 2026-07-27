@@ -83,6 +83,30 @@ test("a local record gains no fallback", () => {
   );
 });
 
+test("the record's own stamp is used before the harness mark", () => {
+  // The timeline has no definition to read, so it passes the record's stamped
+  // avatar. A local record was stamped at create time and must keep showing
+  // exactly that; a remote one was stamped with nothing, which is the gap.
+  const STAMPED = "app-avatar://claude";
+  assert.equal(
+    resolveAgentAvatarUrl({ agent: localAgent, recordAvatarUrl: STAMPED }),
+    STAMPED,
+  );
+  assert.equal(
+    resolveAgentAvatarUrl({ agent: remoteAgent, recordAvatarUrl: null }),
+    PRESET_LOGOS.hermes,
+  );
+  assert.equal(
+    resolveAgentAvatarUrl({
+      agent: remoteAgent,
+      profileAvatarUrl: PUBLISHED,
+      recordAvatarUrl: STAMPED,
+    }),
+    PUBLISHED,
+    "what the agent published about itself still outranks its stamp",
+  );
+});
+
 test("a never-spawned persona shows only what its definition carries", () => {
   assert.equal(
     resolveAgentAvatarUrl({ agent: undefined, personaAvatarUrl: CHOSEN }),

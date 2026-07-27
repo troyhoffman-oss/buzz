@@ -27,6 +27,7 @@ export function resolveAgentAvatarUrl({
   agent,
   personaAvatarUrl,
   profileAvatarUrl,
+  recordAvatarUrl,
 }: {
   /** The record, or `undefined` for a persona that has never been spawned. */
   agent:
@@ -36,8 +37,18 @@ export function resolveAgentAvatarUrl({
   personaAvatarUrl?: string | null;
   /** The avatar the running agent published about itself. */
   profileAvatarUrl?: string | null;
+  /**
+   * The avatar stamped onto the record when it was created — this computer's
+   * runtime avatar for a local agent, and empty for a remote one, which is the
+   * gap the harness mark below fills.
+   */
+  recordAvatarUrl?: string | null;
 }): string | null {
-  const chosen = firstNonEmpty(personaAvatarUrl, profileAvatarUrl);
+  const chosen = firstNonEmpty(
+    personaAvatarUrl,
+    profileAvatarUrl,
+    recordAvatarUrl,
+  );
   if (chosen) return chosen;
   // `null` for a local record, whose avatar was already stamped from this
   // computer's catalog at create time — its rendering must not change.
