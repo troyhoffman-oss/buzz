@@ -44,7 +44,6 @@ describe("remoteRunNotice", () => {
       providers: [provider("ssh")],
     });
     assert.equal(notice.kind, "ready");
-    assert.deepEqual(notice.providerLabels, ["ssh"]);
     assert.equal(
       notice.message,
       "ssh detected — pick a server when you create an agent.",

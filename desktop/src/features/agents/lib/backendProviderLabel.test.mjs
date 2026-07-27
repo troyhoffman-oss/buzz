@@ -46,17 +46,13 @@ describe("backendProviderLabels", () => {
     ]);
   });
 
-  it("uses probed names where they exist and ids elsewhere", () => {
+  it("sorts by the human order, not the code-point one", () => {
     const providers = [
-      { id: "ssh", binaryPath: "/usr/bin/buzz-backend-ssh" },
+      { id: "SSH", binaryPath: "/usr/bin/buzz-backend-ssh" },
       { id: "blox", binaryPath: "/usr/bin/buzz-backend-blox" },
     ];
-    // `localeCompare`, so the order is the human one ("blox" before "SSH")
-    // rather than the code-point one that would strand every capitalized
-    // provider name ahead of every lowercase id.
-    assert.deepEqual(backendProviderLabels(providers, { ssh: "SSH" }), [
-      "blox",
-      "SSH",
-    ]);
+    // `localeCompare`, so "blox" precedes "SSH" rather than every capitalized
+    // label being stranded ahead of every lowercase one.
+    assert.deepEqual(backendProviderLabels(providers), ["blox", "SSH"]);
   });
 });

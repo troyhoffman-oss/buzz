@@ -38,14 +38,16 @@ export function backendProviderLabel(
  * Sorted rather than left in discovery order because discovery walks `PATH`,
  * so the same two providers can come back in a different order between reads
  * and a hint line would reshuffle itself under the user.
+ *
+ * Ids only: its one caller is the onboarding notice, which renders before the
+ * user has asked anything of a provider and so has not paid for a probe. A
+ * surface that HAS probed names its rows through `backendProviderLabel`
+ * directly with the name it already holds (`remoteServerEntries`).
  */
 export function backendProviderLabels(
   providers: readonly BackendProviderCandidate[],
-  probedNames: Readonly<Record<string, string>> = {},
 ): string[] {
   return providers
-    .map((provider) =>
-      backendProviderLabel(provider.id, probedNames[provider.id]),
-    )
+    .map((provider) => backendProviderLabel(provider.id))
     .sort((left, right) => left.localeCompare(right));
 }

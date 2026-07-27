@@ -16,7 +16,7 @@ import type { BackendProviderCandidate } from "@/shared/api/types";
  */
 export type RemoteRunNotice =
   | { kind: "pending" }
-  | { kind: "ready"; message: string; providerLabels: string[] }
+  | { kind: "ready"; message: string }
   | { kind: "hint"; message: string };
 
 /**
@@ -40,6 +40,5 @@ export function remoteRunNotice(input: {
   return {
     kind: "ready",
     message: `${providerLabels.join(", ")} detected — pick a server when you create an agent.`,
-    providerLabels,
   };
 }
