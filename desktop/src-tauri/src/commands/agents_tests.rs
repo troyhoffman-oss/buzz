@@ -440,4 +440,9 @@ fn deploy_payload_carries_the_full_behavioral_quad() {
     assert_eq!(payload["model"], "gpt-x");
     assert_eq!(payload["provider"], "openai");
     assert_eq!(payload["relay_url"], "wss://relay.example");
+    // Both push seams are opt-in env vars: with neither set the payload must
+    // carry no path, so a provider reading them sees the same `None` it saw
+    // before the seams existed.
+    assert!(payload["buzz_acp_binary"].is_null());
+    assert!(payload["buzz_cli_binary"].is_null());
 }
