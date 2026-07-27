@@ -11,7 +11,9 @@ import {
   useStartManagedAgentMutation,
   useUpdateManagedAgentMutation,
 } from "@/features/agents/hooks";
+import { agentLocationLabel } from "@/features/agents/lib/agentLocationLabel";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
+import { providerRecordHarness } from "@/features/agents/lib/pinnedHarness";
 import type {
   ManagedAgent,
   RespondToMode,
@@ -26,12 +28,15 @@ import { Input } from "@/shared/ui/input";
 import { setManagedAgentAutoRestart } from "@/shared/api/tauriManagedAgents";
 import { EditAgentAdvancedFields } from "./EditAgentAdvancedFields";
 import {
+  EditAgentHarnessFields,
+  EditAgentPinnedModelField,
+} from "./EditAgentHarnessFields";
+import {
   AUTO_PROVIDER_DROPDOWN_VALUE,
   BLOCK_BUILD_HIDDEN_PROVIDER_IDS,
   CUSTOM_PROVIDER_DROPDOWN_VALUE,
   formatRuntimeOptionLabel,
   getDefaultLlmModelLabel,
-  getDefaultPersonaRuntime,
   getPersonaProviderOptions,
   isMissingRequiredDropdownField,
   NO_RUNTIME_DROPDOWN_VALUE,
@@ -43,6 +48,11 @@ import {
   sortPersonaRuntimes,
   type PersonaDropdownOption,
 } from "./agentConfigOptions";
+import {
+  resolveDialogRuntimeId,
+  resolveOriginalRuntimeSupportsProvider,
+  resolveProspectiveRuntimeId,
+} from "./editAgentRuntimeResolution";
 import {
   modelDropdownOptions as buildModelDropdownOptions,
   relayMeshModelPickerState,
@@ -106,6 +116,15 @@ export function AgentInstanceEditDialog({
   onOpenChange: (open: boolean) => void;
   onUpdated?: (agent: ManagedAgent) => void;
 }) {
+  // The record's own harness pin, or null when it runs on this computer. Every
+  // "read the record, not the local catalog" branch below hangs off this one
+  // question — see `providerRecordHarness`. Null keeps the local path
+  // byte-identical.
+  const pinnedHarness = providerRecordHarness(agent);
+  // Primitive so the memos below re-run on a real change, not on the new object
+  // identity every 5s poll hands them. `null` = local, `""` = a pinned host
+  // binary this app cannot name.
+  const pinnedRuntimeId = pinnedHarness && (pinnedHarness.id ?? "");
   const updateMutation = useUpdateManagedAgentMutation();
   const startMutation = useStartManagedAgentMutation();
   const runtimesQuery = useAcpRuntimesQuery({ enabled: open });
@@ -192,10 +211,13 @@ export function AgentInstanceEditDialog({
       setShowAdvancedFields(false);
       setIsAvatarUploadPending(false);
       runtimeTouched.current = false;
-      const matched =
-        runtimes.find((r) => r.command?.trim() === agent.agentCommand.trim()) ??
-        runtimes.find((r) => r.id === agent.agentCommand.trim());
-      setSelectedRuntimeId(matched ? matched.id : "custom");
+      setSelectedRuntimeId(
+        resolveDialogRuntimeId(
+          runtimes,
+          agent.agentCommand,
+          pinnedRuntimeId !== null,
+        ) ?? "custom",
+      );
       updateMutation.reset();
     }
   }, [open, agent.pubkey]);
@@ -205,13 +227,15 @@ export function AgentInstanceEditDialog({
     if (!open || runtimeTouched.current || runtimes.length === 0) {
       return;
     }
-    const matched =
-      runtimes.find((r) => r.command?.trim() === agent.agentCommand.trim()) ??
-      runtimes.find((r) => r.id === agent.agentCommand.trim());
+    const matched = resolveDialogRuntimeId(
+      runtimes,
+      agent.agentCommand,
+      pinnedRuntimeId !== null,
+    );
     if (matched) {
-      setSelectedRuntimeId(matched.id);
+      setSelectedRuntimeId(matched);
     }
-  }, [open, runtimes, agent.agentCommand]);
+  }, [open, runtimes, agent.agentCommand, pinnedRuntimeId]);
 
   // Build the sorted runtime catalog for the dropdown.
   const sortedRuntimes = React.useMemo(
@@ -247,53 +271,42 @@ export function AgentInstanceEditDialog({
     return options;
   }, [sortedRuntimes, selectedRuntimeId]);
 
-  // Resolve the dialog-opening command as the catalog loads. Edit-state runtime
-  // ids mutate during selection changes and cannot identify the original state.
-  const originalRuntimeSupportsProvider = React.useMemo(() => {
-    const originalCommand = originalAgentCommand.trim();
-    const matched =
-      runtimes.find((r) => r.command?.trim() === originalCommand) ??
-      runtimes.find((r) => r.id === originalCommand);
-    return runtimeSupportsLlmProviderSelection(matched?.id ?? "");
-  }, [runtimes, originalAgentCommand]);
+  // The provider capability of the runtime the dialog OPENED with — a pinned
+  // remote harness answers from its own id, never this computer's catalog.
+  const originalRuntimeSupportsProvider = React.useMemo(
+    () =>
+      pinnedRuntimeId !== null
+        ? runtimeSupportsLlmProviderSelection(pinnedRuntimeId)
+        : resolveOriginalRuntimeSupportsProvider(
+            runtimes,
+            originalAgentCommand,
+          ),
+    [pinnedRuntimeId, runtimes, originalAgentCommand],
+  );
 
-  // The runtime id that will actually be active after submit. When inheriting,
-  // resolve from the LINKED PERSONA's runtime — that is what will run once the
-  // override is cleared. Deriving from agent.agentCommand here is wrong for a
-  // pinned agent that just toggled "Inherit runtime from template": the override
-  // (e.g. a Claude pin) is still present on the record, so it would resolve to
-  // the old pin instead of the persona's runtime, hiding required credentials.
-  // Fall back to the agent.agentCommand dual-match (command path, then id) only
-  // when there is no linked persona or its runtime is unset. This single
-  // prospective id feeds BOTH the block-save gate (requiredEnvKeys) and the
-  // submit path so they never disagree on which runtime is being saved.
-  const prospectiveRuntimeId = React.useMemo(() => {
-    if (!inheritHarness) {
-      return selectedRuntime?.id ?? selectedRuntimeId;
-    }
-    const personaRuntimeId = linkedPersona?.runtime?.trim();
-    if (personaRuntimeId) {
-      return (
-        runtimes.find((r) => r.id === personaRuntimeId)?.id ?? personaRuntimeId
-      );
-    }
-    return (
-      runtimes.find((r) => r.command?.trim() === agent.agentCommand.trim())
-        ?.id ??
-      runtimes.find((r) => r.id === agent.agentCommand.trim())?.id ??
-      // Fall back to the app default runtime so discovery can run for agents
-      // whose persona has no runtime set (e.g. freshly-added catalog builtins).
-      getDefaultPersonaRuntime(runtimes)?.id ??
-      ""
-    );
-  }, [
-    inheritHarness,
-    linkedPersona?.runtime,
-    runtimes,
-    agent.agentCommand,
-    selectedRuntime?.id,
-    selectedRuntimeId,
-  ]);
+  // The runtime id that will actually be active after submit — the single value
+  // feeding BOTH the block-save credential gate and the submit path, so they can
+  // never disagree about which runtime is being saved. See
+  // `resolveProspectiveRuntimeId` for the remote/local split.
+  const prospectiveRuntimeId = React.useMemo(
+    () =>
+      resolveProspectiveRuntimeId({
+        runtimes,
+        pinnedRuntimeId,
+        inheritHarness,
+        personaRuntimeId: linkedPersona?.runtime,
+        agentCommand: agent.agentCommand,
+        selectedRuntimeId,
+      }),
+    [
+      runtimes,
+      pinnedRuntimeId,
+      inheritHarness,
+      linkedPersona?.runtime,
+      agent.agentCommand,
+      selectedRuntimeId,
+    ],
+  );
 
   const llmProviderFieldVisible =
     runtimeSupportsLlmProviderSelection(prospectiveRuntimeId);
@@ -408,7 +421,11 @@ export function AgentInstanceEditDialog({
   } = usePersonaModelDiscovery({
     envVars: envVarsForDiscovery,
     isCustomProviderEditing,
-    modelFieldVisible: true,
+    // Discovery runs a harness binary on THIS computer. For a pinned record
+    // that harness is on the host, so the probe would describe the wrong
+    // machine — and its credentials would be spent doing it. Stated here rather
+    // than left to the fact that a pinned record selects no local runtime.
+    modelFieldVisible: pinnedRuntimeId === null,
     open,
     provider: providerForDiscovery,
     selectedRuntime,
@@ -484,6 +501,13 @@ export function AgentInstanceEditDialog({
   }
 
   function handleRuntimeDropdownChange(nextValue: string) {
+    // A provider-backed record's harness lives on the host and is fixed when the
+    // agent is created, so no control renders the dropdown for one. The single
+    // remaining caller is the relay-mesh branch below, and a record that can
+    // reach it is already pinned to `buzz-agent` (relay-mesh is offered to no
+    // other pin). Running the body would overwrite that pin with THIS
+    // computer's buzz-agent path and default args, and deploy them to the host.
+    if (pinnedRuntimeId !== null) return;
     const nextRuntimeId =
       nextValue === NO_RUNTIME_DROPDOWN_VALUE ? "" : nextValue;
     const previousRuntimeId = selectedRuntimeId;
@@ -923,62 +947,21 @@ export function AgentInstanceEditDialog({
               variant="persona"
             />
 
-            {/* Provider (runtime) */}
-            <div className="space-y-1.5">
-              <label
-                className="text-sm font-medium text-foreground"
-                htmlFor="edit-agent-runtime"
-              >
-                Provider
-              </label>
-              <PersonaDropdownField
-                disabled={updateMutation.isPending}
-                id="edit-agent-runtime"
-                onValueChange={handleRuntimeDropdownChange}
-                options={runtimeDropdownOptions}
-                placeholder="Choose a provider"
-                value={runtimeDropdownValue}
-              />
-              {selectedRuntime ? (
-                <p className="text-xs text-muted-foreground">
-                  Detected at{" "}
-                  <span className="font-medium">
-                    {selectedRuntime.binaryPath ??
-                      selectedRuntime.command ??
-                      selectedRuntime.id}
-                  </span>
-                </p>
-              ) : null}
-            </div>
-            {selectedRuntimeId === "custom" && !inheritHarness ? (
-              <div className="space-y-1.5">
-                <label
-                  className="text-sm font-medium text-foreground"
-                  htmlFor="edit-agent-command"
-                >
-                  Agent command
-                </label>
-                <div
-                  className={cn(
-                    "flex min-h-11 items-center px-3",
-                    PERSONA_FIELD_SHELL_CLASS,
-                  )}
-                >
-                  <Input
-                    autoCorrect="off"
-                    className={cn(
-                      "h-8 px-0 py-0 leading-6",
-                      PERSONA_FIELD_CONTROL_CLASS,
-                    )}
-                    disabled={updateMutation.isPending}
-                    id="edit-agent-command"
-                    onChange={(event) => setAgentCommand(event.target.value)}
-                    placeholder="Full path or shell command"
-                    value={agentCommand}
-                  />
-                </div>
-              </div>
-            ) : null}
+            {/* Harness — the local catalog's dropdown, or this record's own pin */}
+            <EditAgentHarnessFields
+              agentCommand={agentCommand}
+              disabled={updateMutation.isPending}
+              locationLabel={agentLocationLabel(agent.backend)}
+              onAgentCommandChange={setAgentCommand}
+              onRuntimeChange={handleRuntimeDropdownChange}
+              pinnedHarness={pinnedHarness}
+              runtimeOptions={runtimeDropdownOptions}
+              runtimeValue={runtimeDropdownValue}
+              selectedRuntime={selectedRuntime}
+              showCommandInput={
+                selectedRuntimeId === "custom" && !inheritHarness
+              }
+            />
             {/* LLM provider */}
             {llmProviderFieldVisible ? (
               <div className="space-y-1.5">
@@ -1051,57 +1034,70 @@ export function AgentInstanceEditDialog({
               />
             ) : null}
 
-            {/* Model */}
-            <div className="space-y-1.5">
-              <label
-                className="text-sm font-medium text-foreground"
-                htmlFor="edit-agent-model"
-              >
-                Model
-                {modelRequired ? (
-                  <span className="ml-1 text-destructive" aria-hidden="true">
-                    *
-                  </span>
-                ) : (
-                  <span className={PERSONA_LABEL_OPTIONAL_CLASS}>Optional</span>
-                )}
-              </label>
-              <PersonaDropdownField
-                disabled={updateMutation.isPending || modelDiscoveryLoading}
-                id="edit-agent-model"
-                onValueChange={handleModelDropdownChange}
-                options={modelDropdownOptions}
-                placeholder="Default model"
-                value={modelSelectValue}
+            {/* Model — the host's catalog is unreachable, so a pinned record
+                names its own model instead of offering this computer's. */}
+            {pinnedHarness ? (
+              <EditAgentPinnedModelField
+                disabled={updateMutation.isPending}
+                harnessLabel={pinnedHarness.label}
+                model={model}
+                onModelChange={setModel}
+                required={modelRequired}
               />
-              {showCustomModelInput ? (
-                <div
-                  className={cn(
-                    "mt-2 flex min-h-11 items-center px-3",
-                    PERSONA_FIELD_SHELL_CLASS,
-                  )}
+            ) : (
+              <div className="space-y-1.5">
+                <label
+                  className="text-sm font-medium text-foreground"
+                  htmlFor="edit-agent-model"
                 >
-                  <Input
-                    aria-label="Custom model ID"
-                    autoCorrect="off"
+                  Model
+                  {modelRequired ? (
+                    <span className="ml-1 text-destructive" aria-hidden="true">
+                      *
+                    </span>
+                  ) : (
+                    <span className={PERSONA_LABEL_OPTIONAL_CLASS}>
+                      Optional
+                    </span>
+                  )}
+                </label>
+                <PersonaDropdownField
+                  disabled={updateMutation.isPending || modelDiscoveryLoading}
+                  id="edit-agent-model"
+                  onValueChange={handleModelDropdownChange}
+                  options={modelDropdownOptions}
+                  placeholder="Default model"
+                  value={modelSelectValue}
+                />
+                {showCustomModelInput ? (
+                  <div
                     className={cn(
-                      "h-8 px-0 py-0 leading-6",
-                      PERSONA_FIELD_CONTROL_CLASS,
+                      "mt-2 flex min-h-11 items-center px-3",
+                      PERSONA_FIELD_SHELL_CLASS,
                     )}
-                    disabled={updateMutation.isPending}
-                    id="edit-agent-custom-model"
-                    onChange={(event) => setModel(event.target.value)}
-                    placeholder="Custom model ID"
-                    value={model}
-                  />
-                </div>
-              ) : null}
-              {modelStatusMessage ? (
-                <p className="text-xs text-muted-foreground">
-                  {modelStatusMessage}
-                </p>
-              ) : null}
-            </div>
+                  >
+                    <Input
+                      aria-label="Custom model ID"
+                      autoCorrect="off"
+                      className={cn(
+                        "h-8 px-0 py-0 leading-6",
+                        PERSONA_FIELD_CONTROL_CLASS,
+                      )}
+                      disabled={updateMutation.isPending}
+                      id="edit-agent-custom-model"
+                      onChange={(event) => setModel(event.target.value)}
+                      placeholder="Custom model ID"
+                      value={model}
+                    />
+                  </div>
+                ) : null}
+                {modelStatusMessage ? (
+                  <p className="text-xs text-muted-foreground">
+                    {modelStatusMessage}
+                  </p>
+                ) : null}
+              </div>
+            )}
 
             <AgentAiDefaultsNotice
               onEditDefaults={() => setAiDefaultsOpen(true)}
