@@ -22,9 +22,11 @@ import type { ManagedAgent } from "@/shared/api/types";
  * table — a rival table names `codex-acp` today and misses whatever the Rust
  * catalog learns tomorrow, with no mirror test to catch the gap.
  *
- * Args are empty because these surfaces carry a bare command; an unrecognized
- * one falls through to itself, which is the honest answer for a name only its
- * author knows. Every call site already guards against a blank string.
+ * Args are empty because these surfaces carry a bare command, so nothing here
+ * narrows by profile; an unrecognized command falls through to itself, which is
+ * the honest answer for a name only its author knows. Every call site guards on
+ * the string being non-empty, and one that is only whitespace reads "Not
+ * configured" rather than rendering an invisible badge.
  */
 export function runtimeCommandLabel(command: string): string {
   return resolvePinnedHarness(command, []).label;
