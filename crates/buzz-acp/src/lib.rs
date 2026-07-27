@@ -62,7 +62,13 @@ fn is_subcommand(name: &str) -> bool {
 }
 
 /// Timeout for lightweight helper subcommands (spawn + initialize + model/method probes).
-const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// Matched to the 60s the normal agent-init path allows. The probe spawns the
+/// same adapter that path does, and a cold node adapter (e.g. `codex-acp`) on a
+/// busy host routinely needs more than a few seconds to reach `initialize` — a
+/// shorter budget here only means the probe fails where the real spawn would
+/// have succeeded.
+const MODELS_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Timeout for `buzz-acp authenticate`. Browser-based vendor auth can require
 /// human interaction, so it must not share the short probe timeout.
