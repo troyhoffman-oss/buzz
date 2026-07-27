@@ -277,10 +277,11 @@ missing. It is a preflight, not an installer.
    otherwise emits a warning and provisions the agent anyway. Not a prerequisite — but a host that
    satisfies it gets noticeably better agents.
 
-4. **At least one harness CLI**, named exactly as `discover_harnesses` probes it — the ACP adapter,
-   not the vendor CLI. `claude-agent-acp` or `claude-code-acp` for Claude Code, `codex-acp` for
-   Codex, `goose` for Goose, `cursor-agent`, `omp`, `grok`, `opencode`, `kimi`, `amp-acp`,
-   `hermes-acp`, `openclaw`, or `buzz-agent`.
+4. **At least one harness CLI**, named exactly as `discover_harnesses` probes it. Most harnesses
+   require only their ACP adapter: `codex-acp` for Codex, `goose` for Goose, `cursor-agent`, `omp`,
+   `grok`, `opencode`, `kimi`, `amp-acp`, `hermes-acp`, `openclaw`, or `buzz-agent`. Claude is the
+   deliberate exception: it requires both `claude-agent-acp` or `claude-code-acp` **and** the
+   vendor `claude` CLI whose stable launcher is bound into the adapter.
 
 5. **SSH key auth.** Every invocation is `BatchMode=yes`, so a password prompt is an immediate
    failure and never a hang. Add the desktop machine's public key to `~/.ssh/authorized_keys`, or
@@ -381,6 +382,7 @@ harness path, `git-credential-nostr`, `PATH` — are appended by the remote scri
 | var | value |
 |---|---|
 | `BUZZ_ACP_AGENT_COMMAND` | the pinned harness, resolved on the host with `command -v` |
+| `CLAUDE_CODE_EXECUTABLE` | for a Claude ACP adapter, `~/.local/bin/claude` when executable, otherwise the host's `claude` launcher resolved from `PATH` |
 | `PATH` | `$HOME/.local/bin:$PATH`, **expanded by the host's shell at deploy time** — see below |
 | `BUZZ_PRIVATE_KEY` | payload `private_key_nsec` |
 | `BUZZ_RELAY_URL`, `BUZZ_AUTH_TAG` | payload (auth tag omitted when absent) |
@@ -429,6 +431,16 @@ The lookup is keyed on the command's file name, so an absolute pin
 locally. Runtimes absent from the table declare no such vars in `KNOWN_ACP_RUNTIMES` either:
 Claude is `provider_locked`, and neither Claude nor Codex has a model env var. An unset payload
 field writes no key at all.
+
+Claude has one additional executable binding. When the pinned harness is
+`claude-agent-acp` or `claude-code-acp`, deploy prefers the stable
+`~/.local/bin/claude` launcher and otherwise resolves `claude` from the host's
+`PATH`, then writes it as `CLAUDE_CODE_EXECUTABLE`. This matches local desktop
+spawn behavior and prevents the adapter from silently using the point-in-time
+Claude binary bundled with its SDK dependency. The launcher path is preserved
+instead of dereferencing its native-install symlink, so newly spawned ACP
+children follow subsequent Claude Code updates. Deploy fails with exit 95
+before writing the unit when the adapter is present but the Claude CLI is not.
 
 `BUZZ_MANAGED_AGENT` is deliberately absent. It is the desktop's process-ownership marker for
 reclaiming orphaned local children; where systemd owns the lifecycle it would be actively
@@ -521,6 +533,11 @@ budget fires first and the desktop reports a provider timeout rather than an age
 **`harness <name> not found on the server's PATH` (exit 91).** The pinned harness is not installed
 under that name. Deploy stops before writing anything — no env file, no unit. Install the ACP
 adapter and re-run discovery so the pin names a binary that exists.
+
+**`Claude Code CLI not found in ~/.local/bin or on the server's PATH` (exit 95).** A Claude ACP
+adapter is installed, but the vendor CLI it drives is not. Install Claude Code through its native
+installer so `~/.local/bin/claude` exists, or put another `claude` launcher on the deploying
+shell's `PATH`, then redeploy. The adapter's bundled SDK binary is deliberately not used.
 
 **`Permission denied (publickey)`.** `BatchMode=yes` means SSH declined rather than prompting. Add
 the public key to `~/.ssh/authorized_keys`, or `tailscale set --ssh` on the host.

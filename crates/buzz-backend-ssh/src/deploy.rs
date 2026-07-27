@@ -32,6 +32,7 @@ const RESERVED_ENV_KEYS: &[&str] = &[
     "BUZZ_ACP_AGENT_COMMAND",
     "BUZZ_ACP_AGENT_ARGS",
     "BUZZ_ACP_MCP_COMMAND",
+    "CLAUDE_CODE_EXECUTABLE",
     "BUZZ_ACP_RESPOND_TO",
     "BUZZ_ACP_RESPOND_TO_ALLOWLIST",
     "BUZZ_ACP_AGENT_OWNER",
@@ -439,6 +440,17 @@ fn deploy_script(
         r#"harness_name={command}
 {resolve_acp}
 harness=$(command -v "$harness_name" 2>/dev/null) || {{ echo "harness $harness_name not found on the server's PATH" >&2; exit 91; }}
+claude_cli=""
+case "${{harness##*/}}" in
+  claude-agent-acp|claude-code-acp)
+    if [ -x "$HOME/.local/bin/claude" ]; then
+      claude_cli="$HOME/.local/bin/claude"
+    else
+      claude_cli=$(command -v claude 2>/dev/null || true)
+    fi
+    if [ -z "$claude_cli" ]; then echo "Claude Code CLI not found in ~/.local/bin or on the server's PATH" >&2; exit 95; fi
+    ;;
+esac
 {resolve_cli}
 cred=$(command -v git-credential-nostr 2>/dev/null || true)
 conf="$HOME/.config/buzz-acp"
@@ -481,6 +493,17 @@ tmp="$env_file.new"
     script.push_str("cat <<'BUZZ_ENV_EOF'\n");
     script.push_str(&env_file_body(agent)?);
     script.push_str("BUZZ_ENV_EOF\n");
+    // Match local desktop spawn's `configure_runtime_cli`: the adapter
+    // bundles a point-in-time Claude binary, while the native launcher follows
+    // Claude Code updates. Preserve the stable launcher path rather than
+    // resolving its symlink so every new ACP child inherits the current native
+    // version. This is emitted after the user-env heredoc as an authoritative
+    // provider binding; the key is also reserved so a payload cannot spoof it.
+    script.push_str(
+        "if [ -n \"$claude_cli\" ]; then\n\
+printf 'CLAUDE_CODE_EXECUTABLE=\"%s\"\\n' \"$claude_cli\"\n\
+fi\n",
+    );
     // Git over the relay's NIP-98 endpoint, only when the helper is installed.
     // NOSTR_PRIVATE_KEY mirrors BUZZ_PRIVATE_KEY, as it does locally.
     let helper_key = format!("credential.{relay_http}/git.helper");
@@ -718,6 +741,89 @@ mod tests {
         assert!(script.contains("exit 91"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn remote_claude_adapters_prefer_the_stable_native_launcher() {
+        for (index, adapter) in ["claude-agent-acp", "claude-code-acp"]
+            .into_iter()
+            .enumerate()
+        {
+            let root = sandbox_host(&format!("claude-cli-{index}"), HostAcp::Installed);
+            let bin = root.join("bin");
+            let adapter_path = seed_stub(&bin, adapter, "#!/bin/sh\nexit 0\n");
+            seed_stub(&bin, "claude", "#!/bin/sh\nexit 0\n");
+            let claude = seed_stub(&root.join(".local/bin"), "claude", "#!/bin/sh\nexit 0\n");
+
+            let mut request = request();
+            request["agent"]["agent_command"] = if index == 0 {
+                serde_json::json!(adapter)
+            } else {
+                serde_json::json!(adapter_path)
+            };
+            let agent = Agent::from_request(&request).unwrap();
+            let script =
+                deploy_script(&agent, &config(), UNIT_TEMPLATE, &Pushes::default()).unwrap();
+            let output = run_in_sandbox(&root, &script);
+            assert!(
+                output.status.success(),
+                "deploy script failed for {adapter}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let env_file = root
+                .join(".config/buzz-acp")
+                .join(format!("{}.env", agent.slug()));
+            let written = std::fs::read_to_string(env_file).unwrap();
+            assert!(
+                written.contains(&format!("CLAUDE_CODE_EXECUTABLE=\"{}\"", claude.display())),
+                "{written}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_claude_adapter_falls_back_to_the_hosts_path() {
+        let root = sandbox_host("claude-cli-path", HostAcp::Installed);
+        let bin = root.join("bin");
+        seed_stub(&bin, "claude-agent-acp", "#!/bin/sh\nexit 0\n");
+        let claude = seed_stub(&bin, "claude", "#!/bin/sh\nexit 0\n");
+
+        let mut request = request();
+        request["agent"]["agent_command"] = serde_json::json!("claude-agent-acp");
+        let agent = Agent::from_request(&request).unwrap();
+        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, &Pushes::default()).unwrap();
+        let output = run_in_sandbox(&root, &script);
+        assert!(output.status.success());
+
+        let written = std::fs::read_to_string(
+            root.join(".config/buzz-acp")
+                .join(format!("{}.env", agent.slug())),
+        )
+        .unwrap();
+        assert!(
+            written.contains(&format!("CLAUDE_CODE_EXECUTABLE=\"{}\"", claude.display())),
+            "{written}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_claude_adapter_requires_the_vendor_cli() {
+        let root = sandbox_host("claude-cli-missing", HostAcp::Installed);
+        seed_stub(&root.join("bin"), "claude-agent-acp", "#!/bin/sh\nexit 0\n");
+
+        let mut request = request();
+        request["agent"]["agent_command"] = serde_json::json!("claude-agent-acp");
+        let agent = Agent::from_request(&request).unwrap();
+        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, &Pushes::default()).unwrap();
+        let output = run_in_sandbox(&root, &script);
+
+        assert_eq!(output.status.code(), Some(95));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Claude Code CLI not found"));
+        assert!(!root.join(".config/buzz-acp").exists());
+    }
+
     /// A Hermes per-profile pin, end to end through the deploy path.
     ///
     /// `discover_harnesses` emits `["--profile", <name>, "acp"]`, and the args
@@ -864,7 +970,12 @@ mod tests {
 
     #[test]
     fn reserved_and_malformed_env_keys_are_refused() {
-        for key in ["BUZZ_PRIVATE_KEY", "buzz_relay_url", "BUZZ_MANAGED_AGENT"] {
+        for key in [
+            "BUZZ_PRIVATE_KEY",
+            "buzz_relay_url",
+            "BUZZ_MANAGED_AGENT",
+            "CLAUDE_CODE_EXECUTABLE",
+        ] {
             let mut request = request();
             request["agent"]["env_vars"] = serde_json::json!({ key: "x" });
             let error = env_file_body(&Agent::from_request(&request).unwrap()).unwrap_err();
@@ -1087,6 +1198,7 @@ mod tests {
         );
         assert!(written.contains(&format!("BUZZ_PRIVATE_KEY=\"{NSEC}\"")));
         assert!(written.contains("ANTHROPIC_API_KEY=\"sk-ant-secret\""));
+        assert!(!written.contains("CLAUDE_CODE_EXECUTABLE"));
         // The git block only lands because the stub helper exists, and it
         // carries the helper's resolved path.
         assert!(written.contains(&format!(
@@ -1284,6 +1396,17 @@ acp=$(command -v 'buzz-acp' 2>/dev/null || true)
 if [ -z "$acp" ] && [ -x "$HOME/.local/bin/buzz-acp" ]; then acp="$HOME/.local/bin/buzz-acp"; fi
 if [ -z "$acp" ]; then echo "buzz-acp not found on the server's PATH or in ~/.local/bin — install it, or set 'buzz-acp path on the server'" >&2; exit 90; fi
 harness=$(command -v "$harness_name" 2>/dev/null) || {{ echo "harness $harness_name not found on the server's PATH" >&2; exit 91; }}
+claude_cli=""
+case "${{harness##*/}}" in
+  claude-agent-acp|claude-code-acp)
+    if [ -x "$HOME/.local/bin/claude" ]; then
+      claude_cli="$HOME/.local/bin/claude"
+    else
+      claude_cli=$(command -v claude 2>/dev/null || true)
+    fi
+    if [ -z "$claude_cli" ]; then echo "Claude Code CLI not found in ~/.local/bin or on the server's PATH" >&2; exit 95; fi
+    ;;
+esac
 cli=$(command -v 'buzz' 2>/dev/null || true)
 if [ -z "$cli" ] && [ -x "$HOME/.local/bin/buzz" ]; then cli="$HOME/.local/bin/buzz"; fi
 if [ -z "$cli" ]; then echo "WARNING: no 'buzz' CLI on the server's PATH or in ~/.local/bin — agents on this host cannot reply with 'buzz messages send' and will degrade to slower replies; install it there, or set BUZZ_CLI_PUSH_BINARY on the desktop and redeploy" >&2; fi
@@ -1298,6 +1421,9 @@ printf 'BUZZ_ACP_AGENT_COMMAND="%s"\n' "$harness"
 printf 'PATH="%s"\n' "$HOME/.local/bin:$PATH"
 cat <<'BUZZ_ENV_EOF'
 {env}BUZZ_ENV_EOF
+if [ -n "$claude_cli" ]; then
+printf 'CLAUDE_CODE_EXECUTABLE="%s"\n' "$claude_cli"
+fi
 if [ -n "$cred" ]; then
 printf 'GIT_CONFIG_VALUE_0="%s"\n' "$cred"
 cat <<'BUZZ_GIT_EOF'
