@@ -670,11 +670,6 @@ const overrides = new Map([
   // lives in threading.ts (diffAddedMentionPubkeys); this is the minimal
   // composer-side wiring. Queued to split with the rest of this list.
   ["src/features/messages/ui/MessageComposer.tsx", 1114],
-  // global-agent-config: model-tuning section (BuzzAgentModelTuningFields via
-  // EditAgentAdvancedFields) + providerValid gate + effectiveProvider derivation
-  // + globalProvider threading into getPersonaProviderOptions. All load-bearing
-  // feature logic; queued to split with the rest of this list.
-  ["src/features/agents/ui/EditAgentDialog.tsx", 1088],
   // global-agent-config rebase over #1639: AgentInstanceEditDialog (renamed from
   // EditAgentDialog by #1639) gained initialFocus?/EditAgentFocusTarget prop
   // threading from the deep-link focus feature, and isEditAgentProviderSaveValid

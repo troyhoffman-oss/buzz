@@ -6,8 +6,8 @@ import path from "node:path";
  *
  * Each app supplies its own `rules` (which roots/extensions to scan) and an
  * optional `overrides` map of TEMP per-file ceilings. Everything else — the
- * walk, the line count, the violation report, the non-zero exit — lives here so
- * the two apps can never drift.
+ * walk, the line count, the violation report, the stale-override sweep, the
+ * non-zero exit — lives here so the apps can never drift.
  */
 
 async function walkFiles(directory) {
@@ -26,11 +26,17 @@ async function walkFiles(directory) {
   return files.flat();
 }
 
+/**
+ * Rule roots and override keys are authored with `/`, so paths are normalized
+ * to POSIX separators before either is matched — otherwise every lookup misses
+ * on Windows, where `path.relative` yields `\`.
+ */
+function toPosix(relativePath) {
+  return relativePath.split(path.sep).join("/");
+}
+
 function findRule(rules, relativePath) {
-  return rules.find((rule) => {
-    const normalizedRoot = `${rule.root}${path.sep}`;
-    return relativePath.startsWith(normalizedRoot);
-  });
+  return rules.find((rule) => relativePath.startsWith(`${rule.root}/`));
 }
 
 function countLines(content) {
@@ -69,9 +75,10 @@ export async function runFileSizeCheck({
   ).flat();
 
   const violations = [];
+  const unusedOverrides = new Set(overrides.keys());
 
   for (const filePath of candidateFiles) {
-    const relativePath = path.relative(projectRoot, filePath);
+    const relativePath = toPosix(path.relative(projectRoot, filePath));
     const rule = findRule(rules, relativePath);
     if (!rule) {
       continue;
@@ -82,6 +89,7 @@ export async function runFileSizeCheck({
       continue;
     }
 
+    unusedOverrides.delete(relativePath);
     const limit = overrides.get(relativePath) ?? rule.maxLines;
     const content = await fs.readFile(filePath, "utf8");
     const lineCount = countLines(content);
@@ -90,7 +98,10 @@ export async function runFileSizeCheck({
     }
   }
 
+  let failed = false;
+
   if (violations.length > 0) {
+    failed = true;
     console.error(`${label} file size check failed:`);
     for (const violation of violations) {
       console.error(
@@ -100,6 +111,22 @@ export async function runFileSizeCheck({
     console.error(
       `Split the file or add a narrowly scoped exception in \`${scriptPath}\`.`,
     );
+  }
+
+  // An override no scanned file claims is dead weight: the file was renamed,
+  // split, or deleted, and its ceiling now outlives the rationale next to it.
+  // Worse, it silently re-arms that stale ceiling if the path ever comes back.
+  // The ratchet only holds if every entry is live, so a stale key fails.
+  if (unusedOverrides.size > 0) {
+    failed = true;
+    console.error(`${label} file size check found stale overrides:`);
+    for (const relativePath of [...unusedOverrides].sort()) {
+      console.error(`- ${relativePath}: no such file under the scanned roots`);
+    }
+    console.error(`Remove the entry from \`${scriptPath}\`.`);
+  }
+
+  if (failed) {
     process.exit(1);
   }
 }
