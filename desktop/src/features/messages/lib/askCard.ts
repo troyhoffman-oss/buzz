@@ -19,6 +19,17 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 
 export const ASK_TAG_NAME = "ask";
 
+/**
+ * Upper bound on the options one card will render.
+ *
+ * The harness caps the serialized tag at 4 KiB, but the producer is not the
+ * trust boundary: any agent key can sign an `ask` tag, and the relay caps
+ * kind:9 *content* without capping tags. A buggy or hostile agent must not be
+ * able to turn one timeline row into thousands of buttons — over the bound the
+ * card is refused and the numbered body renders instead.
+ */
+export const ASK_MAX_OPTIONS = 20;
+
 export type AskOption = {
   label: string;
   description?: string;
@@ -72,7 +83,7 @@ export function parseAskTag(
   if (v !== 1 || typeof question !== "string" || question.length === 0) {
     return null;
   }
-  if (!Array.isArray(options)) return null;
+  if (!Array.isArray(options) || options.length > ASK_MAX_OPTIONS) return null;
 
   const parsedOptions: AskOption[] = [];
   for (const option of options) {
@@ -201,11 +212,44 @@ export function askRovingIndex(
 }
 
 /**
- * The message body a selection sends. Labels, not indices: the harness
- * resolves an option by 1-based number OR case-insensitive label
- * (`ElicitationField::select`), and a label survives the agent re-asking the
- * same form with the options reordered.
+ * The message body a multi-select confirmation sends: 1-based option numbers,
+ * comma-separated — exactly what the body's "Reply with the numbers
+ * (comma-separated)" instruction asks a typing owner for.
+ *
+ * Numbers, not labels, because `answer_elicitation_field` splits an array reply
+ * on `,` before resolving each token: a label containing a comma
+ * ("Yes, immediately") would split into tokens that match no option, and the
+ * agent would silently receive free strings instead of the option's wire value.
+ * `ElicitationField::select` resolves a 1-based index first, so numbers are
+ * unambiguous whatever the labels contain.
  */
-export function askReplyContent(labels: readonly string[]): string {
+export function askReplyContent(indices: readonly number[]): string {
+  return indices.map((index) => index + 1).join(", ");
+}
+
+/**
+ * What the answered row shows for a reply — the option labels behind it, so a
+ * numbered multi-select answer reads as "Postgres, SQLite" rather than "1, 2".
+ *
+ * Resolves each token the way the harness does (`ElicitationField::select`):
+ * 1-based index first, then a case-insensitive label match. A reply naming no
+ * option is free text and is shown verbatim, which is also what the agent
+ * received.
+ */
+export function askAnswerLabels(ask: AskQuestion, content: string): string {
+  const tokens = (ask.multiSelect ? content.split(",") : [content]).map(
+    (token) => token.trim(),
+  );
+  const labels = tokens.map((token) => {
+    const index = Number(token);
+    if (Number.isInteger(index) && index >= 1 && index <= ask.options.length) {
+      return ask.options[index - 1].label;
+    }
+    return (
+      ask.options.find(
+        (option) => option.label.toLowerCase() === token.toLowerCase(),
+      )?.label ?? token
+    );
+  });
   return labels.join(", ");
 }

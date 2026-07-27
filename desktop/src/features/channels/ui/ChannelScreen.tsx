@@ -792,52 +792,50 @@ export function ChannelScreen({
   );
   return (
     <AgentSessionProvider onOpenAgentSession={handleOpenAgentSession}>
-      <AskAnswersProvider
-        channelEvents={resolvedMessages}
-        threadReplyEvents={threadReplyEvents}
-      >
-        <ProfilePanelProvider onOpenProfilePanel={handleOpenProfilePanel}>
-          <WelcomeAgentCreateDialog
-            guideName={welcomeGuideAgent?.name ?? "your welcome guide"}
-            isSending={welcomeAgentCreate.isSending}
-            onCreateInChat={() => void welcomeAgentCreate.createInChat()}
-            onCreateManually={welcomeAgentCreate.createManually}
-            onOpenChange={welcomeAgentCreate.setIsOpen}
-            open={welcomeAgentCreate.isOpen}
-            sendError={welcomeAgentCreate.error}
-          />
-          <div
-            className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
-            ref={channelContentRef}
-          >
-            {activeChannel ? (
-              activeChannel.channelType === "forum" ? (
-                <ForumChannelContent
-                  canResetPanelWidth={canResetThreadPanelWidth}
-                  channel={activeChannel}
-                  currentPubkey={currentPubkey}
-                  header={channelHeader}
-                  onClosePost={onCloseForumPost}
-                  onCloseProfilePanel={handleCloseProfilePanel}
-                  onOpenDm={handleOpenDm}
-                  onOpenProfilePanel={handleOpenProfilePanel}
-                  onPanelResizeStart={handleThreadPanelResizeStart}
-                  onProfilePanelTabChange={setProfilePanelTab}
-                  onProfilePanelViewChange={setProfilePanelView}
-                  onResetPanelWidth={handleThreadPanelWidthReset}
-                  onSelectPost={onSelectForumPost}
-                  panelWidthPx={threadPanelWidthPx}
-                  profilePanelPubkey={profilePanelPubkey}
-                  profilePanelTab={profilePanelTab}
-                  profilePanelView={profilePanelView}
-                  selectedPostId={selectedForumPostId}
-                  targetReplyId={targetForumReplyId}
-                />
-              ) : (
-                <React.Suspense
-                  fallback={
-                    <ViewLoadingFallback includeHeader kind="channel" />
-                  }
+      <ProfilePanelProvider onOpenProfilePanel={handleOpenProfilePanel}>
+        <WelcomeAgentCreateDialog
+          guideName={welcomeGuideAgent?.name ?? "your welcome guide"}
+          isSending={welcomeAgentCreate.isSending}
+          onCreateInChat={() => void welcomeAgentCreate.createInChat()}
+          onCreateManually={welcomeAgentCreate.createManually}
+          onOpenChange={welcomeAgentCreate.setIsOpen}
+          open={welcomeAgentCreate.isOpen}
+          sendError={welcomeAgentCreate.error}
+        />
+        <div
+          className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+          ref={channelContentRef}
+        >
+          {activeChannel ? (
+            activeChannel.channelType === "forum" ? (
+              <ForumChannelContent
+                canResetPanelWidth={canResetThreadPanelWidth}
+                channel={activeChannel}
+                currentPubkey={currentPubkey}
+                header={channelHeader}
+                onClosePost={onCloseForumPost}
+                onCloseProfilePanel={handleCloseProfilePanel}
+                onOpenDm={handleOpenDm}
+                onOpenProfilePanel={handleOpenProfilePanel}
+                onPanelResizeStart={handleThreadPanelResizeStart}
+                onProfilePanelTabChange={setProfilePanelTab}
+                onProfilePanelViewChange={setProfilePanelView}
+                onResetPanelWidth={handleThreadPanelWidthReset}
+                onSelectPost={onSelectForumPost}
+                panelWidthPx={threadPanelWidthPx}
+                profilePanelPubkey={profilePanelPubkey}
+                profilePanelTab={profilePanelTab}
+                profilePanelView={profilePanelView}
+                selectedPostId={selectedForumPostId}
+                targetReplyId={targetForumReplyId}
+              />
+            ) : (
+              <React.Suspense
+                fallback={<ViewLoadingFallback includeHeader kind="channel" />}
+              >
+                <AskAnswersProvider
+                  channelEvents={resolvedMessages}
+                  threadReplyEvents={threadReplyEvents}
                 >
                   <ChannelPane
                     activeChannel={activeChannel}
@@ -965,22 +963,22 @@ export function ChannelScreen({
                     onJoinChannel={joinChannelMutation.mutateAsync}
                     typingPubkeys={humanTypingPubkeys}
                   />
-                </React.Suspense>
-              )
-            ) : (
-              <ChannelScreenEmptyState />
-            )}
-          </div>
-          <MembersSidebar
-            channel={activeChannel}
-            currentPubkey={currentPubkey}
-            open={isMembersSidebarOpen}
-            onOpenChange={setIsMembersSidebarOpen}
-            onViewActivity={handleOpenAgentSession}
-            relayUrl={activeCommunity?.relayUrl}
-          />
-        </ProfilePanelProvider>
-      </AskAnswersProvider>
+                </AskAnswersProvider>
+              </React.Suspense>
+            )
+          ) : (
+            <ChannelScreenEmptyState />
+          )}
+        </div>
+        <MembersSidebar
+          channel={activeChannel}
+          currentPubkey={currentPubkey}
+          open={isMembersSidebarOpen}
+          onOpenChange={setIsMembersSidebarOpen}
+          onViewActivity={handleOpenAgentSession}
+          relayUrl={activeCommunity?.relayUrl}
+        />
+      </ProfilePanelProvider>
     </AgentSessionProvider>
   );
 }

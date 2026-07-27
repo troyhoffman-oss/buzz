@@ -295,16 +295,23 @@ pub fn build_remove_member(channel_id: Uuid, target_pubkey: &str) -> Result<Even
 // ── Messages ─────────────────────────────────────────────────────────────────
 
 /// Kind 9 — stream message.
+///
+/// `broadcast` is the author's NIP-CW opt-in to surface a depth-1 reply on the
+/// channel timeline as well as in its thread (`["broadcast", "1"]`). Without
+/// it a reply lives only in the thread's own page, so no timeline-only reader
+/// can see it — see `buzz_sdk::build_message`, which carries the same flag.
+#[allow(clippy::too_many_arguments)]
 pub fn build_message(
     channel_id: Uuid,
     content: &str,
     thread_ref: Option<&ThreadRef>,
     mentions: &[&str],
+    broadcast: bool,
     media_tags: &[Vec<String>],
     custom_emoji_tags: &[Vec<String>],
     mention_ref_tags: &[Vec<String>],
 ) -> Result<EventBuilder, String> {
-    build_message_with_client_tags(
+    let builder = build_message_with_client_tags(
         channel_id,
         content,
         thread_ref,
@@ -313,7 +320,12 @@ pub fn build_message(
         custom_emoji_tags,
         mention_ref_tags,
         &[],
-    )
+    )?;
+    Ok(if broadcast {
+        builder.tag(tag(vec!["broadcast", "1"])?)
+    } else {
+        builder
+    })
 }
 
 /// Kind 9 — stream message with internal client marker tags.

@@ -4023,36 +4023,13 @@ pub(crate) async fn post_notice(
     mentions: &[&str],
     extra_tags: &[Vec<String>],
 ) -> Option<String> {
-    let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
-        let root_id = nostr::EventId::from_hex(root).ok()?;
-        let parent_id = thread_tags
-            .parent_event_id
-            .as_deref()
-            .and_then(|p| nostr::EventId::from_hex(p).ok())
-            .unwrap_or(root_id);
-        Some(buzz_sdk::ThreadRef {
-            root_event_id: root_id,
-            parent_event_id: parent_id,
-        })
-    });
-    let builder = match buzz_sdk::build_message(
-        channel_id,
-        content,
-        thread_ref.as_ref(),
-        mentions,
-        false,
-        &[],
-    ) {
+    let builder = match notice_builder(channel_id, thread_tags, content, mentions, extra_tags) {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(channel = %channel_id, "notice: build failed: {e}");
             return None;
         }
     };
-    let builder = extra_tags
-        .iter()
-        .filter_map(|parts| nostr::Tag::parse(parts.iter().map(String::as_str)).ok())
-        .fold(builder, nostr::EventBuilder::tag);
     let event = match builder.sign_with_keys(&rest.keys) {
         Ok(e) => e,
         Err(e) => {
@@ -4071,6 +4048,41 @@ pub(crate) async fn post_notice(
             None
         }
     }
+}
+
+/// The unsigned notice — split out so the tag set a question actually carries
+/// is assertable without a relay.
+fn notice_builder(
+    channel_id: Uuid,
+    thread_tags: &ThreadTags,
+    content: &str,
+    mentions: &[&str],
+    extra_tags: &[Vec<String>],
+) -> Result<nostr::EventBuilder, buzz_sdk::SdkError> {
+    let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
+        let root_id = nostr::EventId::from_hex(root).ok()?;
+        let parent_id = thread_tags
+            .parent_event_id
+            .as_deref()
+            .and_then(|p| nostr::EventId::from_hex(p).ok())
+            .unwrap_or(root_id);
+        Some(buzz_sdk::ThreadRef {
+            root_event_id: root_id,
+            parent_event_id: parent_id,
+        })
+    });
+    let builder = buzz_sdk::build_message(
+        channel_id,
+        content,
+        thread_ref.as_ref(),
+        mentions,
+        false,
+        &[],
+    )?;
+    Ok(extra_tags
+        .iter()
+        .filter_map(|parts| nostr::Tag::parse(parts.iter().map(String::as_str)).ok())
+        .fold(builder, nostr::EventBuilder::tag))
 }
 
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
@@ -4193,6 +4205,42 @@ mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use serde_json::json;
+
+    #[test]
+    fn a_question_carries_its_ask_tag_and_drops_a_malformed_one() {
+        let channel_id = Uuid::new_v4();
+        let thread_tags = ThreadTags::default();
+        let ask = vec!["ask".to_string(), "{\"v\":1}".to_string()];
+
+        let builder = notice_builder(
+            channel_id,
+            &thread_tags,
+            "1. Yes",
+            &[],
+            std::slice::from_ref(&ask),
+        )
+        .expect("the notice builds");
+        let event = builder
+            .sign_with_keys(&Keys::generate())
+            .expect("the notice signs");
+        // The card's whole contract: the structure rides on the signed event, so
+        // no relay or client can rewrite it away from the numbered body.
+        let carried = event
+            .tags
+            .iter()
+            .map(nostr::Tag::clone)
+            .find(|tag| tag.as_slice().first().map(String::as_str) == Some("ask"))
+            .expect("the ask tag is on the event");
+        assert_eq!(carried.as_slice(), ask.as_slice());
+
+        // A tag the parser rejects is dropped, not fatal — the body still answers.
+        let degraded = notice_builder(channel_id, &thread_tags, "1. Yes", &[], &[vec![]])
+            .expect("the notice still builds");
+        let degraded = degraded
+            .sign_with_keys(&Keys::generate())
+            .expect("the notice signs");
+        assert_eq!(degraded.content, "1. Yes");
+    }
 
     #[test]
     fn model_capabilities_list_both_halves_deduplicated() {

@@ -488,6 +488,7 @@ pub async fn send_channel_message(
     mention_tags: Option<Vec<Vec<String>>>,
     mention_pubkeys: Option<Vec<String>>,
     kind: Option<u32>,
+    broadcast: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<SendChannelMessageResponse, String> {
     let channel_uuid = uuid::Uuid::parse_str(&channel_id)
@@ -538,6 +539,7 @@ pub async fn send_channel_message(
                 content.trim(),
                 thread_ref.as_ref(),
                 &mention_refs,
+                broadcast.unwrap_or(false),
                 &media,
                 &emoji,
                 &mention_refs_only,

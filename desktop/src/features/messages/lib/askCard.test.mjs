@@ -10,7 +10,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  ASK_MAX_OPTIONS,
   askAcceleratorIndex,
+  askAnswerLabels,
   askReplyContent,
   askRovingIndex,
   buildAskAnswerIndex,
@@ -203,9 +205,36 @@ test("roving focus wraps in both directions", () => {
   assert.equal(askRovingIndex(0, 1, 0), 0);
 });
 
-test("multi-select replies join labels the way the harness splits them", () => {
-  // `answer_elicitation_field` splits an array reply on ',' and matches each
-  // token case-insensitively against option titles.
-  assert.equal(askReplyContent(["Postgres", "SQLite"]), "Postgres, SQLite");
-  assert.equal(askReplyContent(["Postgres"]), "Postgres");
+test("multi-select replies send option numbers, not labels", () => {
+  // `answer_elicitation_field` splits an array reply on ',' before resolving
+  // each token, so a label containing a comma would resolve to nothing.
+  // `ElicitationField::select` takes a 1-based index first, so numbers survive
+  // any label.
+  assert.equal(askReplyContent([0, 1]), "1, 2");
+  assert.equal(askReplyContent([0]), "1");
+});
+
+test("the answered row shows labels behind a numbered reply", () => {
+  const ask = parseAskTag(askTags({ multiSelect: true }));
+  assert.equal(askAnswerLabels(ask, "1, 2"), "Postgres, SQLite");
+  // Typed answers still resolve, and free text is shown as the agent got it.
+  assert.equal(askAnswerLabels(ask, "postgres"), "Postgres");
+  assert.equal(askAnswerLabels(ask, "9"), "9");
+  assert.equal(askAnswerLabels(ask, "neither, actually"), "neither, actually");
+});
+
+test("a card refuses more options than it will render", () => {
+  const options = Array.from({ length: ASK_MAX_OPTIONS }, (_, index) => ({
+    label: `option ${index}`,
+  }));
+  assert.equal(
+    parseAskTag(askTags({ options })).options.length,
+    ASK_MAX_OPTIONS,
+  );
+  // One over the bound falls back to the numbered body rather than painting a
+  // timeline row with unbounded buttons — the signing agent is not trusted.
+  assert.equal(
+    parseAskTag(askTags({ options: [...options, { label: "x" }] })),
+    null,
+  );
 });

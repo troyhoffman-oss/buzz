@@ -6,6 +6,7 @@ import { useAskAnswer } from "@/features/messages/AskAnswersContext";
 import {
   type AskQuestion,
   askAcceleratorIndex,
+  askAnswerLabels,
   askReplyContent,
   askRovingIndex,
   canAnswerAsk,
@@ -22,13 +23,29 @@ import { useQueryClient } from "@tanstack/react-query";
 const SKIP_REPLY = "!skip";
 
 /**
+ * How stale a question may be and still take the keyboard on mount.
+ *
+ * A card claims focus when the question *arrives*, not when its row happens to
+ * mount — scrolling back to an old question (or the virtualizer recycling its
+ * row) must never yank the caret out of the composer.
+ */
+const ASK_FOCUS_WINDOW_SECONDS = 60;
+
+/** Questions that have already taken the keyboard once, so a remount can't. */
+const focusClaimedQuestionIds = new Set<string>();
+
+/**
  * An agent's question, rendered as the clickable/keyboard-navigable card the
  * `["ask", …]` tag describes (`crates/buzz-acp/src/acp.rs`).
  *
  * Answering publishes an ordinary threaded reply whose content is exactly what
- * a typed answer would be — an option label, comma-joined labels for a
+ * a typed answer would be — an option label, the option numbers for a
  * multi-select, or `!skip` — so the harness's interception (thread-parent
- * match on the question's event id) resolves it with no special case.
+ * match on the question's event id) resolves it with no special case. The
+ * reply is a NIP-CW broadcast so it lands on the channel window too: the card
+ * derives "answered" from the timeline, which a thread-only reply never
+ * reaches, and an un-collapsed card invites a second click the harness can
+ * only read as a fresh prompt.
  *
  * Composed from `Button` and `Input`; the frame mirrors
  * `WorkflowApprovalCard` (bordered panel, disabled-while-pending actions) and
@@ -61,16 +78,42 @@ export function AskMessageCard({
   // prompt, so the controls must stay dead from the click, not from the ack.
   const [sending, setSending] = React.useState(false);
   const optionRefs = React.useRef<Array<HTMLButtonElement | null>>([]);
+  const freeTextRef = React.useRef<HTMLInputElement | null>(null);
 
   const answered = answer !== null;
   const disabled = !interactive || answered || sending;
+  const optionCount = ask.options.length;
+  // `ownerPubkey` is null until the profile batch resolves, so at first paint
+  // "not the owner" is not yet known — stay silent rather than tell the owner
+  // their own card is read-only for a frame.
+  let hint = "";
+  if (interactive) {
+    hint =
+      optionCount > 0
+        ? "↑↓ to move, 1–9 to pick, or reply in thread"
+        : "Enter to answer, or reply in thread";
+  } else if (message.ownerPubkey) {
+    hint = "Waiting on the channel owner";
+  }
 
   const send = React.useCallback(
     async (content: string) => {
       if (!channelId || !content.trim()) return;
       setSending(true);
       try {
-        await sendChannelMessage(channelId, content, questionId);
+        await sendChannelMessage(
+          channelId,
+          content,
+          questionId,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          // Broadcast: the answered state is read off the channel window, and
+          // a plain depth-1 reply is thread-only there (`NIP-CW`).
+          true,
+        );
         await refreshChannelWindowMessages(queryClient, channelId);
       } catch (error) {
         // Re-arm: nothing reached the relay, so the question is still open.
@@ -108,12 +151,28 @@ export function AskMessageCard({
     optionRefs.current[index]?.focus();
   }, []);
 
+  // Like Claude Code's picker, a question takes the keyboard the moment it
+  // arrives — otherwise the composer keeps focus and the accelerators below
+  // type digits into the draft instead. Once per question and only while it is
+  // fresh: scrolling back to an old card, or the virtualizer remounting this
+  // row, must never yank the caret out of the composer.
+  React.useEffect(() => {
+    if (disabled || focusClaimedQuestionIds.has(questionId)) return;
+    if (message.createdAt < Date.now() / 1000 - ASK_FOCUS_WINDOW_SECONDS) {
+      return;
+    }
+    focusClaimedQuestionIds.add(questionId);
+    // A question with nothing to click is answered in its own box.
+    if (optionCount > 0) focusOption(0);
+    else freeTextRef.current?.focus();
+  }, [disabled, focusOption, message.createdAt, optionCount, questionId]);
+
   // Arrow keys wrap and digits jump, matching `handleMentionKeyDown`
   // (useMentions.ts) — the app's one established list-navigation contract.
   const handleKeyDown = React.useCallback(
     (event: React.KeyboardEvent<HTMLDivElement>) => {
       if (disabled) return;
-      const count = ask.options.length;
+      const count = optionCount;
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         focusOption(
@@ -132,7 +191,7 @@ export function AskMessageCard({
         commit(accelerated);
       }
     },
-    [ask.options.length, commit, disabled, focusedIndex, focusOption],
+    [commit, disabled, focusedIndex, focusOption, optionCount],
   );
 
   if (answered) {
@@ -145,16 +204,15 @@ export function AskMessageCard({
         <span className="min-w-0 truncate">
           {answer.content === SKIP_REPLY
             ? "Skipped"
-            : `${interactive ? "You chose" : "Answered"}: ${answer.content}`}
+            : `${interactive ? "You chose" : "Answered"}: ${askAnswerLabels(ask, answer.content)}`}
         </span>
       </div>
     );
   }
 
   return (
-    // biome-ignore lint/a11y/useSemanticElements: a listbox of buttons, not a form control.
+    // biome-ignore lint/a11y/useSemanticElements: a group of options, not a `<fieldset>` — there is no form to belong to.
     <div
-      aria-label={ask.question}
       className="mt-1 max-w-md rounded-lg border border-border/70 bg-muted/30 p-3"
       data-testid="ask-card"
       onKeyDown={handleKeyDown}
@@ -214,6 +272,7 @@ export function AskMessageCard({
             void send(freeText);
           }}
           placeholder="Something else…"
+          ref={freeTextRef}
           value={freeText}
         />
       ) : null}
@@ -224,9 +283,7 @@ export function AskMessageCard({
             onClick={() =>
               void send(
                 askReplyContent(
-                  [...selected]
-                    .sort((left, right) => left - right)
-                    .map((index) => ask.options[index].label),
+                  [...selected].sort((left, right) => left - right),
                 ),
               )
             }
@@ -245,11 +302,7 @@ export function AskMessageCard({
         >
           Skip
         </Button>
-        <span className="ml-auto text-xs text-muted-foreground">
-          {interactive
-            ? "↑↓ to move, 1–9 to pick, or reply in thread"
-            : "Waiting on the channel owner"}
-        </span>
+        <span className="ml-auto text-xs text-muted-foreground">{hint}</span>
       </div>
     </div>
   );

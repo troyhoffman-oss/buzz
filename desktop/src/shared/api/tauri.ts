@@ -553,6 +553,12 @@ export async function sendChannelMessage(
   kind?: number,
   emojiTags?: string[][],
   mentionTags?: string[][],
+  /**
+   * NIP-CW opt-in surfacing a depth-1 reply on the channel timeline as well as
+   * in its thread. Without it the reply is thread-only, so a reader who never
+   * opens the thread cannot see it — and no timeline-derived state can either.
+   */
+  broadcast?: boolean,
 ): Promise<SendChannelMessageResult> {
   const response = await invokeTauri<RawSendChannelMessageResult>(
     "send_channel_message",
@@ -565,6 +571,7 @@ export async function sendChannelMessage(
       mentionTags: mentionTags ?? null,
       mentionPubkeys: mentionPubkeys ?? null,
       kind: kind ?? null,
+      broadcast: broadcast ?? null,
     },
   );
 

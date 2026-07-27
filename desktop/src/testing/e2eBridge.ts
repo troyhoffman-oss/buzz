@@ -8120,6 +8120,7 @@ async function handleSendChannelMessage(
     mentionPubkeys?: string[];
     mediaTags?: string[][] | null;
     emojiTags?: string[][] | null;
+    broadcast?: boolean | null;
   },
   config: E2eConfig | undefined,
 ): Promise<RawSendChannelMessageResponse> {
@@ -8139,8 +8140,14 @@ async function handleSendChannelMessage(
   // relay echoes them back on the stored event too, so mirror that here so the
   // emoji renderer keeps resolving `:shortcode:` after the round-trip.
   const emojiTags = args.emojiTags ?? [];
-  // Both kinds end up on the stored event's tag set, just like the real relay.
-  const extraTags = [...mediaTags, ...emojiTags];
+  // Both kinds end up on the stored event's tag set, just like the real relay,
+  // as does the NIP-CW broadcast opt-in that promotes a depth-1 reply onto the
+  // channel timeline.
+  const extraTags = [
+    ...mediaTags,
+    ...emojiTags,
+    ...(args.broadcast ? [["broadcast", "1"]] : []),
+  ];
   const identity = getIdentity(config);
   if (!identity) {
     const createdAt = Math.floor(Date.now() / 1000);
