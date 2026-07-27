@@ -49,12 +49,16 @@ type PersonaLlmProviderId = (typeof KNOWN_LLM_PROVIDER_IDS)[number];
 export type PersonaModelOption = {
   id: string;
   label: string;
+  /** Secondary line under the label, verbatim from the adapter. */
+  description?: string;
 };
 
 export type PersonaDropdownOption = {
   disabled?: boolean;
   label: string;
   value: string;
+  /** Secondary line under the label, when the option carries one. */
+  description?: string;
 };
 
 /**
@@ -300,6 +304,28 @@ export function getDefaultLlmProviderLabel(
     : "Select a provider\u2026";
 }
 
+/**
+ * The secondary line to show under a model option's label, or `undefined` for
+ * none.
+ *
+ * Adapters put the identifying detail in `description` and only the family in
+ * `name` — `claude-agent-acp` reports name "Opus" with description
+ * "Opus 4.7 · Best for everyday…", so a label-only row cannot tell two entries
+ * of different major versions apart. Nothing here parses the text: it is the
+ * adapter's own sentence, shown verbatim, minus the case where it merely
+ * repeats the label and would be pure noise.
+ */
+export function personaModelOptionDescription(
+  description: string | null | undefined,
+  label: string,
+): string | undefined {
+  const trimmed = (description ?? "").trim();
+  if (trimmed.length === 0) return undefined;
+  return trimmed.toLowerCase() === label.trim().toLowerCase()
+    ? undefined
+    : trimmed;
+}
+
 /** Returns the zero-value model option label.
  *
  * When a global model is configured, the empty-model option reads
@@ -341,6 +367,7 @@ export function buildTemplateModelDropdownOptions(
   return base.map((option) => ({
     label: option.id === "" ? inheritedModelLabel : option.label,
     value: option.id || AUTO_MODEL_DROPDOWN_VALUE,
+    ...(option.description ? { description: option.description } : {}),
   }));
 }
 

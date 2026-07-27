@@ -204,7 +204,14 @@ export function PersonaModelCombobox({
                       )}
                     />
                   </span>
-                  <span className="truncate">{option.label}</span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate">{option.label}</span>
+                    {option.description ? (
+                      <span className="block truncate text-xs text-muted-foreground">
+                        {option.description}
+                      </span>
+                    ) : null}
+                  </span>
                 </button>
               ))
             ) : (

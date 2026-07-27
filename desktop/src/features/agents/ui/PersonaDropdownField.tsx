@@ -88,7 +88,14 @@ export function PersonaDropdownField({
                   key={option.value}
                   value={option.value}
                 >
-                  <span className="truncate">{option.label}</span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate">{option.label}</span>
+                    {option.description ? (
+                      <span className="block truncate text-xs text-muted-foreground">
+                        {option.description}
+                      </span>
+                    ) : null}
+                  </span>
                 </DropdownMenuRadioItem>
               ))}
             </DropdownMenuRadioGroup>

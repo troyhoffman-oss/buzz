@@ -78,6 +78,7 @@ export function modelDropdownOptions({
       ? options.map((option) => ({
           label: option.label,
           value: option.id || AUTO_MODEL_DROPDOWN_VALUE,
+          ...(option.description ? { description: option.description } : {}),
         }))
       : buildTemplateModelDropdownOptions(
           options,
