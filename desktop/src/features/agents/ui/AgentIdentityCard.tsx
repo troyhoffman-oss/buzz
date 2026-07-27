@@ -11,6 +11,11 @@ type AgentIdentityCardProps = {
   avatarUrl?: string | null;
   dataTestId: string;
   label: string;
+  /**
+   * Where the agent runs ("on ssh"), for provider-backed records only.
+   * `null`/absent for a local agent — see `agentLocationLabel`.
+   */
+  locationLabel?: string | null;
   modelLabel?: string | null;
   onClick: () => void;
   /** Optional badge rendered below the label (e.g. "Restart required"). */
@@ -24,6 +29,7 @@ export function AgentIdentityCard({
   avatarUrl,
   dataTestId,
   label,
+  locationLabel,
   modelLabel,
   onClick,
   statusBadge,
@@ -75,6 +81,14 @@ export function AgentIdentityCard({
         {modelLabel ? (
           <span className="min-w-0 truncate text-xs font-normal text-secondary-foreground/75">
             {modelLabel}
+          </span>
+        ) : null}
+        {locationLabel ? (
+          <span
+            className="min-w-0 truncate text-xs font-normal text-secondary-foreground/75"
+            data-testid={`${dataTestId}-location`}
+          >
+            {locationLabel}
           </span>
         ) : null}
         {statusBadge}

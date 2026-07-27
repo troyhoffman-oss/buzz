@@ -11,6 +11,7 @@ import {
   UserRound,
 } from "lucide-react";
 import * as React from "react";
+import { agentRunsOnLabel } from "@/features/agents/lib/agentLocationLabel";
 import { AgentStatusBadge } from "@/features/agents/ui/AgentStatusBadge";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 import { copyTextToClipboard } from "@/shared/lib/clipboard";
@@ -51,7 +52,7 @@ const AGENT_INFO_LABELS = new Set([
   "NIP-05",
   "Agent type",
   "Capabilities",
-  "Backend",
+  "Runs on",
 ]);
 const AGENT_SETTINGS_LABELS = new Set([
   "Runtime",
@@ -362,13 +363,18 @@ export function buildOwnerFields({
     });
   }
 
-  if (managedAgent?.backend.type === "provider") {
-    const backendLabel = managedAgent.backend.id;
+  // Where the agent runs. Provider-backed only: a local agent runs on this
+  // computer, which is the assumption a reader already holds, so stating it
+  // would add a row that carries no information (see `agentRunsOnLabel`).
+  // Labelled "Runs on" rather than "Backend" because the panel is read by
+  // someone asking where their agent lives, not which internal seam serves it.
+  const runsOnLabel = agentRunsOnLabel(managedAgent?.backend);
+  if (runsOnLabel) {
     fields.push({
-      copyValue: backendLabel,
-      displayValue: backendLabel,
+      copyValue: runsOnLabel,
+      displayValue: runsOnLabel,
       icon: Server,
-      label: "Backend",
+      label: "Runs on",
       testId: "user-profile-backend",
     });
   }

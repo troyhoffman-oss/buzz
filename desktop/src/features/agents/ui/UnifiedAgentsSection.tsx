@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 
 import { resolveAgentCardModelLabel } from "@/features/agents/lib/agentCardModelLabel";
+import { agentLocationLabel } from "@/features/agents/lib/agentLocationLabel";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
 import {
   isManagedAgentActive,
@@ -337,6 +338,9 @@ function AgentPersonaCard({
       avatarUrl={avatarUrl}
       dataTestId={`persona-agent-row-${persona.id}`}
       label={title}
+      // Only a materialized agent has a backend. A definition that has never
+      // been started has no location yet — where it runs is chosen at create.
+      locationLabel={agentLocationLabel(agent?.backend)}
       modelLabel={modelLabel}
       onClick={() => {
         if (agent) {
@@ -415,6 +419,7 @@ function StandaloneAgentCard({
       avatarUrl={profileQuery.data?.avatarUrl}
       dataTestId={`managed-agent-${agent.pubkey}`}
       label={title}
+      locationLabel={agentLocationLabel(agent.backend)}
       modelLabel={resolveAgentCardModelLabel({
         agent,
         personaModel: null,
