@@ -157,7 +157,12 @@ check_harness() { # label, adapter command, vendor cli, install hint
   fi
 }
 
-check_harness "claude" "claude-agent-acp" "claude" \
+CLAUDE_ACP_ADAPTER="claude-agent-acp"
+if ! command -v "${CLAUDE_ACP_ADAPTER}" >/dev/null 2>&1 &&
+  command -v claude-code-acp >/dev/null 2>&1; then
+  CLAUDE_ACP_ADAPTER="claude-code-acp"
+fi
+check_harness "claude" "${CLAUDE_ACP_ADAPTER}" "claude" \
   "npm i -g @agentclientprotocol/claude-agent-acp; curl -fsSL https://claude.ai/install.sh | bash"
 check_harness "codex" "codex-acp" "codex" \
   "npm i -g @agentclientprotocol/codex-acp; curl -fsSL https://chatgpt.com/codex/install.sh | sh"
