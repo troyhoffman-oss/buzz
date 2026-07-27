@@ -375,7 +375,7 @@ export function buildOwnerFields({
       displayValue: runsOnLabel,
       icon: Server,
       label: "Runs on",
-      testId: "user-profile-backend",
+      testId: "user-profile-runs-on",
     });
   }
 
