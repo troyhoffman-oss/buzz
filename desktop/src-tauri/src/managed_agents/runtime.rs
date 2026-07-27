@@ -7,9 +7,9 @@ use super::agent_env::build_buzz_agent_provider_defaults;
 use crate::{
     managed_agents::{
         append_log_marker, known_acp_runtime, login_shell_path, managed_agent_log_path,
-        missing_command_message, open_log_file, resolve_command, spawn_key_refusal,
-        KnownAcpRuntime, ManagedAgentPairRuntime, ManagedAgentRecord, ManagedAgentRuntimeKey,
-        ManagedAgentSummary,
+        missing_command_message, normalize_agent_args, open_log_file, resolve_command,
+        spawn_key_refusal, KnownAcpRuntime, ManagedAgentPairRuntime, ManagedAgentRecord,
+        ManagedAgentRuntimeKey, ManagedAgentSummary,
     },
     util::now_iso,
 };
@@ -34,16 +34,13 @@ type RespondToEnv = (Vec<(&'static str, String)>, Vec<&'static str>);
 
 mod process;
 #[cfg(test)]
-use process::valid_agent_runtime_receipt_with;
-#[cfg(test)]
 use process::{
     buzz_marker_entry, name_matches_interpreter, name_matches_known_binary,
-    terminate_runtime_receipt_with,
+    terminate_runtime_receipt_with, valid_agent_runtime_receipt_with,
 };
 pub(crate) use process::{
-    buzz_sweep_owns_process, current_instance_id, process_belongs_to_us, process_has_buzz_marker,
-    process_is_running, terminate_process, terminate_untracked_pair_runtime,
-    valid_agent_runtime_receipt,
+    current_instance_id, process_belongs_to_us, process_has_buzz_marker, process_is_running,
+    terminate_process, terminate_untracked_pair_runtime, valid_agent_runtime_receipt,
 };
 
 mod orphan_sweep;
@@ -137,6 +134,7 @@ pub fn build_managed_agent_summary(
     record: &ManagedAgentRecord,
     runtimes: &HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
     personas: &[crate::managed_agents::types::AgentDefinition],
+    global_config: &crate::managed_agents::GlobalAgentConfig,
 ) -> Result<ManagedAgentSummary, String> {
     use crate::managed_agents::BackendKind;
 
@@ -240,12 +238,15 @@ pub fn build_managed_agent_summary(
     // stamped at spawn.  This catches out-of-band adapter changes (manual
     // npm install/downgrade) that Phase-1 auto-restart doesn't cover.  The
     // cache is read-only here — no subprocess is spawned.
+    //
+    // Global config drives both the restart-drift hash and descriptor env
+    // layering below — the caller loads it once and passes it in, so
+    // list-style callers pay one disk read per call rather than one per record.
+
     let needs_restart = pair_key
         .as_ref()
         .and_then(|key| runtimes.get(key).map(|runtime| (key, runtime)))
         .is_some_and(|(key, runtime)| {
-            let global_for_hash =
-                crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
             let teams_for_hash = crate::managed_agents::load_teams(app).unwrap_or_default();
             let hash_drift = runtime.spawn_config_hash
                 != crate::managed_agents::spawn_hash::spawn_config_hash(
@@ -253,7 +254,7 @@ pub fn build_managed_agent_summary(
                     personas,
                     &teams_for_hash,
                     &key.relay_url,
-                    &global_for_hash,
+                    global_config,
                 );
             let availability_drift = super::availability_drift(
                 runtime.adapter_availability.as_ref(),
@@ -269,18 +270,26 @@ pub fn build_managed_agent_summary(
         });
 
     // Resolve the effective harness via the single typed descriptor — same resolver
-    // as spawn, so the UI reflects the persona's current harness (or an explicit pin).
-    // `global_for_summary` (loaded above for `resolve_effective_config`) is reused
-    // here for descriptor parity with spawn's env layering.
+    // as spawn, so the UI reflects the persona's current harness (or explicit pin).
     let descriptor = crate::managed_agents::resolve_effective_harness_descriptor(
         record,
         personas,
-        &global_for_summary,
+        global_config,
     )
-    // Dangling harness — show a best-effort command so the UI displays the
-    // record's configured runtime id rather than crashing.
-    .unwrap_or_else(|_| {
-        crate::managed_agents::readiness::dangling_harness_descriptor(record, personas)
+    .unwrap_or_else(|e| {
+        // Dangling harness — surface the missing id so the UI tells the same
+        // story as spawn (which refuses with a sentence), rather than silently
+        // showing the default-command fallback as if the agent were healthy.
+        let cmd = match crate::managed_agents::dangling_harness_id(&e) {
+            Some(id) => crate::managed_agents::dangling_harness_display(id),
+            None => crate::managed_agents::record_agent_command(record, personas),
+        };
+        let args = normalize_agent_args(&cmd, record.agent_args.clone());
+        crate::managed_agents::readiness::EffectiveHarnessDescriptor {
+            command: cmd,
+            args,
+            env: Default::default(),
+        }
     });
     let effective_mcp_command = known_acp_runtime(&descriptor.command)
         .and_then(|r| r.mcp_command)
@@ -291,6 +300,7 @@ pub fn build_managed_agent_summary(
         pubkey: record.pubkey.clone(),
         name: record.name.clone(),
         persona_id: record.persona_id.clone(),
+        runtime: record.runtime.clone(),
         team_id: record.team_id.clone(),
         relay_url: record.relay_url.clone(),
         acp_command: record.acp_command.clone(),
@@ -478,16 +488,21 @@ pub fn spawn_agent_child(
     )
     .require_resolved()?;
 
-    // Resolve the harness axis ONCE, on the same pre-side-effect boundary as the
-    // config axis above. The two are orthogonal: `effective_cfg` owns
-    // model/provider/prompt (definition-authoritative), this descriptor owns
-    // command/args/env. It validates the runtime id (dangling harness → Err) and
-    // is the sole path for harness-definition lookup — spawn, hash, summary, and
-    // model probes all consume it rather than assembling values inline. Resolved
-    // here, before the log marker, so a refused spawn leaves no trace either way.
+    // Single typed resolver: validates runtime id (dangling harness → Err), resolves
+    // command, args (instance wins over definition default), and the full env layer stack.
+    // This is the sole path for harness-definition lookup — spawn, hash, summary, and
+    // model probes all consume this descriptor rather than assembling values inline.
+    // Like the orphan refusal above, this runs before any side effect so a refused
+    // spawn leaves no trace.
     let descriptor =
         crate::managed_agents::resolve_effective_harness_descriptor(record, &personas, &global)
-            .map_err(|e| format!("cannot spawn agent {}: {e}", record.pubkey))?;
+            .map_err(|e| {
+                format!(
+                    "cannot spawn agent {}: {}",
+                    record.pubkey,
+                    crate::managed_agents::user_facing_harness_error(&e)
+                )
+            })?;
     let effective_command = &descriptor.command;
     let agent_args = &descriptor.args;
 

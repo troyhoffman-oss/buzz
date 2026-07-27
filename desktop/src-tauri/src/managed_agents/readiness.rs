@@ -173,25 +173,6 @@ pub(crate) fn resolve_effective_harness_descriptor(
     })
 }
 
-/// The descriptor to display for a record whose harness id no longer resolves.
-///
-/// A dangling harness can never be spawned — `spawn_agent_child` propagates the
-/// `Err` — so the read-only consumers (card summary, spawn-config hash) degrade
-/// to a best-effort command/args pair with no env rather than failing outright.
-/// Shared so those consumers cannot drift apart in how they degrade.
-pub(crate) fn dangling_harness_descriptor(
-    record: &ManagedAgentRecord,
-    personas: &[AgentDefinition],
-) -> EffectiveHarnessDescriptor {
-    let command = crate::managed_agents::record_agent_command(record, personas);
-    let args = normalize_agent_args(&command, record.agent_args.clone());
-    EffectiveHarnessDescriptor {
-        command,
-        args,
-        env: BTreeMap::new(),
-    }
-}
-
 /// Assemble the effective agent env from a record, personas, optional
 /// known-runtime metadata, and the global agent config defaults — without an
 /// `AppHandle` so it is fully unit-testable.

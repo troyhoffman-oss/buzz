@@ -75,6 +75,13 @@ pub(crate) struct HarnessDefinition {
 /// malformed file never fails discovery for the rest.  Returns only
 /// structurally valid, individually validated definitions.
 ///
+/// Filtering is applied HERE — at the loader boundary — so every consumer
+/// (discovery Phase 3, `warm_harness_registry_from_dir`, and through it the
+/// spawn/readiness registry) inherits the same guarantees:
+///   * `check_id_collision` — a hand-placed `goose.json` can never shadow a
+///     built-in or preset id, even on the cold-launch warm path;
+///   * duplicate-id dedup within the directory (first file wins).
+///
 /// **Callers must supply a fresh `dir` path on every `discover_acp_runtimes`
 /// call** — this function performs no caching, mirroring goose's
 /// `refresh_custom_providers()` pattern.
@@ -92,6 +99,7 @@ pub(crate) fn load_custom_harnesses(dir: &Path) -> Vec<HarnessDefinition> {
     };
 
     let mut definitions = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -123,6 +131,24 @@ pub(crate) fn load_custom_harnesses(dir: &Path) -> Vec<HarnessDefinition> {
             continue;
         }
 
+        // A custom file must never shadow a built-in or preset id — enforced at
+        // the loader so the warm path can't admit what discovery would reject.
+        if let Err(reason) = check_id_collision(&def.id) {
+            tracing::warn!("custom_harnesses: skipping {} — {reason}", path.display());
+            continue;
+        }
+
+        // Dedup within the directory itself (a file's id is taken from its JSON
+        // content, not its filename, so two files can carry the same id).
+        if !seen_ids.insert(def.id.clone()) {
+            tracing::warn!(
+                "custom_harnesses: skipping {} — duplicate id {:?}",
+                path.display(),
+                def.id
+            );
+            continue;
+        }
+
         definitions.push(def);
     }
 
@@ -146,6 +172,19 @@ fn validate_harness_definition(def: &HarnessDefinition) -> Result<(), String> {
     }
     if def.label.trim().is_empty() {
         return Err("label must not be empty".into());
+    }
+    // Args travel to the harness through the comma-delimited
+    // `BUZZ_ACP_AGENT_ARGS` env transport (clap `value_delimiter = ','` on the
+    // buzz-acp side), so a literal comma inside one argument would silently
+    // split into two arguments at runtime. Reject at the validation boundary —
+    // shared by save (UI/Tauri) and load (hand-authored files) — so the
+    // invariant holds regardless of how the definition arrives.
+    if let Some(arg) = def.args.iter().find(|a| a.contains(',')) {
+        return Err(format!(
+            "args: argument {arg:?} contains a comma — arguments are passed via a \
+             comma-delimited transport and would be split at spawn time; \
+             use separate argument entries instead"
+        ));
     }
     // Validate env keys through the shared boundary validator.  This closes the
     // reserved-key bypass exploit (BUZZ_AUTH_TAG=x forgery shape), rejects
@@ -284,6 +323,22 @@ pub(crate) fn warm_harness_registry_from_dir(custom_dir: Option<&std::path::Path
     let mut all: Vec<HarnessDefinition> = preset_defs;
     all.extend(custom_defs);
     update_loaded_harness_registry(all);
+}
+
+/// Publish the loaded-harness registry from a **fresh** directory read while
+/// holding the persist mutex — the discovery-side counterpart of
+/// `save_and_warm` / `delete_and_warm`.
+///
+/// `discover_acp_runtimes_from` runs slow auth probes between its directory
+/// scan and its registry publish. Publishing the pre-probe snapshot could
+/// clobber a `save_and_warm` that landed in that window, leaving a freshly
+/// saved harness unresolvable at spawn until the next discovery. Re-reading
+/// the directory at publish time, under the same mutex as save/delete, makes
+/// the documented guarantee ("the registry always reflects disk at warm time")
+/// actually hold. Only the publish is locked — never the probes.
+pub(crate) fn warm_harness_registry_locked(custom_dir: Option<&std::path::Path>) {
+    let _guard = persist_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    warm_harness_registry_from_dir(custom_dir);
 }
 
 /// Global mutex that serializes save/delete filesystem mutations and the
@@ -636,12 +691,46 @@ mod tests {
 
     #[test]
     fn load_applies_id_collision_check() {
-        // A custom file named "goose.json" with id "goose" must be rejected.
-        // The collision check is applied inside discover_acp_runtimes_from, not
-        // in load_custom_harnesses — the file loader only validates the struct.
-        // We test the check_id_collision fn directly here.
+        // A custom file whose id shadows a built-in ("goose") must be dropped
+        // BY THE LOADER — `load_custom_harnesses` is the enforcement boundary
+        // shared by both the warm path and discovery. This exercises the real
+        // loader against a real file, not just the helper predicate.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("goose.json"),
+            r#"{"id":"goose","label":"Not Goose","command":"goose","args":["--evil"]}"#,
+        )
+        .unwrap();
+        assert!(
+            load_custom_harnesses(dir.path()).is_empty(),
+            "loader must drop a file shadowing a builtin id"
+        );
         assert!(check_id_collision("goose").is_err());
         assert!(check_id_collision("custom-goose").is_ok());
+    }
+
+    #[test]
+    fn load_dedups_duplicate_ids_first_file_wins() {
+        // Two files carrying the same custom id: the loader must keep exactly
+        // one definition (directory-order first wins; the duplicate is dropped).
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.json"),
+            r#"{"id":"custom-dup","label":"First","command":"first-cmd"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("b.json"),
+            r#"{"id":"custom-dup","label":"Second","command":"second-cmd"}"#,
+        )
+        .unwrap();
+        let loaded = load_custom_harnesses(dir.path());
+        assert_eq!(
+            loaded.len(),
+            1,
+            "loader must dedup duplicate ids within the directory"
+        );
+        assert_eq!(loaded[0].id, "custom-dup");
     }
 
     // ── Round-trip via save_custom_harness_to_dir (B-4) ─────────────────────
@@ -917,6 +1006,110 @@ mod tests {
         assert!(
             validate_harness_definition_pub(&def).is_ok(),
             "well-formed definition must pass validation"
+        );
+    }
+
+    // ── Comma-in-args validation (transport-lossiness guard) ─────────────────
+
+    /// A definition whose args contain a literal comma must be rejected at the
+    /// validation boundary — the comma-delimited `BUZZ_ACP_AGENT_ARGS`
+    /// transport would silently split it into two args at spawn time.
+    #[test]
+    fn validate_rejects_comma_in_args() {
+        let mut def = make_def("comma-args", "Comma");
+        def.args = vec!["--name".to_string(), "a,b".to_string()];
+        let err = validate_harness_definition_pub(&def).unwrap_err();
+        assert!(
+            err.contains("comma"),
+            "error must explain the comma transport limit, got: {err}"
+        );
+    }
+
+    /// Comma-free args pass — including args with spaces and special chars.
+    #[test]
+    fn validate_accepts_comma_free_args() {
+        let mut def = make_def("clean-args", "Clean");
+        def.args = vec!["acp".to_string(), "--flag=x y".to_string()];
+        assert!(validate_harness_definition_pub(&def).is_ok());
+    }
+
+    /// The loader shares the same validator: a hand-authored file with a comma
+    /// in args is skipped, so the invariant holds regardless of how the
+    /// definition arrives (UI save or hand-edited JSON).
+    #[test]
+    fn load_skips_definition_with_comma_in_args() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("comma.json"),
+            r#"{"id":"comma-file","label":"Comma","command":"comma-bin","args":["a,b"]}"#,
+        )
+        .unwrap();
+        assert!(
+            load_custom_harnesses(dir.path()).is_empty(),
+            "comma-in-args definition must be skipped at the loader boundary"
+        );
+    }
+
+    // ── Discovery publish under persist_mutex (stale-snapshot regression) ────
+
+    /// Discovery's registry publish must re-read the directory at publish time
+    /// (under the persist mutex), not push a snapshot taken before the auth
+    /// probes ran. Regression shape: discovery scans dir → user saves harness X
+    /// (save_and_warm warms the registry with X) → discovery finishes. If
+    /// discovery published its pre-save snapshot, X would be on disk but
+    /// unresolvable at spawn until the next discover.
+    ///
+    /// Deterministic interleaving: we simulate it by calling the publish seam
+    /// (`warm_harness_registry_locked`) after a save that happened "during"
+    /// discovery — the fresh-read semantics mean the just-saved definition
+    /// survives the publish.
+    #[test]
+    fn discovery_publish_after_concurrent_save_keeps_saved_harness() {
+        let _lock = registry_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Discovery "scans" the dir while it is empty (stale snapshot would be []).
+        let stale_snapshot = load_custom_harnesses(dir.path());
+        assert!(stale_snapshot.is_empty());
+
+        // A save lands mid-discovery (save_and_warm: write + warm).
+        let def = make_def("mid-save", "Mid Save");
+        save_and_warm(dir.path(), &def, None).unwrap();
+        assert!(lookup_loaded_harness_by_id("mid-save").is_some());
+
+        // Discovery publishes — the locked warm re-reads the directory, so the
+        // just-saved harness must survive (a stale-snapshot publish would
+        // clobber it).
+        warm_harness_registry_locked(Some(dir.path()));
+        assert!(
+            lookup_loaded_harness_by_id("mid-save").is_some(),
+            "publish must re-read the directory, not clobber the mid-discovery save"
+        );
+    }
+
+    /// Same shape for delete: a delete landing mid-discovery must not be
+    /// resurrected by the discovery publish.
+    #[test]
+    fn discovery_publish_after_concurrent_delete_keeps_harness_gone() {
+        let _lock = registry_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+
+        let def = make_def("mid-delete", "Mid Delete");
+        save_and_warm(dir.path(), &def, None).unwrap();
+
+        // Discovery "scans" while the file exists (stale snapshot would contain it).
+        let stale_snapshot = load_custom_harnesses(dir.path());
+        assert_eq!(stale_snapshot.len(), 1);
+
+        // Delete lands mid-discovery.
+        delete_and_warm(dir.path(), "mid-delete").unwrap();
+        assert!(lookup_loaded_harness_by_id("mid-delete").is_none());
+
+        // Discovery publishes — fresh read keeps it gone.
+        warm_harness_registry_locked(Some(dir.path()));
+        assert!(
+            lookup_loaded_harness_by_id("mid-delete").is_none(),
+            "publish must not resurrect a harness deleted mid-discovery"
         );
     }
 

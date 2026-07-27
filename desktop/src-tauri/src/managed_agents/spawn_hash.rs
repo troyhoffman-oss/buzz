@@ -29,7 +29,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use super::{
     effective_config::{resolve_effective_config, EffectiveConfigResult},
-    known_acp_runtime,
+    known_acp_runtime, normalize_agent_args,
     persona_events::preview_prospective_persona_snapshot,
     types::{AgentDefinition, ManagedAgentRecord, TeamRecord},
     GlobalAgentConfig,
@@ -65,24 +65,27 @@ pub(crate) fn spawn_config_hash(
     // restart would actually run. Idempotent, so the spawn-time stamp
     // (post-snapshot record) and later recomputes (persisted record) agree
     // when nothing changed. The persona env itself reaches the hash through
-    // the effective-harness descriptor below; `persona_source_version` is set
-    // on the clone but is not a hash input.
+    // the descriptor's layered env below; `persona_source_version` is set on
+    // the clone but is not a hash input.
     let record = preview_prospective_persona_snapshot(record, personas);
     let record = &record;
 
     // Resolve command, args, and env via the single typed descriptor — same path
-    // as spawn_agent_child.  A dangling harness id degrades to the shared
-    // best-effort descriptor (no-op: a dangling harness can't be spawned, so the
+    // as spawn_agent_child.  Dangling harness id falls back to the infallible
+    // record_agent_command (no-op: a dangling harness can't be spawned, so the
     // hash never matters for that agent).
     let descriptor =
         crate::managed_agents::resolve_effective_harness_descriptor(record, personas, global)
             .unwrap_or_else(|_| {
-                crate::managed_agents::readiness::dangling_harness_descriptor(record, personas)
+                let cmd = crate::managed_agents::record_agent_command(record, personas);
+                let args = normalize_agent_args(&cmd, record.agent_args.clone());
+                crate::managed_agents::readiness::EffectiveHarnessDescriptor {
+                    command: cmd,
+                    args,
+                    env: Default::default(),
+                }
             });
     let runtime_meta = known_acp_runtime(&descriptor.command);
-
-    // The descriptor's env includes definition env as a floor layer (below
-    // global/persona/agent), mirroring spawn_agent_child exactly.
 
     let mut hasher = DefaultHasher::new();
 

@@ -94,12 +94,6 @@ pub async fn discover_acp_providers(
 /// merged catalog entry so the UI can update the provider list without triggering
 /// a full re-discover.
 ///
-/// Write a user-defined harness definition to `<app-data>/custom_harnesses/<id>.json`.
-///
-/// Validates the definition (id regex, builtin-id collision, non-empty command
-/// and label) before touching the filesystem. Returns the merged catalog entry
-/// so the UI can update the provider list without triggering a full re-discover.
-///
 /// `original_id` handles the rename case: when the user edits an existing
 /// harness and changes its id, pass the old id here so the old file is removed
 /// atomically as part of the write. If the id is unchanged or this is a new

@@ -204,29 +204,6 @@ pub(crate) fn process_has_buzz_marker(_pid: u32, _instance_id: &str) -> bool {
     false
 }
 
-// ── Shared sweep ownership predicate ─────────────────────────────────────────
-//
-// `BUZZ_MANAGED_AGENT` env marker is the sole authoritative ownership proof.
-// The `_belongs_to_us` name-check is passed by callers but is intentionally
-// IGNORED — custom harnesses have arbitrary binary names and would be missed
-// by a name-gated predicate.
-
-/// Returns `true` when a process should be included in the orphan sweep.
-///
-/// The `BUZZ_MANAGED_AGENT` env marker is the sole authoritative ownership
-/// proof — any process carrying it and belonging to this instance is swept,
-/// regardless of binary name.  The `_belongs_to_us` parameter is accepted
-/// for call-site symmetry but is intentionally ignored: the function returns
-/// `has_buzz_marker` unconditionally.  On Windows no `/proc`-based sweep
-/// runs, so `process_has_buzz_marker` always returns `false`.
-///
-/// This predicate is cross-platform and tested directly in the runtime unit
-/// tests — no `#[cfg(unix)]` guard needed here.
-pub(crate) fn buzz_sweep_owns_process(_belongs_to_us: bool, has_buzz_marker: bool) -> bool {
-    // Marker is the sole authoritative ownership gate.
-    has_buzz_marker
-}
-
 #[cfg(unix)]
 fn signal_process_group_or_leader(pid: u32, signal: i32, action: &str) -> Result<(), String> {
     let pgid = -(pid as i32);
@@ -412,20 +389,18 @@ pub(crate) fn valid_agent_runtime_receipt(
         receipt,
         instance_id,
         process_is_running,
-        process_belongs_to_us,
         process_has_buzz_marker,
     )
 }
 
 /// Injectable version of `valid_agent_runtime_receipt` for testing.
-/// `is_running(pid)`, `belongs_to_us(pid)`, and `has_marker(pid, instance_id)`
-/// can be substituted by test doubles without spawning real processes.
+/// `is_running(pid)` and `has_marker(pid, instance_id)` can be substituted by
+/// test doubles without spawning real processes.
 pub(crate) fn valid_agent_runtime_receipt_with(
     path: &std::path::Path,
     receipt: &super::super::ManagedAgentRuntimeReceipt,
     instance_id: &str,
     is_running: impl Fn(u32) -> bool,
-    belongs_to_us: impl Fn(u32) -> bool,
     has_marker: impl Fn(u32, &str) -> bool,
 ) -> bool {
     let Ok(canonical) =
@@ -439,14 +414,10 @@ pub(crate) fn valid_agent_runtime_receipt_with(
         && receipt.desktop_instance_id == instance_id
         && is_running(receipt.pid)
         // Receipts are written by THIS instance at spawn time, so they are
-        // Buzz-owned by construction. Use the shared ownership predicate
-        // (marker-only) so custom-harness binaries (not in KNOWN_AGENT_BINARIES)
-        // are not rejected here. `belongs_to_us` is passed as the fast-
-        // path hint but ignored by `buzz_sweep_owns_process`.
-        && buzz_sweep_owns_process(
-            belongs_to_us(receipt.pid),
-            has_marker(receipt.pid, &receipt.desktop_instance_id),
-        )
+        // Buzz-owned by construction. Marker-only ownership: custom-harness
+        // binaries (not in KNOWN_AGENT_BINARIES) must not be rejected by a
+        // name gate — see the sweep ownership rule in runtime/orphan_sweep.rs.
+        && has_marker(receipt.pid, &receipt.desktop_instance_id)
 }
 
 pub(super) fn terminate_runtime_receipt_with(

@@ -6,6 +6,8 @@ import {
   useAcpRuntimesQuery,
   useDeleteCustomHarnessMutation,
   useManagedAgentPrereqsQuery,
+  useManagedAgentsQuery,
+  usePersonasQuery,
   useSaveCustomHarnessMutation,
 } from "@/features/agents/hooks";
 import type { AcpRuntimeCatalogEntry } from "@/shared/api/types";
@@ -19,13 +21,15 @@ import {
   RuntimeIcon,
 } from "../../onboarding/ui/RuntimeIcon";
 import {
-  buildEnvRecord,
-  envPairsFromRecord,
-  filterArgs,
+  commaArgError,
+  type CustomFormValues,
+  definitionFromFormValues,
+  formValuesFromCatalogEntry,
   idFromLabel,
 } from "./harnessFormLogic";
 import {
   customEntries as getCustomEntries,
+  deleteConfirmState,
   sortedPresetEntries,
 } from "./harnessGalleryLogic";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
@@ -86,18 +90,6 @@ function PresetCard({ entry }: { entry: AcpRuntimeCatalogEntry }) {
 }
 
 // ── Custom harness form ───────────────────────────────────────────────────────
-
-interface CustomFormValues {
-  id: string;
-  label: string;
-  command: string;
-  /** Each element is one argument; no space-splitting round-trip. */
-  args: string[];
-  /** KEY=VALUE pairs for env injection at spawn time. */
-  env: Array<{ key: string; value: string }>;
-  installInstructionsUrl: string;
-  installHint: string;
-}
 
 const EMPTY_FORM: CustomFormValues = {
   id: "",
@@ -298,17 +290,16 @@ function CustomHarnessForm({
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
+    // Mirror the backend comma-in-args rejection so the user gets an inline
+    // error naming the offending argument before the round-trip.
+    const commaError = commaArgError(form.args);
+    if (commaError) {
+      setError(commaError);
+      return;
+    }
     try {
       await save.mutateAsync({
-        definition: {
-          id: form.id.trim(),
-          label: form.label.trim(),
-          command: form.command.trim(),
-          args: filterArgs(form.args),
-          env: buildEnvRecord(form.env),
-          installInstructionsUrl: form.installInstructionsUrl.trim(),
-          installHint: form.installHint.trim(),
-        },
+        definition: definitionFromFormValues(form),
         originalId,
       });
       onSaved();
@@ -413,6 +404,20 @@ function CustomHarnessForm({
         />
       </div>
 
+      <div className="space-y-1">
+        <p className="text-xs text-muted-foreground">
+          Install hint{" "}
+          <span className="text-muted-foreground/60">(optional)</span>
+        </p>
+        <Input
+          className="h-8 text-sm"
+          id="ch-install-hint"
+          onChange={field("installHint")}
+          placeholder="npm install -g my-harness"
+          value={form.installHint}
+        />
+      </div>
+
       {error ? (
         <p className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-sm text-destructive">
           {error}
@@ -439,18 +444,23 @@ function CustomHarnessRow({ entry }: { entry: AcpRuntimeCatalogEntry }) {
   const [confirmingDelete, setConfirmingDelete] = React.useState(false);
   const [deleteError, setDeleteError] = React.useState<string | null>(null);
   const del = useDeleteCustomHarnessMutation();
+  // Blast-radius data for the delete confirmation — only fetched while the
+  // confirmation is open, so the row list doesn't poll agents. Confirm stays
+  // disabled until both queries settle (deleteConfirmState) so a quick click
+  // can't beat the "N agents will stop launching" warning.
+  const agentsQuery = useManagedAgentsQuery({ enabled: confirmingDelete });
+  const personasQuery = usePersonasQuery({ enabled: confirmingDelete });
+  const confirmState = deleteConfirmState(
+    entry.id,
+    entry.label,
+    agentsQuery,
+    personasQuery,
+  );
 
   if (editing) {
     return (
       <CustomHarnessForm
-        initial={{
-          id: entry.id,
-          label: entry.label,
-          command: entry.command ?? "",
-          args: entry.defaultArgs ?? [],
-          env: envPairsFromRecord(entry.definitionEnv),
-          installInstructionsUrl: entry.installInstructionsUrl,
-        }}
+        initial={formValuesFromCatalogEntry(entry)}
         originalId={entry.id}
         onCancel={() => setEditing(false)}
         onSaved={() => setEditing(false)}
@@ -499,7 +509,7 @@ function CustomHarnessRow({ entry }: { entry: AcpRuntimeCatalogEntry }) {
               <Button
                 className="h-7 px-3 text-xs"
                 data-testid={`custom-harness-delete-confirm-${entry.id}`}
-                disabled={del.isPending}
+                disabled={del.isPending || !confirmState.canConfirm}
                 onClick={() => {
                   setDeleteError(null);
                   del.mutate(entry.id, {
@@ -547,6 +557,14 @@ function CustomHarnessRow({ entry }: { entry: AcpRuntimeCatalogEntry }) {
           )}
         </div>
       </div>
+      {confirmingDelete ? (
+        <p
+          className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-sm text-amber-600 dark:text-amber-400"
+          data-testid={`custom-harness-delete-warning-${entry.id}`}
+        >
+          {confirmState.message}
+        </p>
+      ) : null}
       {deleteError ? (
         <p className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-sm text-destructive">
           {deleteError}

@@ -32,7 +32,7 @@ import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 import { useChannelNavigation } from "@/shared/context/ChannelNavigationContext";
-import { parseImetaTags } from "@/features/messages/lib/parseImeta";
+import { parseImetaTags } from "@/shared/ui/markdown/parseImeta";
 import { useMessageEmoji } from "@/features/messages/lib/useMessageEmoji";
 import { parseWaveMessageContent } from "@/features/messages/lib/waveMessage";
 import { resolveAskQuestion } from "@/features/messages/lib/askCard";

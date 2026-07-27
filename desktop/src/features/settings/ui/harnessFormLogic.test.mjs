@@ -6,6 +6,9 @@ import {
   buildEnvRecord,
   filterArgs,
   envPairsFromRecord,
+  formValuesFromCatalogEntry,
+  definitionFromFormValues,
+  commaArgError,
 } from "./harnessFormLogic.ts";
 
 // ── idFromLabel ──────────────────────────────────────────────────────────────
@@ -169,4 +172,120 @@ test("envPairsFromRecord_roundTrip_buildEnvRecord_restoresOriginal", () => {
   const pairs = envPairsFromRecord(original);
   const restored = buildEnvRecord(pairs);
   assert.deepEqual(restored, original);
+});
+
+// ── edit round-trip (entry → form → definition) ──────────────────────────────
+
+/** A fully-populated definition as it appears on a catalog entry. */
+const FULL_ENTRY = {
+  id: "my-harness",
+  label: "My Harness",
+  command: "my-harness",
+  defaultArgs: ["acp", "--verbose"],
+  definitionEnv: { FOO: "bar", BAZ: "qux" },
+  installInstructionsUrl: "https://example.com/docs",
+  installHint: "npm install -g my-harness",
+};
+
+test("formValuesFromCatalogEntry_fullEntry_populatesEveryField", () => {
+  const form = formValuesFromCatalogEntry(FULL_ENTRY);
+  assert.equal(form.id, "my-harness");
+  assert.equal(form.label, "My Harness");
+  assert.equal(form.command, "my-harness");
+  assert.deepEqual(form.args, ["acp", "--verbose"]);
+  assert.deepEqual(form.env, [
+    { key: "FOO", value: "bar" },
+    { key: "BAZ", value: "qux" },
+  ]);
+  assert.equal(form.installInstructionsUrl, "https://example.com/docs");
+  assert.equal(form.installHint, "npm install -g my-harness");
+});
+
+test("editRoundTrip_openThenSaveWithoutChanges_losesNothing", () => {
+  // Regression for the installHint edit-loss bug: opening the edit form and
+  // immediately saving must reproduce the original definition verbatim.
+  const definition = definitionFromFormValues(
+    formValuesFromCatalogEntry(FULL_ENTRY),
+  );
+  assert.deepEqual(definition, {
+    id: FULL_ENTRY.id,
+    label: FULL_ENTRY.label,
+    command: FULL_ENTRY.command,
+    args: FULL_ENTRY.defaultArgs,
+    env: FULL_ENTRY.definitionEnv,
+    installInstructionsUrl: FULL_ENTRY.installInstructionsUrl,
+    installHint: FULL_ENTRY.installHint,
+  });
+});
+
+test("editRoundTrip_definitionKeys_matchFormSeedFields", () => {
+  // Structural guard: any user-editable field added to the save payload must
+  // also be seeded on edit, or open-edit-then-save silently erases it (the
+  // installHint bug). `args`/`env` map to `defaultArgs`/`definitionEnv`.
+  const seeded = new Set(Object.keys(formValuesFromCatalogEntry(FULL_ENTRY)));
+  const saved = Object.keys(
+    definitionFromFormValues(formValuesFromCatalogEntry(FULL_ENTRY)),
+  );
+  for (const key of saved) {
+    assert.ok(
+      seeded.has(key),
+      `save payload field "${key}" not seeded on edit`,
+    );
+  }
+});
+
+test("formValuesFromCatalogEntry_nullishOptionalFields_defaultsSafely", () => {
+  const form = formValuesFromCatalogEntry({
+    id: "min",
+    label: "Min",
+    command: null,
+    defaultArgs: undefined,
+    definitionEnv: undefined,
+    installInstructionsUrl: "",
+    installHint: "",
+  });
+  assert.equal(form.command, "");
+  assert.deepEqual(form.args, []);
+  assert.deepEqual(form.env, []);
+});
+
+test("definitionFromFormValues_trimsScalarFields", () => {
+  const definition = definitionFromFormValues({
+    id: " my-id ",
+    label: " Label ",
+    command: " cmd ",
+    args: ["keep", "  "],
+    env: [{ key: " K ", value: "v" }],
+    installInstructionsUrl: " https://x ",
+    installHint: " hint ",
+  });
+  assert.equal(definition.id, "my-id");
+  assert.equal(definition.label, "Label");
+  assert.equal(definition.command, "cmd");
+  assert.deepEqual(definition.args, ["keep"]);
+  assert.deepEqual(definition.env, { K: "v" });
+  assert.equal(definition.installInstructionsUrl, "https://x");
+  assert.equal(definition.installHint, "hint");
+});
+
+// ── commaArgError ─────────────────────────────────────────────────────────────
+
+test("commaArgError_noCommas_returnsNull", () => {
+  assert.equal(commaArgError(["acp", "--verbose", "--name", "x y"]), null);
+});
+
+test("commaArgError_emptyArgs_returnsNull", () => {
+  assert.equal(commaArgError([]), null);
+});
+
+test("commaArgError_commaInArg_namesOffender", () => {
+  const err = commaArgError(["--models", "a,b"]);
+  assert.ok(err !== null);
+  assert.ok(err.includes('"a,b"'), "error must name the offending argument");
+  assert.ok(err.includes("comma"), "error must name the transport limit");
+});
+
+test("commaArgError_firstOffenderReported", () => {
+  const err = commaArgError(["x,y", "p,q"]);
+  assert.ok(err?.includes('"x,y"'));
 });

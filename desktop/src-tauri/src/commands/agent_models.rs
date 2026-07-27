@@ -28,63 +28,6 @@ use crate::{
     util::now_iso,
 };
 
-/// Everything [`get_agent_models`] needs to run a discovery subprocess for one
-/// agent, resolved from disk state.
-pub(crate) struct AgentModelDiscoveryConfig {
-    /// The effective harness command (pre-PATH-resolution).
-    pub command: String,
-    /// Normalized effective harness args.
-    pub args: Vec<String>,
-    /// Definition-authoritative model, if any.
-    pub model: Option<String>,
-    /// Definition-authoritative provider, if any.
-    pub provider: Option<String>,
-    /// The harness's own provider env var, used to recover a build-baked
-    /// provider from `env` when neither definition nor global names one.
-    pub provider_env_var: Option<&'static str>,
-    /// The full layered process env the discovery subprocess receives.
-    pub env: std::collections::BTreeMap<String, String>,
-}
-
-/// Resolve the discovery configuration for `record` — the pure seam
-/// [`get_agent_models`] consumes.
-///
-/// The two axes are resolved independently and both mirror spawn exactly, so
-/// discovery can never query a configuration the agent would not actually
-/// launch with:
-///
-/// - **Config axis** (model/provider) via `resolve_effective_model_provider`:
-///   for a linked instance the definition (then global) is truth, never the
-///   record's materialized bytes. Definition-less instances keep their own.
-/// - **Harness axis** (command/args/env) via the same effective descriptor
-///   `spawn_agent_child` uses.
-///
-/// Returns `Err` on a dangling harness id.
-///
-/// This exists as a named helper rather than inline resolver calls so the
-/// linked-agent regression binds to the seam the command actually reads: a
-/// mutation reintroducing `record.model` here fails the test.
-pub(crate) fn agent_model_discovery_config(
-    record: &crate::managed_agents::ManagedAgentRecord,
-    personas: &[crate::managed_agents::AgentDefinition],
-    global: &crate::managed_agents::GlobalAgentConfig,
-) -> Result<AgentModelDiscoveryConfig, String> {
-    let descriptor =
-        crate::managed_agents::resolve_effective_harness_descriptor(record, personas, global)?;
-    let (model, provider) =
-        crate::managed_agents::resolve_effective_model_provider(record, personas, global);
-    let provider_env_var =
-        known_acp_runtime(&descriptor.command).and_then(|meta| meta.provider_env_var);
-    Ok(AgentModelDiscoveryConfig {
-        command: descriptor.command,
-        args: descriptor.args,
-        model,
-        provider,
-        provider_env_var,
-        env: descriptor.env,
-    })
-}
-
 /// Query available models from an agent via `buzz-acp models --json`.
 ///
 /// Spawns a short-lived subprocess (no relay connection needed). The subprocess
@@ -95,15 +38,7 @@ pub async fn get_agent_models(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AgentModelsResponse, String> {
-    let (
-        resolved_acp,
-        agent_command,
-        agent_args,
-        persisted_model,
-        saved_provider,
-        provider_env_var,
-        merged_env,
-    ) = {
+    let (resolved_acp, agent_command, discovery) = {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
@@ -136,30 +71,28 @@ pub async fn get_agent_models(
         let personas = load_personas(&app).unwrap_or_default();
         let global = load_global_agent_config(&app).unwrap_or_default();
 
-        let AgentModelDiscoveryConfig {
-            command,
-            args,
-            model,
-            provider,
-            provider_env_var,
-            env,
-        } = agent_model_discovery_config(record, &personas, &global)
-            .map_err(|e| format!("cannot discover models for {pubkey}: {e}"))?;
+        // Single pure helper — descriptor + authoritative model/provider
+        // resolver, packaged so the linked-agent regression test binds the
+        // exact values this command consumes. Returns Err on dangling harness
+        // id, propagating it to the caller.
+        let discovery = agent_model_discovery_config(record, &personas, &global)
+            .map_err(|e| model_discovery_error(&pubkey, &e))?;
 
-        let resolved_agent = resolve_command(&command)
+        let resolved_agent = resolve_command(&discovery.command)
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| command.clone());
+            .unwrap_or_else(|| discovery.command.clone());
 
-        (
-            resolved,
-            resolved_agent,
-            args,
-            model,
-            provider,
-            provider_env_var,
-            env,
-        )
+        (resolved, resolved_agent, discovery)
     }; // store lock released — subprocess runs without holding the lock
+
+    let AgentModelDiscoveryConfig {
+        args: agent_args,
+        model: persisted_model,
+        provider: saved_provider,
+        provider_env_var,
+        env: merged_env,
+        command: _,
+    } = discovery;
 
     let merged_env = discovery_env_with_baked_floor(merged_env);
     // Resolve against the baked/process env when the record saved no provider,
@@ -207,6 +140,82 @@ pub async fn get_agent_models(
         merged_env,
     )
     .await
+}
+
+/// Error copy for a failed harness resolution during model discovery.
+///
+/// Routes through `user_facing_harness_error` so a dangling harness id renders
+/// as a sentence, never as the raw `DANGLING_HARNESS_ID:` sentinel — the same
+/// contract spawn and summary rows honor.
+fn model_discovery_error(pubkey: &str, error: &str) -> String {
+    format!(
+        "cannot discover models for {pubkey}: {}",
+        crate::managed_agents::user_facing_harness_error(error)
+    )
+}
+
+/// Everything `get_agent_models` needs from the record + context, resolved in
+/// one pure step so the linked-agent regression test can bind the exact values
+/// the command consumes.
+#[derive(Debug, PartialEq, Eq)]
+struct AgentModelDiscoveryConfig {
+    /// Effective harness command (descriptor-resolved), for `resolve_command`.
+    command: String,
+    /// Effective harness args (descriptor-resolved).
+    args: Vec<String>,
+    /// Model from the authoritative resolver spawn uses — linked instances
+    /// read their definition, never stale `record.model` bytes.
+    model: Option<String>,
+    /// Provider from the same authoritative resolver — never stale
+    /// `record.provider` bytes for linked instances.
+    provider: Option<String>,
+    /// The runtime's provider env var (e.g. `GOOSE_PROVIDER`), so discovery
+    /// can recover the provider from the env when the resolver yields none.
+    /// `None` for runtimes that do not take a provider, or an unknown command.
+    provider_env_var: Option<&'static str>,
+    /// The descriptor's fully layered env (definition/persona/global/agent).
+    env: BTreeMap<String, String>,
+}
+
+/// Resolve the model-discovery config for a saved agent — the descriptor-backed
+/// successor to the old `saved_agent_model_discovery_config`.
+///
+/// Command/args/env come from `resolve_effective_harness_descriptor` (the same
+/// resolver as `spawn_agent_child`); model/provider come from
+/// `resolve_effective_model_provider` (#1968's definition-authoritative
+/// contract) — linked instances read their definition, never a stale
+/// materialized `record.model`/`record.provider`, so discovery cannot query a
+/// provider this agent will not actually launch with. Definition-less
+/// instances keep their own record values, matching spawn's
+/// `resolve_definition_less` arm. When the resolver yields no provider,
+/// `effective_discovery_provider` recovers the provider the agent will
+/// actually launch with from the runtime's own provider env var, read out of
+/// the descriptor env (which already layers definition/persona/global values
+/// the same way spawn does).
+///
+/// Returns `Err("DANGLING_HARNESS_ID:<id>")` from the descriptor resolver when
+/// the harness id no longer exists; the caller routes it through
+/// `model_discovery_error`.
+fn agent_model_discovery_config(
+    record: &crate::managed_agents::ManagedAgentRecord,
+    personas: &[crate::managed_agents::AgentDefinition],
+    global: &crate::managed_agents::GlobalAgentConfig,
+) -> Result<AgentModelDiscoveryConfig, String> {
+    let descriptor =
+        crate::managed_agents::resolve_effective_harness_descriptor(record, personas, global)?;
+    let (model, provider) =
+        crate::managed_agents::resolve_effective_model_provider(record, personas, global);
+    let provider_env_var =
+        known_acp_runtime(&descriptor.command).and_then(|meta| meta.provider_env_var);
+
+    Ok(AgentModelDiscoveryConfig {
+        command: descriptor.command,
+        args: descriptor.args,
+        model,
+        provider,
+        provider_env_var,
+        env: descriptor.env,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1011,7 +1020,13 @@ pub async fn update_managed_agent(
 
         let summary = {
             let personas = load_personas(&app).unwrap_or_default();
-            build_managed_agent_summary(&app, record, &runtimes, &personas)?
+            build_managed_agent_summary(
+                &app,
+                record,
+                &runtimes,
+                &personas,
+                &crate::managed_agents::load_global_agent_config(&app).unwrap_or_default(),
+            )?
         };
         let rollback = name_changed.then(|| AgentUpdateRollback::new(previous_record, record));
         (summary, sync_params, rollback)
