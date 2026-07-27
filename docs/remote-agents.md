@@ -386,7 +386,7 @@ harness path, `git-credential-nostr`, `PATH` — are appended by the remote scri
 | `BUZZ_RELAY_URL`, `BUZZ_AUTH_TAG` | payload (auth tag omitted when absent) |
 | `BUZZ_ACP_AGENT_ARGS` | comma-joined |
 | `BUZZ_ACP_MCP_COMMAND` | empty |
-| `BUZZ_ACP_LAZY_POOL` | `false` — always eager; lazy pair-start has no meaning for a unit systemd starts unconditionally |
+| `BUZZ_ACP_LAZY_POOL` | `true` — the pool warms on the first accepted event instead of at startup; queued work is not dropped, and a restarted or idle unit does not hold N harness subprocesses |
 | `BUZZ_ACP_AGENTS` | payload `parallelism` |
 | `BUZZ_ACP_MULTIPLE_EVENT_HANDLING` | `steer` |
 | `BUZZ_ACP_DEDUP` | `queue` |

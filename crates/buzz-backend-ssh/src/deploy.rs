@@ -259,10 +259,15 @@ fn env_file_body(agent: &Agent) -> Result<String, String> {
     // and mirroring that table here would drift. Empty rather than omitted,
     // matching what local spawn writes when it does not apply.
     push("BUZZ_ACP_MCP_COMMAND", "")?;
-    // `BUZZ_ACP_LAZY_POOL=true` is the desktop's lazy pair-start concept, which
-    // has no meaning for a unit systemd starts unconditionally. Written
-    // explicitly so the harness default cannot drift underneath us.
-    push("BUZZ_ACP_LAZY_POOL", "false")?;
+    // Lazy defers the *pool warm*, not the process: buzz-acp connects,
+    // subscribes, and queues accepted work, then the first flushable event
+    // wakes all `BUZZ_ACP_AGENTS` slots. Nothing is dropped, and the one-shot
+    // cold start is cheaper than what eager costs here — a `Restart=always`
+    // unit re-pays N serial spawns on every restart, and a deployed-but-idle
+    // agent holds N harness subprocesses that are never reaped. That makes
+    // this the restore case (see `restore.rs`, "eager on restore buys
+    // nothing"), not the interactive-create case that spawns eager locally.
+    push("BUZZ_ACP_LAZY_POOL", "true")?;
     push("BUZZ_ACP_AGENTS", &agent.parallelism.to_string())?;
     push("BUZZ_ACP_MULTIPLE_EVENT_HANDLING", "steer")?;
     push("BUZZ_ACP_DEDUP", "queue")?;
@@ -774,7 +779,7 @@ mod tests {
         for expected in [
             r#"BUZZ_RELAY_URL="wss://relay.example/ws""#,
             r#"BUZZ_AUTH_TAG="tag-abc""#,
-            r#"BUZZ_ACP_LAZY_POOL="false""#,
+            r#"BUZZ_ACP_LAZY_POOL="true""#,
             r#"BUZZ_ACP_AGENTS="3""#,
             r#"BUZZ_ACP_MULTIPLE_EVENT_HANDLING="steer""#,
             r#"BUZZ_ACP_DEDUP="queue""#,
