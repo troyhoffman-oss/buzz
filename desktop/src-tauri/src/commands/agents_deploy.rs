@@ -116,10 +116,26 @@ pub(super) struct BinariesToPush {
 
 impl BinariesToPush {
     /// The dogfood seams as this process's environment currently reports them.
+    ///
+    /// Each var names a Linux binary on THIS machine; `buzz-backend-ssh`
+    /// streams it to the host inside the deploy script and installs it to
+    /// `~/.local/bin` when the host resolves none. Read at deploy time rather
+    /// than captured at startup, so a developer can point one at a fresh build
+    /// without restarting the app.
+    ///
+    /// Two vars rather than one because the two binaries are separately
+    /// policed: a host with no `buzz-acp` cannot run an agent at all, while a
+    /// host with no CLI runs one that simply cannot reply with
+    /// `buzz messages send`.
+    ///
+    /// They are env vars and not settings because the durable answer is not a
+    /// path at all: the release build should resolve the artifact for the
+    /// host's platform by version, with no user-visible choice. Until that
+    /// lands this is the whole surface.
     fn from_env() -> Self {
         Self {
-            buzz_acp: buzz_acp_binary_to_push(),
-            buzz_cli: buzz_cli_binary_to_push(),
+            buzz_acp: binary_to_push("BUZZ_ACP_PUSH_BINARY"),
+            buzz_cli: binary_to_push("BUZZ_CLI_PUSH_BINARY"),
         }
     }
 }
@@ -171,34 +187,6 @@ pub(super) fn deploy_payload_json(
         // warning on the provider side, never a failed deploy.
         "buzz_cli_binary": binaries_to_push.buzz_cli,
     })
-}
-
-/// The dev/dogfood seam for pushing `buzz-acp` to a host that lacks it.
-///
-/// `BUZZ_ACP_PUSH_BINARY` names a Linux `buzz-acp` on this machine;
-/// `buzz-backend-ssh` streams it to the host inside the deploy script and
-/// installs it to `~/.local/bin` when the host resolves none. Read at deploy
-/// time rather than captured at startup, so a developer can point it at a fresh
-/// build without restarting the app.
-///
-/// It is an env var and not a setting because the durable answer is not a path
-/// at all: the release build should resolve the artifact for the host's
-/// platform by version, with no user-visible choice. Until that lands this is
-/// the whole surface.
-fn buzz_acp_binary_to_push() -> Option<String> {
-    binary_to_push("BUZZ_ACP_PUSH_BINARY")
-}
-
-/// The same seam for the `buzz` CLI: `BUZZ_CLI_PUSH_BINARY` names a Linux
-/// `buzz` on this machine, which the provider installs to the host's
-/// `~/.local/bin` when the host resolves none.
-///
-/// Separate from `buzz-acp` because the two are separately policed: a host with
-/// no `buzz-acp` cannot run an agent at all, while a host with no CLI runs one
-/// that simply cannot reply with `buzz messages send`. Release-artifact
-/// resolution is the shared follow-up for both.
-fn buzz_cli_binary_to_push() -> Option<String> {
-    binary_to_push("BUZZ_CLI_PUSH_BINARY")
 }
 
 /// A push seam's value, or `None` when unset or blank — blank being a var the

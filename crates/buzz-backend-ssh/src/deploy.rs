@@ -1232,14 +1232,6 @@ mod tests {
         }
     }
 
-    /// …and only `BUZZ_CLI_PUSH_BINARY`.
-    fn cli_push(payload: Payload) -> Pushes {
-        Pushes {
-            acp: None,
-            cli: Some(payload),
-        }
-    }
-
     #[test]
     fn the_pushed_binaries_are_optional_fields_that_change_nothing_when_absent() {
         // The seams must be invisible: a payload without the fields produces
@@ -1672,7 +1664,12 @@ systemctl --user restart 'buzz-acp@{slug}.service'
         // test, and the deploy must run all the way through to the restart.
         let root = sandbox_host("cli-install", HostAcp::Installed);
         let agent = Agent::from_request(&request()).unwrap();
-        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, &cli_push(payload)).unwrap();
+        // The `Pushes` a desktop that set only `BUZZ_CLI_PUSH_BINARY` produces.
+        let pushes = Pushes {
+            acp: None,
+            cli: Some(payload),
+        };
+        let script = deploy_script(&agent, &config(), UNIT_TEMPLATE, &pushes).unwrap();
         let output = run_in_sandbox(&root, &script);
         assert!(
             output.status.success(),
