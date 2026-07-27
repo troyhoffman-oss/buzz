@@ -432,6 +432,7 @@ fn deploy_payload_carries_the_full_behavioral_quad() {
         Some("openai".to_string()),
         None,
         std::collections::BTreeMap::new(),
+        BinariesToPush::default(),
     );
 
     assert_eq!(payload["parallelism"], 4);
@@ -440,9 +441,26 @@ fn deploy_payload_carries_the_full_behavioral_quad() {
     assert_eq!(payload["model"], "gpt-x");
     assert_eq!(payload["provider"], "openai");
     assert_eq!(payload["relay_url"], "wss://relay.example");
-    // Both push seams are opt-in env vars: with neither set the payload must
-    // carry no path, so a provider reading them sees the same `None` it saw
-    // before the seams existed.
+    // Both push seams are opt-in: unresolved, the payload must carry no path,
+    // so a provider reading them sees the same `None` it saw before the seams
+    // existed.
     assert!(payload["buzz_acp_binary"].is_null());
     assert!(payload["buzz_cli_binary"].is_null());
+
+    // Resolved, each seam serializes as the path itself — the provider reads
+    // it with `as_str()` and streams that file to the host.
+    let pushed = deploy_payload_json(
+        &record,
+        "wss://relay.example".to_string(),
+        None,
+        None,
+        None,
+        std::collections::BTreeMap::new(),
+        BinariesToPush {
+            buzz_acp: Some("/tmp/buzz-acp".to_string()),
+            buzz_cli: Some("/tmp/buzz".to_string()),
+        },
+    );
+    assert_eq!(pushed["buzz_acp_binary"], "/tmp/buzz-acp");
+    assert_eq!(pushed["buzz_cli_binary"], "/tmp/buzz");
 }

@@ -99,12 +99,39 @@ pub(super) fn build_deploy_payload(
         effective_provider,
         effective_prompt,
         merged_env,
+        BinariesToPush::from_env(),
     ))
+}
+
+/// The binaries this machine offers to install on a host that resolves none.
+///
+/// A pair rather than two loose arguments because they are resolved together
+/// and read together by the provider, and because passing them in at all is
+/// what keeps [`deploy_payload_json`] pure.
+#[derive(Default)]
+pub(super) struct BinariesToPush {
+    pub buzz_acp: Option<String>,
+    pub buzz_cli: Option<String>,
+}
+
+impl BinariesToPush {
+    /// The dogfood seams as this process's environment currently reports them.
+    fn from_env() -> Self {
+        Self {
+            buzz_acp: buzz_acp_binary_to_push(),
+            buzz_cli: buzz_cli_binary_to_push(),
+        }
+    }
 }
 
 /// Pure serialization half of [`build_deploy_payload`] — every field the
 /// provider harness receives is deliberately listed here, so payload
 /// completeness is testable without an `AppHandle`.
+///
+/// The push seams arrive as a parameter rather than being read from the
+/// environment here: reading them inside would make this function's output a
+/// property of the developer's shell (the seams are env vars a dogfooding
+/// developer sets), which no test could pin down.
 pub(super) fn deploy_payload_json(
     record: &ManagedAgentRecord,
     relay_url: String,
@@ -112,6 +139,7 @@ pub(super) fn deploy_payload_json(
     effective_provider: Option<String>,
     effective_prompt: Option<String>,
     merged_env: std::collections::BTreeMap<String, String>,
+    binaries_to_push: BinariesToPush,
 ) -> serde_json::Value {
     serde_json::json!({
         "name": &record.name,
@@ -134,14 +162,14 @@ pub(super) fn deploy_payload_json(
         // on the host when the host has none. Serialized as `null` when unset —
         // a provider reading it with `as_str()` sees `None`, exactly as it does
         // for an absent key, so behavior is unchanged by default.
-        "buzz_acp_binary": buzz_acp_binary_to_push(),
+        "buzz_acp_binary": binaries_to_push.buzz_acp,
         // The same, for the `buzz` CLI. A local agent gets the CLI because the
         // desktop bundles it as a sidecar and prepends its directory to the
         // spawned harness's PATH; a remote agent is told by the very same system
         // prompt to reply with `buzz messages send`, so without this the remote
         // half of that contract is missing. Unlike `buzz-acp` its absence is a
         // warning on the provider side, never a failed deploy.
-        "buzz_cli_binary": buzz_cli_binary_to_push(),
+        "buzz_cli_binary": binaries_to_push.buzz_cli,
     })
 }
 

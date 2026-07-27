@@ -1088,7 +1088,10 @@ pub(super) fn normalize_agent_models(
                                     .get("displayName")
                                     .and_then(|v| v.as_str())
                                     .map(str::to_string),
-                                description: None,
+                                description: o
+                                    .get("description")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
                             });
                         }
                     }

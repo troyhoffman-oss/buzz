@@ -194,14 +194,12 @@ pub fn invoke_provider(
     // output would be worse than surfacing the failure.
     let exited_ok = exit_status.success();
     if !exited_ok {
-        let stderr_snippet = &stderr_redacted[..stderr_redacted.len().min(4096)];
-        if stderr_snippet.is_empty() {
-            return Err(format!("provider failed ({exit_info}, empty stderr)"));
-        } else {
-            return Err(format!(
-                "provider failed ({exit_info}). stderr: {stderr_snippet}"
-            ));
-        }
+        return Err(match provider_stderr_notice(&stderr_redacted) {
+            Some(stderr_snippet) => {
+                format!("provider failed ({exit_info}). stderr: {stderr_snippet}")
+            }
+            None => format!("provider failed ({exit_info}, empty stderr)"),
+        });
     }
 
     // Incremental JSON parse: try each line, then try the entire buffer.
@@ -212,14 +210,12 @@ pub fn invoke_provider(
         .lines()
         .find_map(|line| serde_json::from_str(line).ok())
         .or_else(|| serde_json::from_str(stdout_str.trim()).ok())
-        .ok_or_else(|| {
-            let stderr_snippet = &stderr_redacted[..stderr_redacted.len().min(4096)];
-            if stderr_snippet.is_empty() {
+        .ok_or_else(|| match provider_stderr_notice(&stderr_redacted) {
+            Some(stderr_snippet) => format!(
+                "provider produced no JSON response ({exit_info}). stderr: {stderr_snippet}"
+            ),
+            None => {
                 format!("provider produced no JSON response ({exit_info}, empty stderr)")
-            } else {
-                format!(
-                    "provider produced no JSON response ({exit_info}). stderr: {stderr_snippet}"
-                )
             }
         })?;
 
@@ -240,10 +236,13 @@ pub fn invoke_provider(
     Ok(response)
 }
 
-/// The loggable form of a successful provider's stderr: `None` when it holds
-/// nothing but whitespace, otherwise the already-redacted text trimmed and
-/// capped at the same 4 KiB the failure path reports. The cap walks back to a
-/// char boundary so a multi-byte character straddling it cannot panic.
+/// The reportable form of a provider's stderr: `None` when it holds nothing
+/// but whitespace, otherwise the already-redacted text trimmed and capped at
+/// 4 KiB. The cap walks back to a char boundary so a multi-byte character
+/// straddling it cannot panic. Both the success path (which logs it) and the
+/// two failure paths (which fold it into the returned error) go through here,
+/// so the snippet a warning shows and the snippet an error reports are the
+/// same text under the same cap.
 fn provider_stderr_notice(stderr_redacted: &str) -> Option<&str> {
     let trimmed = stderr_redacted.trim();
     if trimmed.is_empty() {
