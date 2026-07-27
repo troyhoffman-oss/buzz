@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 
 import { PRESET_LOGOS } from "../../onboarding/ui/RuntimeIcon.tsx";
 import {
+  HARNESS_LABELS,
   providerRecordHarness,
   resolvePinnedHarness,
 } from "./pinnedHarness.ts";
@@ -65,6 +66,19 @@ test("the Rust catalog parse found both tables", () => {
   );
 });
 
+/**
+ * Keys that intentionally have no Rust counterpart.
+ *
+ * The table also names the free-form command strings foreign surfaces carry —
+ * a relay agent's self-declared `agentType` — which are harnesses Buzz itself
+ * cannot run and so appear in no local catalog. Each one is listed with its
+ * reason, so an id dropped from the Rust side cannot hide here.
+ */
+const NOT_IN_RUST_CATALOG = new Set([
+  // Declared by relay agents (`agentType`); Buzz has no Aider runtime entry.
+  "aider",
+]);
+
 for (const { id, label } of rustHarnesses) {
   test(`harness "${id}" renders its catalog label`, () => {
     // Resolved through the public helper rather than the private table, so a
@@ -77,6 +91,23 @@ for (const { id, label } of rustHarnesses) {
     );
   });
 }
+
+test("HARNESS_LABELS names no harness the Rust catalogs dropped", () => {
+  // The other direction. Without it a harness renamed or removed in Rust
+  // leaves a stale TS entry that keeps answering with the old name, and the
+  // per-id tests above — which only walk the Rust side — stay green.
+  const rustIds = new Set(rustHarnesses.map((harness) => harness.id));
+  const orphaned = Object.keys(HARNESS_LABELS).filter(
+    (id) => !rustIds.has(id) && !NOT_IN_RUST_CATALOG.has(id),
+  );
+  assert.deepEqual(
+    orphaned,
+    [],
+    `HARNESS_LABELS names ids no Rust catalog emits: ${orphaned.join(", ")}. ` +
+      "Drop them, or list them in NOT_IN_RUST_CATALOG with the surface that " +
+      "carries the command.",
+  );
+});
 
 // ── The pins that broke ─────────────────────────────────────────────────────
 

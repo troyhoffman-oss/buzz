@@ -31,6 +31,20 @@ const remoteAgent = {
 
 test("a relay agent's declared type keeps its friendly name", () => {
   assert.equal(runtimeCommandLabel("codex-acp"), "Codex");
+  assert.equal(runtimeCommandLabel("claude-code"), "Claude Code");
+  assert.equal(runtimeCommandLabel("goose"), "Goose");
+  // A harness Buzz cannot run itself, so it lives in HARNESS_LABELS only for
+  // this surface — see `NOT_IN_RUST_CATALOG` in `pinnedHarness.test.mjs`.
+  assert.equal(runtimeCommandLabel("aider"), "Aider");
+});
+
+test("every harness the catalog knows is named here too", () => {
+  // The four-entry table this used to carry named none of these, so a relay
+  // agent declaring one read as a raw command beside a record that read as a
+  // name. One owner means a harness learned in Rust arrives on both surfaces.
+  assert.equal(runtimeCommandLabel("hermes"), "Hermes Agent");
+  assert.equal(runtimeCommandLabel("opencode"), "OpenCode");
+  assert.equal(runtimeCommandLabel("amp-acp"), "Amp");
 });
 
 test("an unmapped command names itself", () => {

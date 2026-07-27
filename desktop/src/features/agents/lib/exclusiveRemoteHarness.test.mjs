@@ -14,6 +14,7 @@ import {
   addedExclusiveHarnessIds,
   isExclusiveRemoteHarnessAdded,
 } from "./exclusiveRemoteHarness.ts";
+import { resolvePinnedHarness } from "./pinnedHarness.ts";
 
 const HOST = {
   providerId: "ssh",
@@ -136,6 +137,24 @@ test("blank and untrimmed args still match the record they minted", () => {
   // record, so the catalog entry must be compared the same way.
   const messy = harness({ args: [" --profile ", "default", "", "acp"] });
   assert.equal(isExclusiveRemoteHarnessAdded(messy, HOST, [agent()]), true);
+});
+
+test("what counts as the same pin here is what the user is shown", () => {
+  // Two spellings of one rule is the drift this shares an owner to avoid: a
+  // pin taken by the guard must read as the same string on screen, or an
+  // agent is "already added" against a card naming something else.
+  const messy = { command: " hermes ", args: [" --profile ", "default", ""] };
+  const clean = { command: "hermes", args: ["--profile", "default"] };
+  assert.equal(
+    resolvePinnedHarness(messy.command, messy.args).command,
+    resolvePinnedHarness(clean.command, clean.args).command,
+  );
+  assert.equal(
+    isExclusiveRemoteHarnessAdded(harness({ args: messy.args }), HOST, [
+      agent({ agentArgs: clean.args }),
+    ]),
+    true,
+  );
 });
 
 test("a blank optional config field equals an omitted one", () => {

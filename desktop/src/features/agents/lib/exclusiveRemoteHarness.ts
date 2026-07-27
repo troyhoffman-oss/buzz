@@ -1,4 +1,5 @@
 import type { ManagedAgent, RemoteHarness } from "@/shared/api/types";
+import { normalizePinnedCommand } from "./pinnedHarness";
 
 /**
  * "Is this exclusive catalog entry already taken?"
@@ -66,25 +67,24 @@ function canonicalConfig(config: Record<string, unknown>): string {
  * The pinned identity of a harness: the command and args that will actually
  * run on the host.
  *
- * Blank args are dropped because `create_time_agent_args` drops them on the way
- * into the record, so a catalog entry carrying one would otherwise never match
- * the record minted from it.
+ * Canonicalized by `normalizePinnedCommand`, the same owner the pin's displayed
+ * `command` string goes through — a rule that decides "same agent?" and a rule
+ * that decides what the user reads must be one rule, or a pin differing only by
+ * whitespace is taken here and a different string on screen.
  *
- * Beyond that the comparison is literal, which is right for a provider record:
- * its create-time args are pinned verbatim precisely because normalizing a
- * REMOTE command against LOCAL runtime identity is a category error (see
- * `create_time_agent_args`). The summary layer still runs them through
- * `normalize_agent_args`, so an exclusive entry whose command happens to share
- * a basename with a known local runtime could read back with substituted args
- * and under-match here. No such entry exists today (`hermes` is not a known
- * local runtime), and the failure mode is the documented one: the guard does
- * not fire.
+ * Beyond that normalization the comparison is literal, which is right for a
+ * provider record: its create-time args are pinned verbatim precisely because
+ * normalizing a REMOTE command against LOCAL runtime identity is a category
+ * error (see `create_time_agent_args`). The summary layer still runs them
+ * through `normalize_agent_args`, so an exclusive entry whose command happens
+ * to share a basename with a known local runtime could read back with
+ * substituted args and under-match here. No such entry exists today (`hermes`
+ * is not a known local runtime), and the failure mode is the documented one:
+ * the guard does not fire.
  */
 function pinnedIdentity(command: string, args: readonly string[]): string {
-  return JSON.stringify([
-    command.trim(),
-    args.map((arg) => arg.trim()).filter((arg) => arg.length > 0),
-  ]);
+  const pin = normalizePinnedCommand(command, args);
+  return JSON.stringify([pin.command, pin.args]);
 }
 
 /**

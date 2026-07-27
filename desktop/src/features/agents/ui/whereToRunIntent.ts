@@ -1,3 +1,4 @@
+import { backendProviderLabel } from "../lib/backendProviderLabel";
 import type { BackendIntent } from "../lib/instanceInputForDefinition";
 import type {
   AgentModelsResponse,
@@ -64,7 +65,9 @@ export const emptyWhereToRunDraft: WhereToRunDraft = {
  * actually selected have ever been probed. `probedNames` carries the names
  * already paid for — see `rememberProbedProviderName` — and the id stands in
  * for the rest, rather than spawning every discovered provider on dialog open
- * to decorate a label.
+ * to decorate a label. The name-or-id choice itself is
+ * `backendProviderLabel`'s, so the create dialog and the agent cards cannot
+ * drift into two naming schemes for one machine.
  *
  * The cache is what keeps the list stable. Reading the name off the CURRENT
  * selection alone would rename a provider the moment it is picked and rename
@@ -79,7 +82,7 @@ export function runTargetOptions(
   return [
     { label: "This computer", value: LOCAL_RUN_TARGET_VALUE },
     ...providers.map((provider) => ({
-      label: probedNames[provider.id] ?? provider.id,
+      label: backendProviderLabel(provider.id, probedNames[provider.id]),
       value: provider.id,
     })),
   ];

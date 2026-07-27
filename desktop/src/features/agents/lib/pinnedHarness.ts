@@ -18,14 +18,20 @@ import type { ManagedAgent } from "@/shared/api/types";
  */
 
 /**
- * Human labels for the harness ids both catalogs emit.
+ * Human labels for every harness command this app has a name for.
  *
  * Mirrors the Rust `KNOWN_ACP_RUNTIMES` and `PRESET_HARNESSES` tables. The two
  * sides are different languages, so no compiler catches drift —
  * `pinnedHarness.test.mjs` reads the Rust source and asserts both directions,
  * exactly as `presetLogos.test.mjs` does for the logo map.
+ *
+ * A key with no Rust counterpart must be listed in that test's
+ * `NOT_IN_RUST_CATALOG` with its reason: this table also names the free-form
+ * command strings foreign surfaces carry (a relay agent's self-declared
+ * `agentType`), which are harnesses Buzz itself cannot run.
  */
-const HARNESS_LABELS: Record<string, string> = {
+export const HARNESS_LABELS: Record<string, string> = {
+  aider: "Aider",
   amp: "Amp",
   "buzz-agent": "Buzz Agent",
   claude: "Claude Code",
@@ -42,6 +48,31 @@ const HARNESS_LABELS: Record<string, string> = {
 
 /** Shown when a record carries no command at all. Matches the dialog copy. */
 const UNCONFIGURED_LABEL = "Not configured";
+
+/**
+ * A pin's command and args in the one canonical spelling this app uses.
+ *
+ * The command is trimmed and blank args are dropped, because
+ * `create_time_agent_args` drops them on the way into the record — a catalog
+ * entry carrying one would otherwise never match the record minted from it.
+ * Beyond that nothing is rewritten: the pin names a binary on the HOST, and
+ * normalizing a remote command against local runtime identity is the category
+ * error `create_time_agent_args` exists to avoid.
+ *
+ * One owner because two lanes read this: the pin's own `command` string (what a
+ * human sees and copies) and `exclusiveRemoteHarness`'s identity comparison
+ * (whether two records are the same agent). If they disagreed, a pin differing
+ * only by whitespace would be "already added" and a different string on screen.
+ */
+export function normalizePinnedCommand(
+  command: string,
+  args: readonly string[],
+): { command: string; args: string[] } {
+  return {
+    command: command.trim(),
+    args: args.map((arg) => arg.trim()).filter((arg) => arg.length > 0),
+  };
+}
 
 /** The identity of a harness pin, derived from the pin alone. */
 export type PinnedHarness = {
@@ -133,22 +164,17 @@ export function resolvePinnedHarness(
   command: string,
   args: readonly string[],
 ): PinnedHarness {
-  const trimmedCommand = command.trim();
-  const basename = commandBasename(trimmedCommand);
+  const pin = normalizePinnedCommand(command, args);
+  const basename = commandBasename(pin.command);
   const id = resolveHarnessId(basename);
-  const baseLabel = id
-    ? HARNESS_LABELS[id]
-    : trimmedCommand || UNCONFIGURED_LABEL;
+  const baseLabel = id ? HARNESS_LABELS[id] : pin.command || UNCONFIGURED_LABEL;
   const profile = profileName(args);
-  const trimmedArgs = args
-    .map((arg) => arg.trim())
-    .filter((arg) => arg.length > 0);
 
   return {
     id,
     label: profile ? `${baseLabel} (${profile})` : baseLabel,
     logoUrl: getHarnessLogoUrl(basename),
-    command: [trimmedCommand, ...trimmedArgs].join(" ").trim(),
+    command: [pin.command, ...pin.args].join(" ").trim(),
   };
 }
 

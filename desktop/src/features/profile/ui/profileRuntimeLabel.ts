@@ -1,31 +1,33 @@
-import { providerRecordHarness } from "@/features/agents/lib/pinnedHarness";
+import {
+  providerRecordHarness,
+  resolvePinnedHarness,
+} from "@/features/agents/lib/pinnedHarness";
 import type { ManagedAgent } from "@/shared/api/types";
 
 /**
  * How the profile surfaces name the harness behind an agent.
  *
  * One owner for a rule that was typed twice — the panel's "Runtime" field and
- * the popover's badge carried byte-identical copies of the table below, so a
+ * the popover's badge carried byte-identical copies of the label table, so a
  * name learned in one place was still wrong in the other.
  */
 
 /**
- * Friendly names for the command strings a NON-record surface carries.
+ * The friendly name for a command string a NON-record surface carries.
  *
- * The values here are a relay agent's self-declared `agentType` and a
- * definition's `runtime` preference: free-form strings from elsewhere, not a
- * pin this app can resolve. Unmatched input falls through to itself, which is
- * the honest answer for a name only its author knows.
+ * The inputs here are a relay agent's self-declared `agentType` and a
+ * definition's `runtime` preference: free-form strings from elsewhere rather
+ * than a record's pin. They are still commands, so they are read by the one
+ * command→harness owner (`resolvePinnedHarness`) instead of a second label
+ * table — a rival table names `codex-acp` today and misses whatever the Rust
+ * catalog learns tomorrow, with no mirror test to catch the gap.
+ *
+ * Args are empty because these surfaces carry a bare command; an unrecognized
+ * one falls through to itself, which is the honest answer for a name only its
+ * author knows. Every call site already guards against a blank string.
  */
-const RUNTIME_LABELS: Record<string, string> = {
-  goose: "Goose",
-  "claude-code": "Claude Code",
-  "codex-acp": "Codex",
-  aider: "Aider",
-};
-
 export function runtimeCommandLabel(command: string): string {
-  return RUNTIME_LABELS[command] ?? command;
+  return resolvePinnedHarness(command, []).label;
 }
 
 /**
