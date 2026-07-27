@@ -465,6 +465,10 @@ pub struct ManagedAgentSummary {
     pub pubkey: String,
     pub name: String,
     pub persona_id: Option<String>,
+    /// The record's harness/runtime id (mirror of `ManagedAgentRecord.runtime`).
+    /// Lets the UI count agents referencing a harness definition (e.g. in the
+    /// delete-confirmation flow). `None` = inherit from the linked persona.
+    pub runtime: Option<String>,
     pub team_id: Option<String>,
     pub relay_url: String,
     pub acp_command: String,
@@ -771,7 +775,7 @@ pub struct UpdateTeamRequest {
 pub const DEFAULT_ACP_COMMAND: &str = "buzz-acp";
 /// ~5 min (320s) — matches the CLI harness default (BUZZ_ACP_IDLE_TIMEOUT).
 pub const DEFAULT_AGENT_TURN_TIMEOUT_SECONDS: u64 = 320;
-pub const DEFAULT_AGENT_PARALLELISM: u32 = 24;
+pub const DEFAULT_AGENT_PARALLELISM: u32 = 10;
 
 fn default_agent_parallelism() -> u32 {
     DEFAULT_AGENT_PARALLELISM

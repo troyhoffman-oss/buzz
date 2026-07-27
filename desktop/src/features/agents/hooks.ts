@@ -278,8 +278,9 @@ export function useGitBashPrerequisiteQuery() {
   });
 }
 
-export function usePersonasQuery() {
+export function usePersonasQuery(options?: { enabled?: boolean }) {
   return useQuery({
+    enabled: options?.enabled ?? true,
     queryKey: personasQueryKey,
     queryFn: listPersonas,
     staleTime: 30_000,

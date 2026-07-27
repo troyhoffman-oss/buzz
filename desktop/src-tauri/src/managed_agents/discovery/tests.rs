@@ -6,8 +6,8 @@ use super::{
     codex_adapter_is_outdated, create_time_agent_command_override, default_agent_command,
     effective_agent_command, find_nvm_default_bin, find_via_login_shell,
     is_login_shell_path_uninit, is_safe_nvm_tag, managed_agent_avatar_url, normalize_agent_args,
-    parse_semver_tag, probe_codex_acp_major_version, record_agent_command,
-    refresh_login_shell_path, try_record_agent_command, BUZZ_AGENT_AVATAR_URL,
+    parse_semver_tag, preset_catalog_entry, probe_codex_acp_major_version, record_agent_command,
+    refresh_login_shell_path, try_record_agent_command, PresetHarness, BUZZ_AGENT_AVATAR_URL,
     CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL, GOOSE_AVATAR_URL,
 };
 use crate::managed_agents::AcpAvailabilityStatus;
@@ -187,6 +187,90 @@ fn classifies_cli_missing_when_adapter_found_but_cli_absent() {
     assert_eq!(status, AcpAvailabilityStatus::CliMissing);
     assert_eq!(cmd.as_deref(), Some("codex-acp"));
     assert_eq!(path.as_deref(), Some("/opt/homebrew/bin/codex-acp"));
+}
+
+/// Amp-shaped preset: an ACP adapter (`amp-acp`) wrapping a separately
+/// installed vendor CLI (`amp`).
+const ADAPTER_PRESET: PresetHarness = PresetHarness {
+    id: "amp-test",
+    label: "Amp Test",
+    command: "amp-acp",
+    args: &[],
+    install_instructions_url: "https://example.com/install",
+    install_hint: "Install the amp-acp npm adapter.",
+    underlying_cli: Some("amp"),
+};
+
+#[test]
+fn preset_entry_adapter_missing_when_underlying_cli_present() {
+    // Vendor CLI resolves, adapter does not — the state Tyler's Amp
+    // hand-test hit. Must NOT degrade to the misleading NotInstalled.
+    let entry = preset_catalog_entry(&ADAPTER_PRESET, |cmd| {
+        (cmd == "amp").then(|| PathBuf::from("/usr/local/bin/amp"))
+    });
+    assert_eq!(entry.availability, AcpAvailabilityStatus::AdapterMissing);
+    assert!(entry.command.is_none());
+    assert!(entry.binary_path.is_none());
+    assert_eq!(
+        entry.underlying_cli_path.as_deref(),
+        Some("/usr/local/bin/amp")
+    );
+    assert!(!entry.requires_external_cli);
+    assert_eq!(entry.install_hint, "Install the amp-acp npm adapter.");
+}
+
+#[test]
+fn preset_entry_not_installed_when_both_missing() {
+    let entry = preset_catalog_entry(&ADAPTER_PRESET, |_| None);
+    assert_eq!(entry.availability, AcpAvailabilityStatus::NotInstalled);
+    assert!(entry.underlying_cli_path.is_none());
+    assert!(!entry.requires_external_cli);
+}
+
+#[test]
+fn preset_entry_available_when_adapter_and_cli_present() {
+    let entry = preset_catalog_entry(&ADAPTER_PRESET, |cmd| match cmd {
+        "amp-acp" => Some(PathBuf::from("/usr/local/bin/amp-acp")),
+        "amp" => Some(PathBuf::from("/usr/local/bin/amp")),
+        _ => None,
+    });
+    assert_eq!(entry.availability, AcpAvailabilityStatus::Available);
+    assert_eq!(entry.command.as_deref(), Some("amp-acp"));
+    assert_eq!(entry.binary_path.as_deref(), Some("/usr/local/bin/amp-acp"));
+    assert_eq!(
+        entry.underlying_cli_path.as_deref(),
+        Some("/usr/local/bin/amp")
+    );
+}
+
+#[test]
+fn preset_entry_stays_available_when_adapter_present_but_cli_absent() {
+    // Wren's regression guard: today an `amp-acp` install without `amp`
+    // is Available and selectable. Feeding underlying_cli through the
+    // FULL classify_runtime predicate would flip this to CliMissing
+    // (unselectable, with backwards install copy) — the adapter-missing
+    // arm is the only one presets consume.
+    let entry = preset_catalog_entry(&ADAPTER_PRESET, |cmd| {
+        (cmd == "amp-acp").then(|| PathBuf::from("/usr/local/bin/amp-acp"))
+    });
+    assert_eq!(entry.availability, AcpAvailabilityStatus::Available);
+    assert_eq!(entry.command.as_deref(), Some("amp-acp"));
+    assert_eq!(entry.binary_path.as_deref(), Some("/usr/local/bin/amp-acp"));
+    assert!(entry.underlying_cli_path.is_none());
+}
+
+#[test]
+fn preset_entry_without_underlying_cli_stays_simple() {
+    // Most presets: the command IS the vendor CLI. No external-CLI flag,
+    // absent command means plain NotInstalled.
+    let preset = PresetHarness {
+        underlying_cli: None,
+        ..ADAPTER_PRESET
+    };
+    let entry = preset_catalog_entry(&preset, |_| None);
+    assert_eq!(entry.availability, AcpAvailabilityStatus::NotInstalled);
+    assert!(!entry.requires_external_cli);
+    assert!(entry.underlying_cli_path.is_none());
 }
 
 fn persona_with_runtime(id: &str, runtime: Option<&str>) -> crate::managed_agents::AgentDefinition {
@@ -1507,6 +1591,96 @@ fn registry_edit_with_id_rename_old_dangling_new_resolved() {
     );
 }
 
+// ── Dangling-harness sentinel → user-facing surfaces ─────────────────────────
+
+/// The internal `DANGLING_HARNESS_ID:<id>` sentinel round-trips through
+/// `dangling_harness_id` and is never confused with other error strings.
+#[test]
+fn dangling_harness_id_extracts_id_and_rejects_other_errors() {
+    use super::{dangling_harness_id, DANGLING_HARNESS_PREFIX};
+    assert_eq!(
+        dangling_harness_id(&format!("{DANGLING_HARNESS_PREFIX}my-harness")),
+        Some("my-harness")
+    );
+    assert_eq!(dangling_harness_id("some other error"), None);
+    assert_eq!(dangling_harness_id(""), None);
+    // Prefix must anchor at the start — a wrapped sentinel is not a sentinel.
+    assert_eq!(
+        dangling_harness_id("cannot spawn: DANGLING_HARNESS_ID:x"),
+        None
+    );
+}
+
+/// Spawn surfaces the sentinel as an actionable sentence naming the id;
+/// non-sentinel errors pass through untouched.
+#[test]
+fn user_facing_harness_error_converts_sentinel_to_sentence() {
+    use super::{user_facing_harness_error, DANGLING_HARNESS_PREFIX};
+    let msg = user_facing_harness_error(&format!("{DANGLING_HARNESS_PREFIX}foo"));
+    assert!(
+        msg.contains("\"foo\"") && msg.contains("deleted"),
+        "sentence must name the missing harness, got: {msg}"
+    );
+    assert!(
+        !msg.contains(DANGLING_HARNESS_PREFIX),
+        "raw sentinel must never reach the user, got: {msg}"
+    );
+    assert_eq!(
+        user_facing_harness_error("plain failure"),
+        "plain failure",
+        "non-sentinel errors pass through"
+    );
+}
+
+/// Composed coherence test (delete → summary display → spawn sentence): after
+/// a harness is deleted, the single resolver errors with the sentinel, the
+/// summary path renders the *missing id* (not a silent buzz-agent fallback),
+/// and the spawn path renders the actionable sentence — both halves tell the
+/// same story from the same error.
+#[test]
+fn deleted_harness_summary_display_and_spawn_sentence_agree() {
+    use crate::managed_agents::custom_harnesses::{
+        delete_and_warm, registry_test_lock, save_and_warm,
+    };
+    use crate::managed_agents::{resolve_effective_harness_descriptor, GlobalAgentConfig};
+
+    let _lock = registry_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+
+    // Save a custom harness and pin a record to it.
+    let def = crate::managed_agents::custom_harnesses::HarnessDefinition {
+        id: "doomed".to_string(),
+        label: "Doomed".to_string(),
+        command: "doomed-bin".to_string(),
+        args: vec![],
+        env: Default::default(),
+        install_instructions_url: String::new(),
+        install_hint: String::new(),
+    };
+    save_and_warm(dir.path(), &def, None).unwrap();
+    let record = record_with(Some("doomed"), None, None);
+    let global = GlobalAgentConfig::default();
+    assert!(
+        resolve_effective_harness_descriptor(&record, &[], &global).is_ok(),
+        "must resolve before delete"
+    );
+
+    // Delete it — the shared resolver used by BOTH spawn and summary errors.
+    delete_and_warm(dir.path(), "doomed").unwrap();
+    let err = resolve_effective_harness_descriptor(&record, &[], &global).unwrap_err();
+
+    // Summary half: renders the missing id, never the default command.
+    let id = super::dangling_harness_id(&err).expect("resolver must emit the typed sentinel");
+    let display = super::dangling_harness_display(id);
+    assert_eq!(display, "harness (deleted): doomed");
+    assert!(!display.contains(&default_agent_command()));
+
+    // Spawn half: renders a sentence naming the same id, no raw sentinel.
+    let sentence = super::user_facing_harness_error(&err);
+    assert!(sentence.contains("\"doomed\"") && sentence.contains("deleted"));
+    assert!(!sentence.contains(super::DANGLING_HARNESS_PREFIX));
+}
+
 // ── I2: custom catalog entry carries definition_env for the edit round-trip ───
 
 /// A custom harness definition that includes env vars must surface those vars
@@ -1517,10 +1691,18 @@ fn registry_edit_with_id_rename_old_dangling_new_resolved() {
 /// therefore preserves existing env vars rather than silently erasing them.
 #[test]
 fn custom_catalog_entry_carries_definition_env_for_edit_roundtrip() {
+    use crate::managed_agents::custom_harnesses::registry_test_lock;
     use crate::managed_agents::discovery::discover_acp_runtimes_from;
     use std::{collections::BTreeMap, fs};
     use tempfile::tempdir;
 
+    // Discovery's auth probes read/warm the process-global PATH and
+    // login-shell-PATH caches, and its final step publishes to the global
+    // harness registry — hold both guards so parallel tests (e.g. the
+    // PATH-swapping resolution tests) can't observe or absorb torn state.
+    // Lock order for tests that need both: path lock first, then registry.
+    let _path_guard = crate::managed_agents::lock_path_mutex();
+    let _lock = registry_test_lock();
     let dir = tempdir().unwrap();
     // Write a custom definition with two env vars.
     fs::write(
@@ -1558,8 +1740,13 @@ fn custom_catalog_entry_carries_definition_env_for_edit_roundtrip() {
 /// is handled via the `KnownAcpRuntime` metadata path, not user-editable JSON.
 #[test]
 fn builtin_catalog_entry_has_empty_definition_env() {
+    use crate::managed_agents::custom_harnesses::registry_test_lock;
     use crate::managed_agents::discovery::discover_acp_runtimes_from;
 
+    // Same guards as above: discovery probes PATH-dependent caches and
+    // publishes to the global registry.
+    let _path_guard = crate::managed_agents::lock_path_mutex();
+    let _lock = registry_test_lock();
     let entries = discover_acp_runtimes_from(None);
     // Find any builtin entry (e.g. "goose" or "claude").
     let builtin = entries
@@ -1571,5 +1758,113 @@ fn builtin_catalog_entry_has_empty_definition_env() {
         builtin.definition_env.is_empty(),
         "builtin entry must not carry definition_env, got: {:?}",
         builtin.definition_env
+    );
+}
+
+// ── Discovery publish via the PRODUCTION call path (stale-snapshot regression) ─
+//
+// These drive `discover_acp_runtimes_from` itself and land a save/delete in
+// the window between its directory scan and its registry publish (via the
+// `pre_publish_test_hook` seam). They red if discovery's final line reverts
+// to publishing its pre-probe `loaded_defs` snapshot — the original bug —
+// unlike the `custom_harnesses` seam tests, which pin only the fresh-read
+// contract of `warm_harness_registry_locked`.
+
+/// RAII guard: installs the pre-publish hook, clears it on drop (even on
+/// panic) so a failing test cannot poison later ones.
+struct PrePublishHookGuard;
+
+impl PrePublishHookGuard {
+    fn install(hook: Box<dyn Fn() + Send>) -> Self {
+        super::pre_publish_test_hook::set(Some(hook));
+        PrePublishHookGuard
+    }
+}
+
+impl Drop for PrePublishHookGuard {
+    fn drop(&mut self) {
+        super::pre_publish_test_hook::set(None);
+    }
+}
+
+fn harness_def(
+    id: &str,
+    label: &str,
+    command: &str,
+) -> crate::managed_agents::custom_harnesses::HarnessDefinition {
+    crate::managed_agents::custom_harnesses::HarnessDefinition {
+        id: id.to_string(),
+        label: label.to_string(),
+        command: command.to_string(),
+        args: vec![],
+        env: Default::default(),
+        install_instructions_url: String::new(),
+        install_hint: String::new(),
+    }
+}
+
+/// A `save_and_warm` landing mid-discovery (after the scan, before the
+/// publish) must survive discovery's registry publish — through the real
+/// `discover_acp_runtimes_from` path.
+#[test]
+fn discovery_publish_path_survives_mid_flight_save() {
+    use crate::managed_agents::custom_harnesses::{
+        lookup_loaded_harness_by_id, registry_test_lock, save_and_warm,
+    };
+    use crate::managed_agents::discovery::discover_acp_runtimes_from;
+
+    // Path lock first, then registry — discovery's probes touch the global
+    // PATH caches (see the definition_env tests above for the full rationale).
+    let _path_guard = crate::managed_agents::lock_path_mutex();
+    let _lock = registry_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+
+    // Discovery scans the dir while it is EMPTY; the save lands in the
+    // pre-publish window. A stale-snapshot publish would clobber it.
+    let hook_dir = dir.path().to_path_buf();
+    let _guard = PrePublishHookGuard::install(Box::new(move || {
+        let def = harness_def("mid-flight-save", "Mid Flight", "mid-flight-bin");
+        save_and_warm(&hook_dir, &def, None).unwrap();
+        assert!(lookup_loaded_harness_by_id("mid-flight-save").is_some());
+    }));
+
+    let _entries = discover_acp_runtimes_from(Some(dir.path()));
+
+    assert!(
+        lookup_loaded_harness_by_id("mid-flight-save").is_some(),
+        "discovery's publish must re-read the directory — a stale-snapshot \
+         publish clobbers a save that landed mid-discovery"
+    );
+}
+
+/// A `delete_and_warm` landing mid-discovery must stay gone after discovery's
+/// publish — a stale snapshot (taken while the file existed) would resurrect it.
+#[test]
+fn discovery_publish_path_drops_mid_flight_delete() {
+    use crate::managed_agents::custom_harnesses::{
+        delete_and_warm, lookup_loaded_harness_by_id, registry_test_lock, save_and_warm,
+    };
+    use crate::managed_agents::discovery::discover_acp_runtimes_from;
+
+    // Path lock first, then registry (same rationale as the sibling test).
+    let _path_guard = crate::managed_agents::lock_path_mutex();
+    let _lock = registry_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+
+    // File exists at scan time — discovery's snapshot would contain it.
+    let def = harness_def("mid-flight-delete", "Mid Flight Del", "mid-flight-del-bin");
+    save_and_warm(dir.path(), &def, None).unwrap();
+
+    let hook_dir = dir.path().to_path_buf();
+    let _guard = PrePublishHookGuard::install(Box::new(move || {
+        delete_and_warm(&hook_dir, "mid-flight-delete").unwrap();
+        assert!(lookup_loaded_harness_by_id("mid-flight-delete").is_none());
+    }));
+
+    let _entries = discover_acp_runtimes_from(Some(dir.path()));
+
+    assert!(
+        lookup_loaded_harness_by_id("mid-flight-delete").is_none(),
+        "discovery's publish must not resurrect a harness deleted mid-discovery"
     );
 }

@@ -107,6 +107,17 @@ const _: () = assert!(std::mem::size_of::<BSDInfo>() == 136);
 #[cfg(target_os = "macos")]
 pub(super) const PROC_PIDTBSDINFO: libc::c_int = 3;
 
+// ── Sweep ownership rule ──────────────────────────────────────────────────────
+//
+// The `BUZZ_MANAGED_AGENT` env marker is the SOLE authoritative ownership
+// proof for sweep/receipt decisions. Do NOT name-gate via
+// `process_belongs_to_us` here — custom harnesses use arbitrary binary names
+// and a name-gated predicate would silently leak their orphans (the old Linux
+// AND-gate bug). `process_belongs_to_us` remains in use only as a cheap
+// pre-check on paths that already know the binary (see runtime/stop.rs).
+// On Windows no `/proc`-based sweep runs, so `process_has_buzz_marker`
+// always returns `false`.
+
 /// Enumerate all processes on the system owned by the current user and kill any
 /// agent binary stamped with *this* instance's `BUZZ_MANAGED_AGENT` marker
 /// (`instance_id`) that isn't in `skip_pids`. This catches orphans that escaped
@@ -151,13 +162,7 @@ pub(crate) fn sweep_system_agent_processes(instance_id: &str, skip_pids: &[u32])
         }
         // Custom harnesses don't match KNOWN_AGENT_BINARIES by name; the
         // BUZZ_MANAGED_AGENT env marker is the authoritative ownership proof.
-        // `buzz_sweep_owns_process` returns `has_buzz_marker` — the
-        // `_belongs_to_us` argument is accepted for call-site symmetry but
-        // is intentionally ignored (see the function's doc comment).
-        if !buzz_sweep_owns_process(
-            process_belongs_to_us(upid),
-            process_has_buzz_marker(upid, instance_id),
-        ) {
+        if !process_has_buzz_marker(upid, instance_id) {
             continue;
         }
         // Live descendants of a tracked harness are exempt — see sweep::is_live_descendant_*.
@@ -208,13 +213,9 @@ pub(crate) fn sweep_system_agent_processes(instance_id: &str, skip_pids: &[u32])
         if meta.uid() != my_uid {
             continue;
         }
-        // Same ownership predicate as macOS: marker is the authoritative gate,
-        // `_belongs_to_us` is accepted for call-site symmetry but ignored.
+        // Same ownership rule as macOS: the marker is the authoritative gate.
         // Fixes custom-harness orphan cleanup on Linux.
-        if !buzz_sweep_owns_process(
-            process_belongs_to_us(upid),
-            process_has_buzz_marker(upid, instance_id),
-        ) {
+        if !process_has_buzz_marker(upid, instance_id) {
             continue;
         }
         // Live descendants of a tracked harness are exempt — see sweep::is_live_descendant_*.
@@ -317,10 +318,7 @@ pub(crate) fn collect_same_instance_orphans(
         }
         // Custom harnesses don't match KNOWN_AGENT_BINARIES by name; the
         // BUZZ_MANAGED_AGENT env marker is the authoritative ownership proof.
-        if !buzz_sweep_owns_process(
-            process_belongs_to_us(upid),
-            process_has_buzz_marker(upid, instance_id),
-        ) {
+        if !process_has_buzz_marker(upid, instance_id) {
             continue;
         }
         // Live descendants of a tracked harness are exempt — see sweep::is_live_descendant_*.
@@ -366,13 +364,9 @@ pub(crate) fn collect_same_instance_orphans(
         if meta.uid() != my_uid {
             continue;
         }
-        // Same ownership predicate as macOS: marker is the authoritative gate,
-        // `_belongs_to_us` is accepted for call-site symmetry but ignored.
+        // Same ownership rule as macOS: the marker is the authoritative gate.
         // Fixes custom-harness orphan cleanup on Linux.
-        if !buzz_sweep_owns_process(
-            process_belongs_to_us(upid),
-            process_has_buzz_marker(upid, instance_id),
-        ) {
+        if !process_has_buzz_marker(upid, instance_id) {
             continue;
         }
         // Live descendants of a tracked harness are exempt — see sweep::is_live_descendant_*.

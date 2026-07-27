@@ -194,33 +194,33 @@ fn saved_agent_model_discovery_uses_record_snapshot_for_definition_less_agent() 
     )
     .expect("sample managed agent record");
 
-    // Bound to the seam get_agent_models consumes — verify it layers env
-    // correctly and strips reserved keys. Model/provider are
-    // definition-authoritative, but this record is definition-less, so its own
-    // values are the effective ones.
-    let config = agent_model_discovery_config(&record, &[], &Default::default())
-        .expect("config should resolve for a valid record");
+    // agent_model_discovery_config is the single helper get_agent_models
+    // consumes — verify it layers env correctly, strips reserved keys, and
+    // keeps the record's own model/provider for a definition-less instance
+    // (matching spawn's `resolve_definition_less` arm).
+    let discovery = agent_model_discovery_config(&record, &[], &Default::default())
+        .expect("discovery config should resolve for a valid record");
 
-    assert_eq!(config.command.as_str(), "goose");
-    assert_eq!(config.model.as_deref(), Some("record-model"));
-    assert_eq!(config.provider.as_deref(), Some("databricks"));
+    assert_eq!(discovery.command.as_str(), "goose");
+    assert_eq!(discovery.model.as_deref(), Some("record-model"));
+    assert_eq!(discovery.provider.as_deref(), Some("databricks"));
     assert_eq!(
-        config.env.get("GOOSE_MODEL").map(String::as_str),
+        discovery.env.get("GOOSE_MODEL").map(String::as_str),
         Some("record-model")
     );
     assert_eq!(
-        config.env.get("GOOSE_PROVIDER").map(String::as_str),
+        discovery.env.get("GOOSE_PROVIDER").map(String::as_str),
         Some("databricks")
     );
     assert_eq!(
-        config.env.get("OPENAI_API_KEY").map(String::as_str),
+        discovery.env.get("OPENAI_API_KEY").map(String::as_str),
         Some("record-key")
     );
-    // Reserved keys are stripped from the discovery env.
-    assert!(!config.env.contains_key("BUZZ_PRIVATE_KEY"));
-    // The provider env var discovery recovers from is the effective harness's
-    // own key, resolved off the effective command.
-    assert_eq!(config.provider_env_var, Some("GOOSE_PROVIDER"));
+    // Reserved keys are stripped from the descriptor env.
+    assert!(!discovery.env.contains_key("BUZZ_PRIVATE_KEY"));
+    // The provider env var is recovered from the runtime metadata for the
+    // effective command (the old SavedAgentModelDiscoveryConfig.provider_env_var).
+    assert_eq!(discovery.provider_env_var, Some("GOOSE_PROVIDER"));
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +356,7 @@ fn effective_discovery_provider_reads_the_runtimes_own_env_var() {
 /// linked definition's current model/provider wins, mirroring spawn's
 /// `resolve_effective_model_provider`.
 #[test]
-fn saved_agent_model_discovery_ignores_stale_record_for_linked_agent() {
+fn model_discovery_ignores_stale_record_for_linked_agent() {
     let record: crate::managed_agents::ManagedAgentRecord = serde_json::from_str(
         r#"{
             "pubkey": "abcd1234",
@@ -388,9 +388,6 @@ fn saved_agent_model_discovery_ignores_stale_record_for_linked_agent() {
         display_name: "Persona".to_string(),
         avatar_url: None,
         system_prompt: "You are a persona.".to_string(),
-        // Definition-authoritative on the harness axis too: the linked
-        // definition names the runtime, so discovery keys env off goose
-        // (GOOSE_MODEL) rather than the default harness.
         runtime: Some("goose".to_string()),
         model: Some("persona-model".to_string()),
         provider: Some("anthropic".to_string()),
@@ -407,23 +404,26 @@ fn saved_agent_model_discovery_ignores_stale_record_for_linked_agent() {
         updated_at: "".to_string(),
     };
 
-    // Assert on the seam `get_agent_models` actually consumes, not on the
-    // general-purpose resolvers underneath it: binding to the resolvers would
-    // let a mutation that reintroduces `record.model` in the command body
-    // survive this test.
-    let config = agent_model_discovery_config(
-        &record,
-        &[persona],
-        &crate::managed_agents::GlobalAgentConfig::default(),
-    )
-    .expect("goose harness resolves");
+    // agent_model_discovery_config is the single helper get_agent_models
+    // consumes — the stale record bytes must lose to the persona's current
+    // model/provider (the same authoritative resolver spawn uses).
+    let personas = [persona];
+    let global = crate::managed_agents::GlobalAgentConfig::default();
+    let discovery = agent_model_discovery_config(&record, &personas, &global)
+        .expect("discovery config should resolve for a linked record");
+    assert_eq!(discovery.model.as_deref(), Some("persona-model"));
+    assert_eq!(discovery.provider.as_deref(), Some("anthropic"));
 
-    assert_eq!(config.command, "goose");
-    assert_eq!(config.model.as_deref(), Some("persona-model"));
-    assert_eq!(config.provider.as_deref(), Some("anthropic"));
+    // And the discovery env comes from the descriptor, whose layering also
+    // resolves through the definition — the derived model env var must carry
+    // the persona's model, not the stale record snapshot.
     assert_eq!(
-        config.env.get("GOOSE_MODEL").map(String::as_str),
+        discovery.env.get("GOOSE_MODEL").map(String::as_str),
         Some("persona-model")
+    );
+    assert_eq!(
+        discovery.env.get("GOOSE_PROVIDER").map(String::as_str),
+        Some("anthropic")
     );
 }
 
@@ -620,4 +620,19 @@ fn stable_config_options_carry_their_description() {
     // An option that omits the field still normalizes to `None` rather than
     // an empty string, so the frontend renders one line for it.
     assert_eq!(response.models[2].description, None);
+}
+
+#[test]
+fn model_discovery_error_converts_dangling_sentinel_to_sentence() {
+    // get_agent_models is a user-facing surface: a dangling harness must
+    // render as a sentence, never as the raw DANGLING_HARNESS_ID: sentinel.
+    let raw = format!("{}doomed", crate::managed_agents::DANGLING_HARNESS_PREFIX);
+    let msg = model_discovery_error("agent-pk", &raw);
+    assert!(msg.contains("cannot discover models for agent-pk"));
+    assert!(msg.contains("\"doomed\"") && msg.contains("deleted"));
+    assert!(!msg.contains(crate::managed_agents::DANGLING_HARNESS_PREFIX));
+
+    // Non-dangling errors pass through untouched.
+    let plain = model_discovery_error("agent-pk", "plain failure");
+    assert_eq!(plain, "cannot discover models for agent-pk: plain failure");
 }

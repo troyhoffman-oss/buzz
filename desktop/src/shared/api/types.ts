@@ -343,6 +343,12 @@ export type ManagedAgent = {
   pubkey: string;
   name: string;
   personaId: string | null;
+  /**
+   * The record's harness/runtime id (e.g. "goose", "my-custom-harness").
+   * `null` means the agent inherits its harness from the linked persona.
+   * Used to count agents referencing a harness definition (delete confirm).
+   */
+  runtime: string | null;
   teamId?: string | null;
   relayUrl: string;
   acpCommand: string;
