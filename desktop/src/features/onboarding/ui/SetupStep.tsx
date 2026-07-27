@@ -590,19 +590,25 @@ function RemoteRunNotice() {
     providers: providersQuery.data,
   });
 
-  if (notice.kind === "pending") return null;
-
+  // The wrapper renders in all three states and reserves one line of height.
+  // The pending state says nothing on purpose, but returning nothing at all
+  // would let the card grid below jump up a line and back down again as
+  // discovery lands — on the first screen a new user ever sees.
   return (
-    <p
-      className="mx-auto mt-3 max-w-[760px] text-xs leading-5 text-foreground/50"
-      data-testid={
-        notice.kind === "ready"
-          ? "onboarding-remote-run-ready"
-          : "onboarding-remote-run-hint"
-      }
-    >
-      {notice.message}
-    </p>
+    <div className="mt-3 min-h-5">
+      {notice.kind === "pending" ? null : (
+        <p
+          className="mx-auto max-w-[760px] text-xs leading-5 text-foreground/50"
+          data-testid={
+            notice.kind === "ready"
+              ? "onboarding-remote-run-ready"
+              : "onboarding-remote-run-hint"
+          }
+        >
+          {notice.message}
+        </p>
+      )}
+    </div>
   );
 }
 
