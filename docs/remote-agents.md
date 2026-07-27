@@ -131,62 +131,88 @@ redaction layer.
 `deploy` provisions and starts the unit, and returns `{"ok": true, "agent_id": "buzz-acp@<slug>"}`.
 The desktop persists `agent_id` in `record.backend_agent_id`.
 
-`deploy` also **verifies or installs** `buzz-acp` on the host. When the payload carries the optional
-`agent.buzz_acp_binary` — a path on the *desktop* machine to a Linux `buzz-acp` — and the host
-resolves none, the binary is installed to `~/.local/bin/buzz-acp` inside the provisioning round trip,
-before anything else is written. When the field is absent, `deploy` resolves `buzz-acp` on the host or
-fails with exit 90 exactly as it always has: the field is a seam, not a mode, and there is no second
-op, no provisioning step, and no new UI state.
+`deploy` also **verifies or installs** two host-side tools. When the payload carries the optional
+path — a path on the *desktop* machine to a Linux binary — and the host resolves none, that binary is
+installed to `~/.local/bin` inside the provisioning round trip, before anything else is written.
+The fields are seams, not modes: there is no second op, no provisioning step, and no new UI state.
+A payload carrying neither field sends no binary and opens no extra round trip — the script is the
+one the crate has always sent, plus the CLI resolution block, which is unconditional because its
+whole job is to notice a host that has no CLI. A test pins that script byte for byte.
 
-**Resolution is `PATH` *or* `~/.local/bin/buzz-acp`, never `PATH` alone.** A non-interactive SSH
+| payload field | tool | installed as | host has neither it nor a payload |
+|---|---|---|---|
+| `agent.buzz_acp_binary` | `buzz-acp`, the harness | `~/.local/bin/buzz-acp` | **exit 90** — the deploy stops |
+| `agent.buzz_cli_binary` | `buzz`, the agent-facing CLI | `~/.local/bin/buzz` | a `WARNING:` line on stderr; the deploy **continues** |
+
+**The asymmetry is deliberate.** `buzz-acp` *is* the agent, so its absence is fail-closed. The `buzz`
+CLI is what a remote agent's own system prompt tells it to reply with (`buzz messages send --reply-to
+<event-id>`, `buzz feed get`) — a local agent gets it because the desktop bundles it as a sidecar and
+prepends its directory to the spawned harness's `PATH`. Without it a remote agent still runs; it just
+cannot use the CLI, and in practice spends its first minutes hunting the filesystem for a command
+that is not there. That is worth a warning and never worth failing a deploy over. Integrity failures
+(exit 93/94) are fatal for **both**: a payload that arrives damaged is evidence the stream is damaged,
+and that stream also carries the minted nsec.
+
+**Resolution is `PATH` *or* `~/.local/bin/<tool>`, never `PATH` alone.** A non-interactive SSH
 command reads no profile, so `~/.local/bin` — the documented convention and the install destination —
 is not on the ambient `PATH`. That is exactly why the unit's env file pins
-`PATH="$HOME/.local/bin:$PATH"` itself. A `command -v`-only rule would therefore never see the copy a
-previous deploy installed: since deploy is the start path, every agent start would re-stream tens of
-megabytes and swap the binary underneath a running fleet. The probe and the deploy script apply the
-same two-part rule, so they cannot disagree.
+`PATH="$HOME/.local/bin:$PATH"` itself (see the env file contract). A `command -v`-only rule would
+therefore never see the copy a previous deploy installed: since deploy is the start path, every agent
+start would re-stream tens of megabytes and swap the binary underneath a running fleet. The probe and
+the deploy script apply the same two-part rule, so they cannot disagree.
 
-**Staleness rule: push-when-missing only.** A host that already resolves `buzz-acp` keeps the binary
-it has, whatever its version. Deploy is the start path, so a version-comparing rule would reinstall
+**Staleness rule: push-when-missing only.** A host that already resolves a tool keeps the binary it
+has, whatever its version. Deploy is the start path, so a version-comparing rule would reinstall
 underneath a running fleet on every start, and a desktop pinned to an older artifact would
 *downgrade* the host. Refreshing an existing install belongs to the release-artifact follow-up below.
 
-**Setting `buzz_acp_binary` costs one extra round trip, and only when it is set.** Deploy is the
-start path, so embedding the binary unconditionally would stream tens of megabytes of base64 on every
-start of every agent, forever, to hosts that were provisioned on day one. So when — and only when —
-the field is present, `deploy` asks the host the resolution question above first; if the host already
-has it, the file is never even read and the script is the one the crate has always sent. The probe is
-an optimization, never the decision: the deploy script re-checks on the host and installs only into an
-empty `$acp`, so a host that gains or loses the binary between the two round trips still lands
-correct.
+**Setting either field costs one extra round trip, and only when one is set.** Deploy is the start
+path, so embedding binaries unconditionally would stream tens of megabytes of base64 on every start of
+every agent, forever, to hosts that were provisioned on day one. So when — and only when — at least
+one field is present, `deploy` asks the host the resolution question above first, for both tools in a
+single probe; anything the host already has is never even read from disk. The probe is an
+optimization, never the decision: the deploy script re-checks on the host and installs only into an
+empty variable, so a host that gains or loses a tool between the two round trips still lands correct.
 
 The install rides the SSH stdin channel with everything else, which dictates its shape:
 
 - **base64, not raw bytes.** The script is text; a NUL or a stray newline inside an ELF section
   would corrupt the *script*, not just the payload. The encoded alphabet (`A-Za-z0-9+/=`) contains
-  no shell metacharacter and no `_`, so no data line can terminate the `BUZZ_ACP_B64_EOF` heredoc
-  early. The delimiter is quoted as well, so the remote shell expands nothing in the body.
+  no shell metacharacter and no `_`, so no data line can terminate a `BUZZ_ACP_B64_EOF` /
+  `BUZZ_CLI_B64_EOF` heredoc early. The delimiters are quoted as well, so the remote shell expands
+  nothing in either body, and they differ so one script can carry both.
 - **sha256 before install.** The digest is computed on the desktop and travels in the script in the
   clear (a fingerprint, not a credential); the host runs `sha256sum -c` against the decoded temp
   file and aborts with exit 94 on a mismatch. Nothing is made executable before it verifies.
-- **Atomic.** Decode goes to `~/.local/bin/.buzz-acp.tmp.$$` — same directory as the target, so the
+- **Atomic.** Decode goes to `~/.local/bin/.<tool>.tmp.$$` — same directory as the target, so the
   `mv` is a rename — then `chmod 755`, then `mv`. Every failure path removes the temp file first, so
   no run leaves a half-written executable where `ExecStart` would name it.
 - **`base64` and `sha256sum` must exist on the host** (coreutils). Their absence is exit 92 with a
   clear message, never a silent skip of the integrity check.
 - **The desktop refuses the payload before the session opens** when the path is missing, is not a
-  file, is empty, is over 200 MB, or is not an ELF binary. Pushing a Mach-O from a macOS desktop
-  would otherwise install cleanly and restart-loop on `Exec format error` every five seconds after a
-  deploy that reported success.
+  file, is empty, is over 200 MB, or is not an ELF binary — and the message names which tool it is
+  about. Pushing a Mach-O from a macOS desktop would otherwise install cleanly and restart-loop on
+  `Exec format error` every five seconds after a deploy that reported success. This holds for the CLI
+  too: a *missing* CLI is tolerable, but a desktop that pointed the seam at the wrong file has a bug
+  worth naming.
 - **The secret discipline is untouched.** The pushed bytes are not secret, but they share the stream
   with the minted nsec; base64 is what keeps them from corrupting it. `umask 077`, the `chmod 600`
   env file and the "nothing secret on any argv" rule are unchanged.
+- **Only `buzz-acp` reaches the unit.** `ExecStart` is substituted from the resolved harness path.
+  The CLI is reached purely through the env file's `PATH`, which is why installing it and pinning
+  that `PATH` are one change and not two.
 
-`buzz_acp_binary` is filled desktop-side from the `BUZZ_ACP_PUSH_BINARY` environment variable, read
-at deploy time (`deploy_payload_json`). That is a dev/dogfood seam, not the destination: the release
-build should resolve the artifact for the host's platform by version, with no user-visible path at
-all. **Fetching release artifacts is out of scope here and is the immediate follow-up**, along with
-the version-refresh rule that only becomes safe once the desktop knows which version it is offering.
+The fields are filled desktop-side from the `BUZZ_ACP_PUSH_BINARY` and `BUZZ_CLI_PUSH_BINARY`
+environment variables, read at deploy time (`deploy_payload_json`), so a developer can point either at
+a fresh build without restarting the app. Those are dev/dogfood seams, not the destination: the
+release build should resolve the artifacts for the host's platform by version, with no user-visible
+path at all. **Fetching release artifacts is out of scope here and is the immediate follow-up**, along
+with the version-refresh rule that only becomes safe once the desktop knows which version it is
+offering.
+
+Non-fatal host-side complaints — today, only the missing-CLI warning — reach the desktop on the
+provider's **stderr**, prefixed `WARNING: ` and scrubbed by the same redactor the failure path uses.
+The op's JSON response is unchanged: the deploy succeeded, and a warning is not a result.
 
 Errors are `{"ok": false, "error": "…"}` on stdout, human detail on stderr, and **exit 0 always**.
 A non-zero exit makes `invoke_provider` discard stdout entirely and report raw stderr, which throws
@@ -239,6 +265,12 @@ missing. It is a preflight, not an installer.
    when the desktop supplied one (`BUZZ_ACP_PUSH_BINARY`, see the `deploy` section) and otherwise
    refuses. Installing it needs `base64` and `sha256sum` on the host — coreutils, present on any
    normal Linux — and nothing else.
+
+   **The `buzz` CLI is the same story with a softer ending.** Agents are told by their system prompt
+   to reply with `buzz messages send`, so a host without it produces an agent that cannot. `deploy`
+   resolves it the same two ways, installs it from `BUZZ_CLI_PUSH_BINARY` when the host has none, and
+   otherwise emits a warning and provisions the agent anyway. Not a prerequisite — but a host that
+   satisfies it gets noticeably better agents.
 
 4. **At least one harness CLI**, named exactly as `discover_harnesses` probes it — the ACP adapter,
    not the vendor CLI. `claude-agent-acp` or `claude-code-acp` for Claude Code, `codex-acp` for
@@ -344,7 +376,7 @@ harness path, `git-credential-nostr`, `PATH` — are appended by the remote scri
 | var | value |
 |---|---|
 | `BUZZ_ACP_AGENT_COMMAND` | the pinned harness, resolved on the host with `command -v` |
-| `PATH` | `$HOME/.local/bin:$PATH` |
+| `PATH` | `$HOME/.local/bin:$PATH`, **expanded by the host's shell at deploy time** — see below |
 | `BUZZ_PRIVATE_KEY` | payload `private_key_nsec` |
 | `BUZZ_RELAY_URL`, `BUZZ_AUTH_TAG` | payload (auth tag omitted when absent) |
 | `BUZZ_ACP_AGENT_ARGS` | comma-joined |
@@ -360,6 +392,22 @@ harness path, `git-credential-nostr`, `PATH` — are appended by the remote scri
 | `BUZZ_ACP_IDLE_TIMEOUT`, `BUZZ_ACP_MAX_TURN_DURATION` | emitted only when set, so the harness's own defaults win |
 | `NOSTR_PRIVATE_KEY`, `GIT_TERMINAL_PROMPT`, `GIT_CONFIG_*` | only when `git-credential-nostr` is on the host |
 | user `env_vars` | written last, so they override — matching the local layering |
+
+**The `PATH` line is the remote half of the desktop's own PATH contract.** Local spawn prepends
+`<home>/.local/bin` (and the bundled sidecar directory) to the spawned harness's `PATH`
+(`managed_agents::runtime::path::build_augmented_path`), which is why a local agent can run the
+`buzz` CLI its system prompt tells it to reply with. Remotely the harness runs under `systemd --user`,
+whose `PATH` is the user manager's: no profile, no login shell, and on many distributions no
+`~/.local/bin` at all. Without this line every tool `deploy` installs would be installed and
+unreachable.
+
+It is composed **by the host's shell during the deploy**, not written into the unit as
+`Environment=PATH=$HOME/.local/bin:$PATH`. systemd expands no variable in `Environment=` or in an
+`EnvironmentFile`, so that form would hand the harness the five literal characters `$PATH`. The right
+half is the non-interactive SSH shell's own `PATH`, captured at deploy time — which is the same
+`PATH` the install machinery just searched, so anything `command -v` found on the host stays findable
+for the agent. The harness passes its environment to its children unchanged, so this is what makes
+`buzz` a command a remote agent can actually run.
 
 The runtime model/provider pair is the remote half of `runtime_metadata_env_vars`. `BUZZ_ACP_MODEL`
 is what `buzz-acp` reads; these are what the harness underneath it reads, and local spawn writes
@@ -391,8 +439,8 @@ that no `TURN_TIMEOUT` key can reappear in the env file.
 **Deploy is the start path.** `start_managed_agent` re-enters `deploy_to_provider`, so start and
 redeploy are one code path and everything in it is idempotent. Non-idempotence would surface as
 duplicate units, not as an error. One deploy is one round trip (plus the cheap resolution probe,
-only when `buzz_acp_binary` is set) that resolves — or, on a host that has none and a payload that
-carries one, installs — `buzz-acp`, resolves the
+only when a push field is set) that resolves — or, on a host that has none and a payload that
+carries one, installs — `buzz-acp` and the `buzz` CLI, resolves the
 harness, writes the env file atomically, enables lingering, installs the unit template,
 `daemon-reload`s only when the unit content actually changed, then `enable --now` and `restart`.
 The restart is what makes an already-running unit adopt the rewritten env file.
@@ -425,19 +473,34 @@ install. Install it to `~/.local/bin`, set `buzz_acp_path`, or
 point `BUZZ_ACP_PUSH_BINARY` at a Linux `buzz-acp` on the desktop and let the deploy install it.
 Note that `discover_harnesses` reports this non-fatally, so it can first appear at deploy time.
 
-**`the server has no 'base64' / 'sha256sum'` (exit 92).** The host is missing coreutils, so the
+**`WARNING: no 'buzz' CLI on the server's PATH or in ~/.local/bin`.** The deploy **succeeded** — this
+is a warning on the provider's stderr, not an error. The agent is running, but it cannot answer with
+`buzz messages send --reply-to …` the way its own system prompt tells it to, so it will fall back to
+slower replies (and, left to itself, waste its first turns looking for the command). Install `buzz`
+into `~/.local/bin` on the host, or point `BUZZ_CLI_PUSH_BINARY` at a Linux `buzz` on the desktop and
+redeploy. This is the one host-side complaint that is deliberately not fatal.
+
+**Agent replies are slow, or it reports it cannot find `buzz`.** Either the CLI is not installed
+(above), or it is installed somewhere the unit's `PATH` does not reach. The env file pins
+`PATH="$HOME/.local/bin:<the host's PATH at deploy time>"`; `systemctl --user show-environment` and
+`cat ~/.config/buzz-acp/<slug>.env` show what the harness actually got. A tool installed after the
+last deploy into a directory that was not on the deploying shell's `PATH` needs one redeploy.
+
+**`the server has no 'base64' / 'sha256sum'` (exit 92).** The host is missing coreutils, so a pushed
 binary cannot be decoded or — the part that is not negotiable — verified. Install coreutils, or
-install `buzz-acp` on the host by hand. The deploy stops before writing anything.
+install the tool on the host by hand. The deploy stops before writing anything.
 
-**`the pushed buzz-acp did not decode` / `failed its sha256 check` (exit 93 / 94).** The binary was
-damaged between the desktop and the host. Nothing is installed and no temp file survives; the env
-file and unit are never written. Retry — and if it repeats, the local file named by
-`BUZZ_ACP_PUSH_BINARY` is the suspect.
+**`the pushed buzz-acp` / `the pushed buzz did not decode` / `failed its sha256 check` (exit 93 /
+94).** The binary was damaged between the desktop and the host. Nothing is installed and no temp file
+survives; the env file and unit are never written. Fatal for both tools — including the
+non-load-bearing CLI, because the damaged stream is the one carrying the nsec. Retry, and if it
+repeats, the local file named by the corresponding `BUZZ_*_PUSH_BINARY` is the suspect.
 
-**`the buzz-acp binary to push is not a Linux (ELF) executable`.** `BUZZ_ACP_PUSH_BINARY` points at
-the desktop's own `buzz-acp` (Mach-O or PE) rather than a Linux build. Caught locally, before the
-session opens, because the alternative is a unit that restart-loops on `Exec format error` after a
-deploy that reported success.
+**`the buzz-acp binary to push is not a Linux (ELF) executable`** (or `the buzz binary …`).
+`BUZZ_ACP_PUSH_BINARY` / `BUZZ_CLI_PUSH_BINARY` points at the desktop's own build (Mach-O or PE)
+rather than a Linux one. Caught locally, before the session opens; the message names which variable to
+fix. The alternative is a unit that restart-loops on `Exec format error`, or a `buzz` on the host that
+fails on every invocation, after a deploy that reported success.
 
 **`harness <name> not found on the server's PATH` (exit 91).** The pinned harness is not installed
 under that name. Deploy stops before writing anything — no env file, no unit. Install the ACP
@@ -473,10 +536,12 @@ MagicDNS name typed into it will fail with `Could not resolve hostname`.
   needs a `check`-style round trip that reports the host's own configuration — a protocol addition.
 - The tailnet device picker filters out phones and TVs, but still offers Windows peers, which
   cannot be deploy targets. Picking one fails at deploy, not at selection.
-- `buzz-acp` is installed only when the desktop supplies one. `deploy` installs the binary named by
-  `agent.buzz_acp_binary` (from `BUZZ_ACP_PUSH_BINARY`) on a host that has none; with the variable
-  unset it still refuses with exit 90. Resolving the right release artifact for the host — which is
-  what makes the create dialog's deploy-will-install promise true without a developer setting an
-  env var — is the immediate follow-up, and the version-refresh rule rides with it.
-- An already-installed `buzz-acp` is never upgraded by a deploy, by design (see the staleness rule).
-  A host stuck on an old build has to be updated by hand until artifact fetching lands.
+- **Neither host-side tool is installed unless the desktop supplies one.** `deploy` installs the
+  binaries named by `agent.buzz_acp_binary` / `agent.buzz_cli_binary` (from `BUZZ_ACP_PUSH_BINARY` /
+  `BUZZ_CLI_PUSH_BINARY`) on a host that has none; with the variables unset a missing `buzz-acp` is
+  still exit 90 and a missing `buzz` is still just a warning. Resolving the right release artifacts
+  for the host — which is what makes the create dialog's deploy-will-install promise true, and what
+  gives every remote agent CLI parity with a local one without a developer setting an env var — is
+  the immediate follow-up, and the version-refresh rule rides with it.
+- An already-installed tool is never upgraded by a deploy, by design (see the staleness rule). A host
+  stuck on an old `buzz-acp` or `buzz` has to be updated by hand until artifact fetching lands.

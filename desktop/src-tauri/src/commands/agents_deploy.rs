@@ -135,6 +135,13 @@ pub(super) fn deploy_payload_json(
         // a provider reading it with `as_str()` sees `None`, exactly as it does
         // for an absent key, so behavior is unchanged by default.
         "buzz_acp_binary": buzz_acp_binary_to_push(),
+        // The same, for the `buzz` CLI. A local agent gets the CLI because the
+        // desktop bundles it as a sidecar and prepends its directory to the
+        // spawned harness's PATH; a remote agent is told by the very same system
+        // prompt to reply with `buzz messages send`, so without this the remote
+        // half of that contract is missing. Unlike `buzz-acp` its absence is a
+        // warning on the provider side, never a failed deploy.
+        "buzz_cli_binary": buzz_cli_binary_to_push(),
     })
 }
 
@@ -151,7 +158,25 @@ pub(super) fn deploy_payload_json(
 /// platform by version, with no user-visible choice. Until that lands this is
 /// the whole surface.
 fn buzz_acp_binary_to_push() -> Option<String> {
-    std::env::var("BUZZ_ACP_PUSH_BINARY")
+    binary_to_push("BUZZ_ACP_PUSH_BINARY")
+}
+
+/// The same seam for the `buzz` CLI: `BUZZ_CLI_PUSH_BINARY` names a Linux
+/// `buzz` on this machine, which the provider installs to the host's
+/// `~/.local/bin` when the host resolves none.
+///
+/// Separate from `buzz-acp` because the two are separately policed: a host with
+/// no `buzz-acp` cannot run an agent at all, while a host with no CLI runs one
+/// that simply cannot reply with `buzz messages send`. Release-artifact
+/// resolution is the shared follow-up for both.
+fn buzz_cli_binary_to_push() -> Option<String> {
+    binary_to_push("BUZZ_CLI_PUSH_BINARY")
+}
+
+/// A push seam's value, or `None` when unset or blank — blank being a var the
+/// user cleared rather than a request to push an empty path.
+fn binary_to_push(var: &str) -> Option<String> {
+    std::env::var(var)
         .ok()
         .map(|path| path.trim().to_string())
         .filter(|path| !path.is_empty())
