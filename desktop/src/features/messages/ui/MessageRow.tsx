@@ -35,6 +35,8 @@ import { useChannelNavigation } from "@/shared/context/ChannelNavigationContext"
 import { parseImetaTags } from "@/features/messages/lib/parseImeta";
 import { useMessageEmoji } from "@/features/messages/lib/useMessageEmoji";
 import { parseWaveMessageContent } from "@/features/messages/lib/waveMessage";
+import { resolveAskQuestion } from "@/features/messages/lib/askCard";
+import { AskMessageCard } from "./AskMessageCard";
 import { resolveSnapshotSharedBy } from "@/features/messages/lib/snapshotSharedBy";
 import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
 import { Markdown } from "@/shared/ui/markdown";
@@ -336,6 +338,19 @@ export const MessageRow = React.memo(
           );
         default:
           {
+            // Branch here, not inside `<Markdown>`: `renderCachedMarkdown`
+            // caches parsed trees module-globally by content, so per-mount
+            // interactive state inside one would be shared across rows.
+            const ask = resolveAskQuestion(message, isKnownAgentPubkey);
+            if (ask) {
+              return (
+                <AskMessageCard
+                  ask={ask}
+                  channelId={channelId}
+                  message={message}
+                />
+              );
+            }
             const waveMessage = parseWaveMessageContent(message.body);
             if (waveMessage) {
               return (
@@ -821,6 +836,8 @@ export const MessageRow = React.memo(
     prev.message.author === next.message.author &&
     prev.message.isAgent === next.message.isAgent &&
     prev.message.ownerPubkey === next.message.ownerPubkey &&
+    // Gates the ask card's authentication and its interactivity.
+    prev.message.signerPubkey === next.message.signerPubkey &&
     prev.message.ownerLabel === next.message.ownerLabel &&
     prev.message.avatarUrl === next.message.avatarUrl &&
     prev.message.accent === next.message.accent &&
