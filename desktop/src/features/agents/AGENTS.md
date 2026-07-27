@@ -239,6 +239,47 @@ with a TypeScript lookup table or an id comparison in a component.
     no-provider sentence is `NO_BACKEND_PROVIDER_HINT`, stated once and
     rendered by all three surfaces — a user meets it in up to three places, and
     three spellings of one fact read as three different facts.
+19. **A provider record answers from itself, never from the local catalog.**
+    A provider-backed record's `agentCommand`/`agentArgs` name a binary on the
+    HOST, which this computer's runtime catalog has never seen — so every local
+    lookup either misses (`hermes …` → generic icon, raw command as a name) or
+    hits by pure name collision (`claude-agent-acp` happens to be a local
+    builtin's command, the only reason a Claude card ever looked right).
+    Neither is knowledge. `providerRecordHarness` (`lib/pinnedHarness.ts`) is
+    the single owner of "may this surface read the record instead of the local
+    catalog?", and it answers `null` for a local agent — whose catalog entry
+    genuinely describes it, and whose rendering must not change. Three
+    consequences:
+    - **Derivation is generic.** A command basename (both separators, since
+      the path is the host's), the base-id fallback `resolveHarnessLogo`
+      already uses for variant ids, and a `--profile <name>` flag — a
+      widespread CLI convention. Nothing here knows what Hermes or SSH is; do
+      not teach it. The profile is part of the identity: two profiles of one
+      harness are two agents with their own memory and credentials, and must
+      not read as one name (same fact rule 16 guards on).
+    - **Normalization has one owner.** `normalizePinnedCommand` trims the
+      command and drops blank args, matching `create_time_agent_args`, and
+      BOTH the displayed `pin.command` and `exclusiveRemoteHarness`'s equality
+      check go through it. A rule that decides "same agent?" and a rule that
+      decides what the user reads must be one rule.
+    - **Avatar precedence is by authorship** (`lib/agentAvatarUrl.ts`): what a
+      human chose, then what the agent published about itself, then the record's
+      create-time stamp, then the pin's bundled harness mark. That last step
+      exists because a local create stamps this computer's runtime avatar onto
+      the record and a remote one has nothing to stamp — the host's catalog
+      entry deliberately carries no avatar url, since rendering a host-supplied
+      image is a tracking-pixel and spoofing vector (`RuntimeIcon`'s bundled
+      maps are the only permitted route). Do not add a host-supplied image
+      path, and do not move the derivation to deploy time: the fleet already
+      exists, and records minted before this carry an empty avatar forever.
+
+    The pin is editable only where it was made — at create/deploy.
+    `personaManagedAgentUpdate` must NOT write a locally-discovered runtime's
+    command/args over a provider record (its `runtimeChanged` gate is
+    `backend.type === "local"`): the catalog entry it would write is a path on
+    THIS machine, so a working `hermes --profile marshall acp` would be
+    replaced by a binary that does not exist on the host, from a dialog that
+    never said it would touch the harness.
 
 ## The tests that enforce this
 
@@ -263,6 +304,25 @@ with a TypeScript lookup table or an id comparison in a component.
   command is not; a local agent never occupies a host identity; a
   non-exclusive entry is never taken however many agents run it; and an absent
   flag is exactly today's behavior.
+- `lib/pinnedHarness.test.mjs` — rule 19's derivation, plus the label table's
+  agreement with the Rust catalogs in BOTH directions (it reads
+  `discovery.rs` as text, the same trick `presetLogos.test.mjs` uses; a TS-only
+  key must be listed in `NOT_IN_RUST_CATALOG` with the surface that carries the
+  command). The cases are the two fleet shapes that broke: a
+  `hermes --profile marshall acp` pin that rendered a generic icon and lost its
+  profile, and a `claude-agent-acp` pin that only looked right by collision.
+  Also that an unknown host binary shows itself rather than a local guess — if
+  a remote card starts naming a harness the host does not run, this is the test
+  that should have caught it.
+- `lib/agentAvatarUrl.test.mjs` — rule 19's precedence chain. A human's choice
+  beats the agent's own published avatar beats the record's stamp beats the
+  harness mark; a LOCAL record never reaches the harness step, so its rendering
+  is unchanged.
+- `features/profile/ui/profileRuntimeLabel.test.mjs` — that the profile
+  surfaces name a record from its pin and a foreign surface's free-form command
+  (a relay agent's declared `agentType`) through the SAME owner. A second label
+  table here is what let `codex-acp` be "Codex" in one place and a harness
+  learned in Rust be a raw command in the other.
 - `lib/agentLocationLabel.test.mjs` — rule 17. A local, undefined or null
   backend is unlabelled; a provider-backed one is named by its id; and a
   config carrying an `ssh_host` still yields the provider's name, so the host

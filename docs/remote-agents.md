@@ -124,7 +124,10 @@ the desktop.
 `probe_models` exports the harness env inside the script, then runs `buzz-acp models --json` on the
 host and returns the document verbatim under `models_raw`. The desktop feeds it straight into the
 same `normalize_agent_models` the local path uses, so the model picker needs no remote-specific
-code. Model env must be nested under `agent.env_vars` — that is the only place the desktop's
+code. That host-side command carries its own budget inside the provider's 110s: `MODELS_TIMEOUT`,
+60s, matched to what the normal agent-init path gives the same adapter spawn — a shorter one only
+fails probes the real spawn would have survived, since a cold node adapter on a busy host takes
+tens of seconds to reach `initialize`. Model env must be nested under `agent.env_vars` — that is the only place the desktop's
 `env_secrets_from_request` scrubber looks. A flat `model_env` is accepted but loses that second
 redaction layer.
 
@@ -503,6 +506,17 @@ repeats, the local file named by the corresponding `BUZZ_*_PUSH_BINARY` is the s
 rather than a Linux one. Caught locally, before the session opens; the message names which variable to
 fix. The alternative is a unit that restart-loops on `Exec format error`, or a `buzz` on the host that
 fails on every invocation, after a deploy that reported success.
+
+**The model list never arrives, or reports `agent timed out (60s)`.** There are three nested
+budgets on that path and the innermost one is on the host: `buzz-acp models --json` allows
+`MODELS_TIMEOUT` — 60s, deliberately the same budget the normal agent-init path gives the very same
+adapter spawn — for the harness to reach `initialize`. Outside it, the provider allows 110s for the
+whole `probe_models` op and the desktop allows 150s. A cold node adapter (`codex-acp`) on a busy
+host can take tens of seconds on its first spawn and be instant warm, so a probe that times out
+once and succeeds on "check host again" is a slow host, not a broken harness. A probe that keeps
+hitting 60s is the harness failing to start: run `buzz-acp models --json` on the host by hand, where
+the adapter's own stderr is visible. Longer than 110s and the failure changes shape — the provider
+budget fires first and the desktop reports a provider timeout rather than an agent one.
 
 **`harness <name> not found on the server's PATH` (exit 91).** The pinned harness is not installed
 under that name. Deploy stops before writing anything — no env file, no unit. Install the ACP
