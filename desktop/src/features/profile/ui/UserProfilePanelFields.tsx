@@ -13,6 +13,11 @@ import {
 import * as React from "react";
 import { agentRunsOnLabel } from "@/features/agents/lib/agentLocationLabel";
 import { AgentStatusBadge } from "@/features/agents/ui/AgentStatusBadge";
+import {
+  managedAgentRuntimeCopyValue,
+  managedAgentRuntimeLabel,
+  runtimeCommandLabel,
+} from "@/features/profile/ui/profileRuntimeLabel";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 import { copyTextToClipboard } from "@/shared/lib/clipboard";
 import { PubKey } from "@/shared/ui/PubKey";
@@ -23,17 +28,6 @@ import type {
   Profile,
   RelayAgent,
 } from "@/shared/api/types";
-
-const RUNTIME_LABELS: Record<string, string> = {
-  goose: "Goose",
-  "claude-code": "Claude Code",
-  "codex-acp": "Codex",
-  aider: "Aider",
-};
-
-function runtimeLabel(command: string): string {
-  return RUNTIME_LABELS[command] ?? command;
-}
 
 export type ProfileField = {
   copyValue?: string;
@@ -188,7 +182,7 @@ export function buildPublicFields({
   if (isBot && relayAgent?.agentType) {
     fields.push({
       copyValue: relayAgent.agentType,
-      displayValue: runtimeLabel(relayAgent.agentType),
+      displayValue: runtimeCommandLabel(relayAgent.agentType),
       icon: Cpu,
       label: "Agent type",
       testId: "user-profile-agent-type",
@@ -293,8 +287,8 @@ export function buildOwnerFields({
 
   if (managedAgent?.agentCommand) {
     fields.push({
-      copyValue: managedAgent.agentCommand,
-      displayValue: runtimeLabel(managedAgent.agentCommand),
+      copyValue: managedAgentRuntimeCopyValue(managedAgent),
+      displayValue: managedAgentRuntimeLabel(managedAgent),
       icon: Terminal,
       label: "Runtime",
       testId: "user-profile-runtime",
@@ -302,7 +296,7 @@ export function buildOwnerFields({
   } else if (relayAgent?.agentType) {
     fields.push({
       copyValue: relayAgent.agentType,
-      displayValue: runtimeLabel(relayAgent.agentType),
+      displayValue: runtimeCommandLabel(relayAgent.agentType),
       icon: Terminal,
       label: "Runtime",
       testId: "user-profile-runtime",
@@ -310,7 +304,7 @@ export function buildOwnerFields({
   } else if (persona?.runtime) {
     fields.push({
       copyValue: persona.runtime,
-      displayValue: runtimeLabel(persona.runtime),
+      displayValue: runtimeCommandLabel(persona.runtime),
       icon: Terminal,
       label: "Runtime",
       testId: "user-profile-runtime",
