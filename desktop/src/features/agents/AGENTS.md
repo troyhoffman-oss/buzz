@@ -205,6 +205,40 @@ with a TypeScript lookup table or an id comparison in a component.
     is exact after trimming/dropping-blanks/sorting, so a host reached by two
     names under-matches (the guard does not fire) rather than falsely blocking
     a create; the real fix is a host-identity answer from the provider.
+17. **A location label names the PROVIDER, never the host.** `agentRunsOnLabel`
+    is the one owner of "where does this agent run" for every surface that
+    lists agents (`AgentIdentityCard`, `MembersSidebarMemberCard`, the user
+    profile panel's "Runs on" row). It answers `null` for a local agent — "on
+    this computer" is the assumption a reader already holds, so painting it
+    costs a metadata line to say nothing — and for a provider-backed one it
+    returns `backendProviderLabel(backend.id)`. It does NOT read
+    `backend.config`. That is the same refusal rule 16 makes: a blessed
+    `ssh_host` key means the desktop grows a host vocabulary per provider, and
+    a provider id is constrained to `^[a-z0-9][a-z0-9_-]*$` by
+    `provider_id_is_valid` while a host is not, so naming the provider is also
+    the only answer with a bounded shape. Ids stand in for probed names on
+    these surfaces on purpose (`backendProviderLabel`'s own rule): a card list
+    must not spawn one subprocess per provider to decorate a string. A new
+    agent-listing surface calls the same helper and extends an existing
+    metadata slot rather than adding a badge.
+18. **Settings → Remote servers reports what is installed; the create flow owns
+    deployment.** `RemoteServersCard` is read-only by design and has no host
+    list. A provider is a binary on `PATH`, so "adding" one is an install, not
+    a form; and the host is a per-agent decision the create dialog pins onto
+    the agent record verbatim at create time. CRUD here would either edit saved
+    configs that deployed agents deliberately do not re-read — which reads as a
+    bug — or duplicate the create flow's ownership of the host. Three
+    consequences that must not drift: this gallery is the ONLY surface that
+    pays for an `info` probe per discovered binary
+    (`useBackendProviderProbesQuery`; the create dialog and the onboarding
+    notice render ids, per rule 17); `"ready"` means "this binary answers the
+    provider protocol", never "the server is reachable", because `info` opens
+    no connection; and every settled probe must land in the probe map, since an
+    absent entry is indistinguishable from one still in flight and a dropped
+    result is therefore a row that spins forever (`remoteServerProbes`). The
+    no-provider sentence is `NO_BACKEND_PROVIDER_HINT`, stated once and
+    rendered by all three surfaces — a user meets it in up to three places, and
+    three spellings of one fact read as three different facts.
 
 ## The tests that enforce this
 
@@ -229,6 +263,25 @@ with a TypeScript lookup table or an id comparison in a component.
   command is not; a local agent never occupies a host identity; a
   non-exclusive entry is never taken however many agents run it; and an absent
   flag is exactly today's behavior.
+- `lib/agentLocationLabel.test.mjs` — rule 17. A local, undefined or null
+  backend is unlabelled; a provider-backed one is named by its id; and a
+  config carrying an `ssh_host` still yields the provider's name, so the host
+  cannot leak into a card by accident.
+- `lib/backendProviderLabel.test.mjs` — the id-vs-probed-name fallback and the
+  sorted label list. A blank probed name reads as no name (the id is the better
+  label), and sorting is what stops a `PATH`-order change from reshuffling a
+  hint line under the user.
+- `features/onboarding/ui/remoteRunNotice.test.mjs` — the setup step's three
+  states. Pending stays pending over a cached list, because rendering the
+  install hint and then contradicting it a frame later is the failure this
+  projection exists to prevent.
+- `features/settings/ui/remoteServerGalleryLogic.test.mjs` — rule 18.
+  `remoteServerProbes` lands every settled query somewhere (a response-less
+  success is a failed row, not a permanent spinner), and `remoteServerEntries`
+  covers ready/probing/unavailable, blank-vs-absent metadata, and the
+  ready-first sort. The card itself is a thin render over these two; if a row
+  spins forever or the gallery reshuffles, this is the test that should have
+  caught it.
 - `shared/api/tauri.test.mjs` — `fromRawRemoteHarness`: the wire boundary for
   `exclusive`. An asserted flag is carried; absent stays absent (the desktop
   must not claim something the provider never said).

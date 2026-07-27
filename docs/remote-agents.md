@@ -23,7 +23,7 @@ process per op; no daemon, no state, no version negotiation.
 
 | op | opens SSH | provider budget | desktop budget | desktop caller |
 |---|---|---|---|---|
-| `info` | no | — | 10s | `probe_backend_provider`, to build the host field |
+| `info` | no | — | 10s | `probe_backend_provider`: the host field, and Settings → Remote servers to name and version each row |
 | `check` | yes | 8s | — | none yet |
 | `discover_harnesses` | yes | 40s | 60s | `WhereToRunSection`, on "check host" |
 | `probe_models` | yes | 110s | 150s | `WhereToRunSection`, after a harness resolves |
