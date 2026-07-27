@@ -59,14 +59,21 @@ export function RemoteServersCard() {
         description="Buzz agents run on this computer or on your own servers. A backend provider is the binary that puts an agent on one — install it on your PATH, then pick the server when you create an agent."
       />
 
+      {/*
+        Text, not a spinner. Discovery is a sub-100ms PATH walk, so the common
+        case — no provider installed, first entry into Settings → Agents — would
+        mount and unmount a spinner inside a frame or two before swapping to the
+        empty state. The Settings siblings state it the same way
+        (`ChannelTemplatesSettingsCard`, `DoctorSettingsPanel`); a spinner in
+        this directory belongs to a mutation the user started, not to a query.
+      */}
       {providersQuery.isLoading ? (
         <div
           aria-live="polite"
-          className="flex items-center gap-2 text-sm text-muted-foreground"
+          className="rounded-2xl bg-muted/20 px-4 py-4 text-sm text-muted-foreground"
           data-testid="remote-server-loading"
           role="status"
         >
-          <Spinner className="h-4 w-4" />
           Looking for backend providers&hellip;
         </div>
       ) : entries.length > 0 ? (
