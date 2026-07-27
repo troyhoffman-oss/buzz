@@ -212,7 +212,9 @@ offering.
 
 Non-fatal host-side complaints — today, only the missing-CLI warning — reach the desktop on the
 provider's **stderr**, prefixed `WARNING: ` and scrubbed by the same redactor the failure path uses.
-The op's JSON response is unchanged: the deploy succeeded, and a warning is not a result.
+`invoke_provider` writes them to the desktop log (`tracing::warn`) when the op succeeds, and folds
+them into the error message when it fails. The op's JSON response is unchanged either way: the deploy
+succeeded, and a warning is not a result.
 
 Errors are `{"ok": false, "error": "…"}` on stdout, human detail on stderr, and **exit 0 always**.
 A non-zero exit makes `invoke_provider` discard stdout entirely and report raw stderr, which throws

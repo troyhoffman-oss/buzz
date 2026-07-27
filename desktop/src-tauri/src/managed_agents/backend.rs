@@ -228,7 +228,32 @@ pub fn invoke_provider(
         return Err(redact_secrets_with(error, &env_secret_refs));
     }
 
+    // A successful op's stderr is not an error, but it is not nothing either:
+    // providers write their non-fatal complaints there (today, deploy's
+    // "this host has no buzz CLI" WARNING). Without this the buffer is dropped
+    // on success and the warning is invisible. Log-only by design — the op
+    // succeeded, and a warning is not a result.
+    if let Some(notice) = provider_stderr_notice(&stderr_redacted) {
+        tracing::warn!("provider {}: {notice}", binary.display());
+    }
+
     Ok(response)
+}
+
+/// The loggable form of a successful provider's stderr: `None` when it holds
+/// nothing but whitespace, otherwise the already-redacted text trimmed and
+/// capped at the same 4 KiB the failure path reports. The cap walks back to a
+/// char boundary so a multi-byte character straddling it cannot panic.
+fn provider_stderr_notice(stderr_redacted: &str) -> Option<&str> {
+    let trimmed = stderr_redacted.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let end = (0..=trimmed.len().min(4096))
+        .rev()
+        .find(|&i| trimmed.is_char_boundary(i))
+        .unwrap_or(0);
+    Some(&trimmed[..end])
 }
 
 /// Split a config key into lowercase words on `_`, `-`, `.`, and camelCase boundaries.
@@ -734,6 +759,26 @@ pub struct BackendProviderInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_stderr_notice_skips_blank_and_keeps_warnings() {
+        // The success path only logs when the provider actually said
+        // something — a blank buffer must not produce an empty warn line.
+        assert_eq!(provider_stderr_notice(""), None);
+        assert_eq!(provider_stderr_notice("  \n\t "), None);
+        assert_eq!(
+            provider_stderr_notice("buzz-backend-ssh: WARNING: no buzz CLI\n"),
+            Some("buzz-backend-ssh: WARNING: no buzz CLI")
+        );
+    }
+
+    #[test]
+    fn provider_stderr_notice_caps_on_a_char_boundary() {
+        // A multi-byte char straddling the 4096-byte cap must not panic.
+        let long = format!("{}é", "a".repeat(4095));
+        let notice = provider_stderr_notice(&long).expect("non-empty");
+        assert_eq!(notice.len(), 4095);
+    }
 
     #[test]
     fn redact_secrets_replaces_nsec() {

@@ -621,8 +621,9 @@ pub fn deploy(
     // A successful deploy's remote stderr is otherwise dropped as host noise,
     // so the script's non-fatal complaints — today, "this host has no buzz CLI"
     // — would be invisible without this. They go to *this* process's stderr,
-    // which `invoke_provider` surfaces, rather than into the response: the op
-    // succeeded, and a warning is not a result.
+    // which `invoke_provider` logs on success and shows in the error on
+    // failure, rather than into the response: the op succeeded, and a warning
+    // is not a result.
     for warning in install::warnings(&output.stderr) {
         eprintln!("buzz-backend-ssh: {warning}");
     }
