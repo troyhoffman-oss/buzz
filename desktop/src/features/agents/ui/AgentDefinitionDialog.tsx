@@ -85,6 +85,7 @@ import {
 } from "./agentAiConfigurationPolicy";
 import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { buildRuntimeModelProviderPayload } from "./agentDefinitionSubmitPayload";
+import { useCreateRuntimeSeed } from "./useCreateRuntimeSeed";
 import { useRemoteAwareModelDiscovery } from "./useRemoteAwareModelDiscovery";
 import type { RemoteModelDiscoveryView } from "./whereToRunIntent";
 
@@ -258,56 +259,18 @@ export function AgentDefinitionDialog({
     hasSeededForOpenRef.current = false;
   }, [initialValues, open]);
 
-  React.useEffect(() => {
-    if (
-      !open ||
-      !initialValues ||
-      initialValues.runtime?.trim() ||
-      runtimesLoading ||
-      runtime.trim().length > 0 ||
-      defaultRuntime === null ||
-      hasSeededForOpenRef.current
-    ) {
-      return;
-    }
-
-    setRuntime(defaultRuntime.id);
-    hasSeededForOpenRef.current = true;
-    if ("id" in initialValues) {
-      // Edit mode: record that this runtime was auto-seeded so the submit path
-      // can omit it from the payload for builtin definitions (canonical runtime
-      // null; sync would revert the value anyway). Explicit user changes via
-      // the dropdown clear this flag.
-      isRuntimeAutoSeededRef.current = true;
-    }
-  }, [defaultRuntime, initialValues, open, runtime, runtimesLoading]);
-
-  // Keep an inherited Create runtime synced with defaults saved in-place.
-  React.useEffect(() => {
-    if (
-      !open ||
-      !initialValues ||
-      "id" in initialValues ||
-      initialValues.runtime?.trim() ||
-      aiConfigurationMode !== "defaults" ||
-      runtimesLoading ||
-      defaultRuntime === null ||
-      (runtime.trim().length > 0 && !isRuntimeAutoSeededRef.current)
-    ) {
-      return;
-    }
-
-    if (runtime !== defaultRuntime.id) setRuntime(defaultRuntime.id);
-    isRuntimeAutoSeededRef.current = true;
-    hasSeededForOpenRef.current = true;
-  }, [
+  useCreateRuntimeSeed({
     aiConfigurationMode,
+    createRunsRemotely,
     defaultRuntime,
+    hasSeededForOpenRef,
     initialValues,
+    isRuntimeAutoSeededRef,
     open,
     runtime,
     runtimesLoading,
-  ]);
+    setRuntime,
+  });
 
   // Keep setup guidance reachable when no available runtime can be inherited.
   React.useEffect(() => {

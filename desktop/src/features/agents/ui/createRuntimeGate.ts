@@ -59,6 +59,74 @@ export function createGateHarnessId({
   return runsRemotely ? (remoteHarnessId ?? "") : runtime;
 }
 
+/**
+ * Whether the dialog may seed its harness field from this computer's default.
+ *
+ * Never for a remote create. `runtime` is the definition's harness preference,
+ * and a provider-backed agent takes its harness from the HOST's catalog via
+ * "Where to run" — so seeding the local default stamps a harness of the wrong
+ * machine (`buzz-agent` on most installs) onto a record that runs somewhere
+ * else, and every surface reading the record back reports it as the harness the
+ * agent runs on. The remote pin travels via `BackendIntent.harness` instead.
+ */
+export function createRuntimeSeedAllowed(runsRemotely: boolean): boolean {
+  return !runsRemotely;
+}
+
+/**
+ * What the harness auto-seed should do on this render.
+ *
+ * `shed` exists because "Where to run" lives inside the dialog and starts
+ * local: the seed has usually already been applied by the time the user picks a
+ * provider, so refusing to seed is not enough on its own — the stamped local
+ * default has to be taken back off, or the remote create submits it anyway.
+ * Only an auto-seeded value is ever shed; an explicit pick belongs to the user.
+ */
+export type CreateRuntimeSeedAction =
+  | { type: "seed"; runtimeId: string }
+  | { type: "shed" }
+  | { type: "none" };
+
+export function createRuntimeSeedAction({
+  defaultRuntimeId,
+  definitionRuntime,
+  hasInitialValues,
+  hasSeededForOpen,
+  isAutoSeeded,
+  open,
+  runsRemotely,
+  runtime,
+  runtimesLoading,
+}: {
+  /** The local default, or null when nothing is installed. */
+  defaultRuntimeId: string | null;
+  /** The definition's own runtime preference, which the seed never overrides. */
+  definitionRuntime: string | null | undefined;
+  hasInitialValues: boolean;
+  hasSeededForOpen: boolean;
+  isAutoSeeded: boolean;
+  open: boolean;
+  runsRemotely: boolean;
+  runtime: string;
+  runtimesLoading: boolean;
+}): CreateRuntimeSeedAction {
+  if (!createRuntimeSeedAllowed(runsRemotely)) {
+    return isAutoSeeded ? { type: "shed" } : { type: "none" };
+  }
+  if (
+    !open ||
+    !hasInitialValues ||
+    definitionRuntime?.trim() ||
+    runtimesLoading ||
+    runtime.trim().length > 0 ||
+    defaultRuntimeId === null ||
+    hasSeededForOpen
+  ) {
+    return { type: "none" };
+  }
+  return { type: "seed", runtimeId: defaultRuntimeId };
+}
+
 /** Whether the picked runtime clears the local-availability requirement. */
 export function createRuntimeIsAvailable({
   runsRemotely,

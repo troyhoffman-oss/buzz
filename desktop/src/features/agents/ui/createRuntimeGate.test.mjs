@@ -5,6 +5,7 @@ import {
   createGateHarnessId,
   createRuntimeIsAvailable,
   createRuntimeOptionDisabled,
+  createRuntimeSeedAction,
   createRuntimeSelectionSatisfied,
   runtimeDropdownOptions,
   runtimeDropdownPlaceholder,
@@ -207,6 +208,96 @@ test("a remote goose on a claude laptop still demands credentials", () => {
       "anthropic",
     ),
     ["ANTHROPIC_API_KEY"],
+  );
+});
+
+// ── the harness auto-seed is local-only ─────────────────────────────────────
+
+function seedInput(overrides = {}) {
+  return {
+    defaultRuntimeId: "buzz-agent",
+    definitionRuntime: undefined,
+    hasInitialValues: true,
+    hasSeededForOpen: false,
+    isAutoSeeded: false,
+    open: true,
+    runsRemotely: false,
+    runtime: "",
+    runtimesLoading: false,
+    ...overrides,
+  };
+}
+
+test("a local create still seeds this computer's default harness", () => {
+  assert.deepEqual(createRuntimeSeedAction(seedInput()), {
+    type: "seed",
+    runtimeId: "buzz-agent",
+  });
+});
+
+// The defect: a provider-backed agent takes its harness from the HOST's
+// catalog, so stamping the local default onto the draft describes the wrong
+// machine — the edit dialog then reports a remote SSH agent as running
+// "Buzz Agent" locally.
+test("a remote create is never seeded with the local default", () => {
+  assert.deepEqual(createRuntimeSeedAction(seedInput({ runsRemotely: true })), {
+    type: "none",
+  });
+});
+
+// Refusing to seed is not enough on its own: "Where to run" starts local and
+// lives inside the dialog, so the seed has already been applied by the time the
+// user picks a provider. Without the shed, the remote create submits it anyway.
+test("switching to a provider sheds an already-seeded local default", () => {
+  assert.deepEqual(
+    createRuntimeSeedAction(
+      seedInput({
+        runsRemotely: true,
+        runtime: "buzz-agent",
+        isAutoSeeded: true,
+        hasSeededForOpen: true,
+      }),
+    ),
+    { type: "shed" },
+  );
+});
+
+test("a harness the user picked explicitly is never shed", () => {
+  assert.deepEqual(
+    createRuntimeSeedAction(
+      seedInput({
+        runsRemotely: true,
+        runtime: "goose",
+        isAutoSeeded: false,
+        hasSeededForOpen: true,
+      }),
+    ),
+    { type: "none" },
+    "an explicit pick belongs to the user, remote or not",
+  );
+});
+
+test("the seed never overrides a definition's own runtime or a loaded catalog", () => {
+  assert.deepEqual(
+    createRuntimeSeedAction(seedInput({ definitionRuntime: "goose" })),
+    { type: "none" },
+  );
+  assert.deepEqual(
+    createRuntimeSeedAction(seedInput({ runtimesLoading: true })),
+    { type: "none" },
+  );
+  assert.deepEqual(
+    createRuntimeSeedAction(seedInput({ defaultRuntimeId: null })),
+    { type: "none" },
+    "nothing installed locally means nothing to seed",
+  );
+  assert.deepEqual(createRuntimeSeedAction(seedInput({ open: false })), {
+    type: "none",
+  });
+  assert.deepEqual(
+    createRuntimeSeedAction(seedInput({ hasSeededForOpen: true })),
+    { type: "none" },
+    "the seed fires at most once per dialog-open",
   );
 });
 

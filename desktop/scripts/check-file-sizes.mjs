@@ -699,7 +699,9 @@ const overrides = new Map([
   // credential questions from the HOST's catalog, so each local-runtime
   // requirement it suspends needs its own reason recorded here. Queued to
   // split with the create-mode surface.
-  ["src/features/agents/ui/AgentDefinitionDialog.tsx", 1087],
+  // -37 (1087 -> 1050): the harness auto-seed effects moved to
+  // useCreateRuntimeSeed.ts; ratcheted to the post-extraction count.
+  ["src/features/agents/ui/AgentDefinitionDialog.tsx", 1050],
 ]);
 
 await runFileSizeCheck({
