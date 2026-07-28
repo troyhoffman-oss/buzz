@@ -19,6 +19,10 @@ import {
 } from "@/features/agents/hooks";
 import { getPersonaLibraryState } from "@/features/agents/lib/catalog";
 import { clearLegacyPersonaCatalogVisibility } from "@/features/agents/lib/legacyPersonaCatalogVisibility";
+import {
+  personaCardEditAction,
+  type PersonaCardInstanceEdit,
+} from "@/features/agents/ui/personaCardEditAction";
 import { useCreatedAgentChannelAttachment } from "@/features/agents/useCreatedAgentChannelAttachment";
 import type {
   SnapshotFormat,
@@ -69,6 +73,8 @@ export function usePersonaActions() {
 
   const [personaDialogState, setPersonaDialogState] =
     React.useState<PersonaDialogState | null>(null);
+  const [agentToEditInstance, setAgentToEditInstance] =
+    React.useState<PersonaCardInstanceEdit | null>(null);
   const [personaToDelete, setPersonaToDelete] =
     React.useState<AgentPersona | null>(null);
   const [personaToShare, setPersonaToShare] = React.useState<{
@@ -337,16 +343,43 @@ export function usePersonaActions() {
     setShouldLoadAcpRuntimes(true);
   }
 
-  function openEdit(persona: AgentPersona) {
-    clearFeedback("library");
+  /**
+   * Enter the definition dialog, whatever the instance dialog was showing.
+   *
+   * The two dialogs are separate mounts driven by separate state, so every
+   * entry into one clears the other rather than trusting it was already null —
+   * otherwise a second action taken before the first dialog closed leaves both
+   * mounted, stacked on one backdrop.
+   */
+  function openDefinitionDialog(state: PersonaDialogState) {
+    setAgentToEditInstance(null);
     setShouldLoadAcpRuntimes(true);
-    setPersonaDialogState(editPersonaDialogState(persona));
+    setPersonaDialogState(state);
+  }
+
+  /** Edit the definition itself, past the provider-record routing below. */
+  function openEditDefinition(persona: AgentPersona) {
+    clearFeedback("library");
+    openDefinitionDialog(editPersonaDialogState(persona));
+  }
+
+  function openEdit(persona: AgentPersona, linkedAgent?: ManagedAgent) {
+    clearFeedback("library");
+    // Rule 19, on the card's own door into the same dialog — see
+    // `personaCardEditAction`, which owns the decision so it can be tested
+    // the way the profile panel's and `!model`'s doors already are.
+    const action = personaCardEditAction(persona, linkedAgent);
+    if (action.type === "instance") {
+      setPersonaDialogState(null);
+      setAgentToEditInstance({ agent: action.agent, persona: action.persona });
+      return;
+    }
+    openDefinitionDialog(editPersonaDialogState(persona));
   }
 
   function openDuplicate(persona: AgentPersona) {
     clearFeedback("library");
-    setShouldLoadAcpRuntimes(true);
-    setPersonaDialogState(duplicatePersonaDialogState(persona));
+    openDefinitionDialog(duplicatePersonaDialogState(persona));
   }
 
   function openCatalog() {
@@ -426,6 +459,8 @@ export function usePersonaActions() {
     isPending,
     personaDialogState,
     setPersonaDialogState,
+    agentToEditInstance,
+    setAgentToEditInstance,
     personaToDelete,
     setPersonaToDelete,
     personaToShare,
@@ -441,6 +476,7 @@ export function usePersonaActions() {
     handleSetActive,
     prepareCreate,
     openEdit,
+    openEditDefinition,
     openDuplicate,
     openCatalog,
     openDelete,

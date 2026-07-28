@@ -70,7 +70,10 @@ type UnifiedAgentsSectionProps = {
   onCreatePersona: () => void;
   onChooseCatalog: () => void;
   onDuplicatePersona: (persona: AgentPersona) => void;
-  onEditPersona: (persona: AgentPersona) => void;
+  onEditPersona: (
+    persona: AgentPersona,
+    linkedAgent: ManagedAgent | undefined,
+  ) => void;
   onSharePersona: (
     persona: AgentPersona,
     linkedAgent: ManagedAgent | undefined,
