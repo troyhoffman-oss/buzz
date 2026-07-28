@@ -223,6 +223,48 @@ Errors are `{"ok": false, "error": "…"}` on stdout, human detail on stderr, an
 A non-zero exit makes `invoke_provider` discard stdout entirely and report raw stderr, which throws
 the structured error away.
 
+A failure the user can act on may carry an optional `recovery` alongside `error`:
+
+```json
+{ "ok": false,
+  "error": "this host requires Tailscale SSH authentication in a browser: https://login.tailscale.com/a/…",
+  "recovery": { "action": "open_url", "url": "https://login.tailscale.com/a/…" } }
+```
+
+`recovery` is optional in both directions, so there is no negotiation and no flag: a desktop that
+does not read it still renders `error`, which names the problem and carries the URL as text, and a
+desktop that does read it finds nothing there from an older provider. The only `action` today is
+`open_url`, and the only URL is Tailscale's login host — the SSH provider **constructs** that URL
+from a fixed prefix plus a charset-constrained token rather than parsing one out of remote output,
+so no host, scheme, or query from the host can reach the browser opener. The desktop re-validates
+the prefix anyway before opening, on the same "the provider is a subprocess, not a trusted peer"
+footing as its secret re-redaction.
+
+The provider emits this when a tailnet ACL uses Tailscale SSH's `check` action, which makes `ssh`
+print the URL and then block for a human that `BatchMode` cannot supply. It is detected by peeking
+at buffered stderr during the poll loop, so the op fails in one 25 ms tick instead of burning its
+whole budget (8 s for `check`, 300 s for `deploy`) and reporting a bare timeout.
+
+On the desktop, `invoke_provider` returns `ProviderFailure { message, recovery }` rather than a
+`String`, and `ProviderRecovery::from_response` is where the URL is re-validated — on entry, so an
+unvalidated one never exists in desktop memory at all and no later reader of the payload can become
+a second, unguarded way to open it. There is deliberately no `From<ProviderFailure> for String`:
+that is the type-level guard against a caller flattening the recovery away, which is the one bug
+this plumbing exists to prevent. The provider commands carry the type out to the frontend, which
+reads it off `TauriInvokeError.payload` via `providerRecoveryOf`.
+
+Two paths drop the recovery **explicitly**, each at one named site, because their surface cannot
+render an action: `start_managed_agent` (a toast) and `create_managed_agent`'s `spawn_error` (a
+reported field of a succeeding create). Nothing is lost to the user there — the message names the
+problem and carries the URL as text — but widening either needs its surface to grow an action
+first. The agent record's `last_error` is a plain string for a different reason: it is read back
+long after the fact, and an auth URL is a one-shot token that is stale by then.
+
+**Recovery is a manual retry.** The create dialog renders an "Authenticate in browser" button beside
+the failure and nothing else: the desktop cannot tell when the user has finished authenticating in a
+browser it does not own, so an auto-retry would be guessing at a delay. "Check the host again" is
+already the retry, and it is the same button every other host failure offers.
+
 ## Configuration
 
 `validate_provider_config` rejects any config key whose word-split contains

@@ -1,6 +1,6 @@
 use crate::managed_agents::{
     discover_provider_candidates, invoke_provider, provider_discover_harnesses,
-    provider_probe_models, validate_provider_config, BackendProviderInfo,
+    provider_probe_models, validate_provider_config, BackendProviderInfo, ProviderFailure,
 };
 
 /// Resolve a frontend-supplied binary path to a canonical path that is
@@ -10,6 +10,12 @@ use crate::managed_agents::{
 /// argument is an arbitrary-execution primitive for a compromised frontend or
 /// any process that can reach the IPC channel: the desktop would spawn
 /// whatever it names and feed it the agent's private key.
+/// The provider commands below return [`ProviderFailure`] rather than `String`
+/// so a failure carrying a recovery keeps it all the way to the frontend, which
+/// reads the serialized `{message, recovery?}` off `TauriInvokeError.payload`.
+/// Every non-provider failure on these paths — a path that will not resolve, a
+/// config that will not validate, a join that panicked — converts through
+/// `.into()` and simply has no recovery.
 fn resolve_discovered_provider(binary_path: &str) -> Result<std::path::PathBuf, String> {
     let canonical = std::path::PathBuf::from(binary_path)
         .canonicalize()
@@ -41,7 +47,9 @@ pub async fn discover_backend_providers() -> Result<Vec<BackendProviderInfo>, St
 }
 
 #[tauri::command]
-pub async fn probe_backend_provider(binary_path: String) -> Result<serde_json::Value, String> {
+pub async fn probe_backend_provider(
+    binary_path: String,
+) -> Result<serde_json::Value, ProviderFailure> {
     let canonical = resolve_discovered_provider(&binary_path)?;
     // request_id is for provider-side logging — not validated in the response
     // (stdin→stdout is 1:1 per process invocation).
@@ -66,7 +74,7 @@ pub async fn probe_backend_provider(binary_path: String) -> Result<serde_json::V
 pub async fn discover_provider_harnesses(
     binary_path: String,
     config: serde_json::Value,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, ProviderFailure> {
     let canonical = resolve_discovered_provider(&binary_path)?;
     validate_provider_config(&config)?;
     tokio::task::spawn_blocking(move || provider_discover_harnesses(&canonical, &config))
@@ -83,7 +91,7 @@ pub async fn probe_provider_models(
     config: serde_json::Value,
     harness: serde_json::Value,
     env_vars: Option<std::collections::BTreeMap<String, String>>,
-) -> Result<crate::managed_agents::AgentModelsResponse, String> {
+) -> Result<crate::managed_agents::AgentModelsResponse, ProviderFailure> {
     let canonical = resolve_discovered_provider(&binary_path)?;
     validate_provider_config(&config)?;
     let env_vars = env_vars.unwrap_or_default();

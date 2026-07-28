@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use crate::protocol::{snippet, SshConfig};
+use crate::protocol::{snippet, Failure, SshConfig};
 use crate::ssh::{quote, Session};
 
 /// Harnesses the desktop knows how to render, in the same vocabulary its local
@@ -448,26 +448,30 @@ fn hermes_profile_harnesses(probes: &[Probe<'_>], stdout: &str) -> Vec<serde_jso
 pub fn discover_harnesses(
     config: &SshConfig,
     session: &Session,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, Failure> {
     let output = session.run(&discover_script(config), Duration::from_secs(40))?;
     if !output.ok() {
-        return Err(output.failure());
+        return Err(output.failure().into());
     }
     Ok(harnesses_response(&output.stdout))
 }
 
 /// `check`: the preflight the create dialog runs before Deploy goes live.
-pub fn check(session: &Session) -> Result<serde_json::Value, String> {
+pub fn check(session: &Session) -> Result<serde_json::Value, Failure> {
     let output = session.run("echo buzz-ok\n", Duration::from_secs(8))?;
     if output.stdout.trim() == "buzz-ok" {
         return Ok(serde_json::json!({ "ok": true, "detail": "Connected" }));
     }
-    Err(guidance(&output.failure()))
+    Err(guidance(&output.failure()).into())
 }
 
 /// Turn ssh's own diagnosis into something the user can act on. The classified
 /// causes are the ones that actually happen; everything else passes through
 /// verbatim rather than being flattened into a generic message.
+///
+/// Deliberately no entry for the Tailscale re-auth prompt: `run` returns that
+/// as a typed [`Failure`] carrying the URL, so it never reaches this classifier
+/// — which is the point of the typed carrier.
 fn guidance(failure: &str) -> String {
     const GUIDANCE: &[(&str, &str)] = &[
         ("permission denied", "add your public key to ~/.ssh/authorized_keys on the server, or run `tailscale set --ssh` there."),
@@ -494,10 +498,10 @@ pub fn probe_models(
     request: &serde_json::Value,
     config: &SshConfig,
     session: &Session,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, Failure> {
     let output = session.run(&models_script(request, config)?, Duration::from_secs(110))?;
     if !output.ok() {
-        return Err(output.failure());
+        return Err(output.failure().into());
     }
     let models_raw: serde_json::Value =
         serde_json::from_str(output.stdout.trim()).map_err(|e| {

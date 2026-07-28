@@ -153,6 +153,44 @@ impl Tailnet {
     }
 }
 
+/// The Tailscale SSH re-auth URL in a subprocess's stderr, or `None`.
+///
+/// A tailnet ACL with the `check` action makes `ssh` print
+/// `To authenticate, visit: https://login.tailscale.com/a/<token>` and then
+/// block until a human clicks it — including under `BatchMode`, which is why
+/// this is detectable at all.
+///
+/// The result is **constructed, never parsed**: the prefix is matched
+/// byte-exactly and the remainder is constrained to an unreserved-character
+/// token, so no host, userinfo, scheme, query or fragment from the subprocess's
+/// output can survive into the returned string. A URL scraped from a
+/// subprocess and handed to the OS browser opener is an injection primitive;
+/// building the answer makes that structurally impossible instead of checking
+/// for it afterwards. The cost is that a custom control server (Headscale)
+/// prints a different host and gets no clickable link — the right trade against
+/// trusting an arbitrary host from remote output.
+pub fn auth_url_in(stderr: &[u8]) -> Option<String> {
+    const MARKER: &str = "https://login.tailscale.com/a/";
+    /// Comfortably above the ~14-character token Tailscale prints. A longer one
+    /// is dropped rather than truncated: half a URL is worse than none.
+    const MAX_TOKEN: usize = 128;
+
+    let start = stderr
+        .windows(MARKER.len())
+        .position(|window| window == MARKER.as_bytes())?
+        + MARKER.len();
+    let token: String = stderr[start..]
+        .iter()
+        .copied()
+        .take(MAX_TOKEN + 1)
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~'))
+        .map(char::from)
+        .collect();
+    (1..=MAX_TOKEN)
+        .contains(&token.len())
+        .then(|| format!("{MARKER}{token}"))
+}
+
 fn device_from_peer(peer: &Peer, magic_dns: bool) -> Option<Device> {
     let os = peer.os.as_deref().unwrap_or("");
     // Phones and TVs are tailnet members but cannot host an agent.
@@ -359,6 +397,62 @@ mod tests {
         assert!(tailnet.contains("VPS-PROD.tailcfd703.ts.net"));
         assert!(!tailnet.contains("vps.example.com"));
         assert!(!Tailnet::parse(NEEDS_LOGIN).contains("vps-prod.tailcfd703.ts.net"));
+    }
+
+    #[test]
+    fn an_auth_url_is_lifted_out_of_the_line_ssh_prints_around_it() {
+        let stderr =
+            b"# To authenticate, visit:\n#\n#\thttps://login.tailscale.com/a/1a2b3c4d5e6f7g\n#\n";
+        assert_eq!(
+            auth_url_in(stderr).as_deref(),
+            Some("https://login.tailscale.com/a/1a2b3c4d5e6f7g")
+        );
+    }
+
+    #[test]
+    fn stderr_without_the_marker_yields_nothing() {
+        assert_eq!(auth_url_in(b""), None);
+        assert_eq!(auth_url_in(b"Permission denied (publickey).\n"), None);
+        // The host must match byte-exactly: a look-alike control server is not
+        // the one host this function is allowed to name.
+        assert_eq!(
+            auth_url_in(b"https://login.tailscale.com.evil.test/a/tok"),
+            None
+        );
+        assert_eq!(auth_url_in(b"http://login.tailscale.com/a/tok"), None);
+    }
+
+    #[test]
+    fn a_marker_with_no_token_after_it_yields_nothing() {
+        // Half a URL is worse than none: it would open a Tailscale 404.
+        assert_eq!(auth_url_in(b"https://login.tailscale.com/a/"), None);
+        assert_eq!(auth_url_in(b"https://login.tailscale.com/a/ tok"), None);
+        assert_eq!(auth_url_in(b"https://login.tailscale.com/a/\n"), None);
+    }
+
+    #[test]
+    fn an_overlong_token_is_dropped_rather_than_truncated() {
+        // 128 is the last length that is still plausibly a real token; a
+        // truncated 129th would be a valid-looking URL that goes nowhere.
+        let at_cap = format!("https://login.tailscale.com/a/{}", "a".repeat(128));
+        assert_eq!(auth_url_in(at_cap.as_bytes()).as_deref(), Some(&at_cap[..]));
+        let over_cap = format!("https://login.tailscale.com/a/{}", "a".repeat(129));
+        assert_eq!(auth_url_in(over_cap.as_bytes()), None);
+    }
+
+    #[test]
+    fn nothing_after_the_token_survives_into_the_result() {
+        // The whole point of constructing rather than parsing: a query, a
+        // fragment, or a second URL cannot ride along into the browser.
+        assert_eq!(
+            auth_url_in(b"https://login.tailscale.com/a/tok?next=https://evil.test#x").as_deref(),
+            Some("https://login.tailscale.com/a/tok")
+        );
+        // A token flush against the end of the buffer is still a whole token.
+        assert_eq!(
+            auth_url_in(b"visit: https://login.tailscale.com/a/tok").as_deref(),
+            Some("https://login.tailscale.com/a/tok")
+        );
     }
 
     #[test]

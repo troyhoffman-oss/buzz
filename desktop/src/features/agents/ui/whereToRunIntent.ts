@@ -1,5 +1,6 @@
 import { backendProviderLabel } from "../lib/backendProviderLabel";
 import type { BackendIntent } from "../lib/instanceInputForDefinition";
+import { providerRecoveryOf, type ProviderRecovery } from "@/shared/api/tauri";
 import type {
   AgentModelsResponse,
   BackendProviderCandidate,
@@ -25,6 +26,32 @@ export type RemoteModelProbe =
   | { status: "loading" }
   | { status: "loaded"; models: AgentModelsResponse }
   | { status: "failed"; error: string };
+
+/**
+ * A host failure the user can act on, as the section renders it.
+ *
+ * The message always stands alone — it names the problem, and for the
+ * Tailscale case it carries the URL as text — so `recovery` only ever adds a
+ * button. A failure without one is an ordinary failure with a `null` here.
+ */
+export type HostFailure = {
+  message: string;
+  recovery: ProviderRecovery | null;
+};
+
+/**
+ * Read a rejected host call into the shape the section renders.
+ *
+ * Every `catch` in this flow goes through here so the recovery is picked up in
+ * one place rather than at each call site — the failure paths differ in which
+ * state they write, not in how they read an error.
+ */
+export function hostFailureOf(error: unknown): HostFailure {
+  return {
+    message: error instanceof Error ? error.message : String(error),
+    recovery: providerRecoveryOf(error),
+  };
+}
 
 /** Dropdown value of the "runs on this computer" choice. */
 export const LOCAL_RUN_TARGET_VALUE = "local";

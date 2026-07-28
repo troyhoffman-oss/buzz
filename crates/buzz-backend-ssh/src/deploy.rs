@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::install::{self, Payload, Tool};
-use crate::protocol::{Secret, SshConfig};
+use crate::protocol::{Failure, Secret, SshConfig};
 use crate::ssh::{quote, Session};
 
 /// The templated unit, installed once per host and instantiated per agent.
@@ -596,7 +596,7 @@ fn payloads_to_push(
     agent: &Agent,
     config: &SshConfig,
     session: &Session,
-) -> Result<Pushes, String> {
+) -> Result<Pushes, Failure> {
     let candidates = [
         (install::ACP, acp_command(config), &agent.buzz_acp_binary),
         (
@@ -638,13 +638,13 @@ pub fn deploy(
     request: &serde_json::Value,
     config: &SshConfig,
     session: &Session,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, Failure> {
     let agent = Agent::from_request(request)?;
     let push = payloads_to_push(&agent, config, session)?;
     let script = deploy_script(&agent, config, UNIT_TEMPLATE, &push)?;
     let output = session.run(&script, Duration::from_secs(300))?;
     if !output.ok() {
-        return Err(output.failure());
+        return Err(output.failure().into());
     }
     // A successful deploy's remote stderr is otherwise dropped as host noise,
     // so the script's non-fatal complaints — today, "this host has no buzz CLI"
