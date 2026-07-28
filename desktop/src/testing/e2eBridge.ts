@@ -7409,7 +7409,10 @@ async function handleUpdatePersona(args: {
   return { ...persona };
 }
 
-async function handleDeletePersona(args: { id: string }): Promise<void> {
+async function handleDeletePersona(args: {
+  id: string;
+  forceRemoteDelete?: boolean | null;
+}): Promise<void> {
   const persona = mockPersonas.find((candidate) => candidate.id === args.id);
   if (!persona) {
     throw new Error(`agent ${args.id} not found`);
@@ -7420,6 +7423,23 @@ async function handleDeletePersona(args: { id: string }): Promise<void> {
   if (mockTeams.some((team) => team.persona_ids.includes(args.id))) {
     throw new Error(
       `${persona.display_name} is still referenced by a team. Remove it from those teams first.`,
+    );
+  }
+
+  // Model the backend pre-flight: a cascade containing provider-deployed
+  // instances is refused unless the caller acknowledged that their remote
+  // units keep running (the provider protocol has no undeploy).
+  const remoteDeployed = mockManagedAgents.filter(
+    (agent) =>
+      agent.persona_id === args.id &&
+      agent.backend.type === "provider" &&
+      agent.backend_agent_id != null,
+  );
+  if (remoteDeployed.length > 0 && !args.forceRemoteDelete) {
+    throw new Error(
+      `persona ${args.id} has provider-deployed agent instances (${remoteDeployed
+        .map((agent) => agent.name)
+        .join(", ")}); delete those agent instances first`,
     );
   }
 

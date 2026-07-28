@@ -69,6 +69,7 @@ import {
 } from "@/features/profile/ui/UserProfilePanelSections";
 import { AgentConfigurationFocusedView } from "@/features/profile/ui/UserProfilePanelAgentDetails";
 import { UserProfileAgentSettingsMenuSlot } from "@/features/profile/ui/UserProfileAgentActions";
+import { collectPersonaRemoteCascadeInstances } from "@/features/agents/lib/personaCascade";
 import { useProfileAgentDeletion } from "@/features/profile/ui/UserProfilePanelDeletion";
 import { useProfileFieldBuckets } from "@/features/profile/ui/UserProfilePanelFields";
 import { profileEditAgentTarget } from "@/features/profile/ui/profileEditAgentTarget";
@@ -601,6 +602,18 @@ export function UserProfilePanel({
     setPersonaActiveMutation.mutateAsync,
   ]);
 
+  // Cascade instances the delete cannot stop, named in the confirm dialog.
+  const personaDeleteRemoteInstances = React.useMemo(
+    () =>
+      personaToDelete
+        ? collectPersonaRemoteCascadeInstances(
+            managedAgentsQuery.data ?? [],
+            personaToDelete.id,
+          )
+        : [],
+    [managedAgentsQuery.data, personaToDelete],
+  );
+
   const handleConfirmDeletePersona = React.useCallback(
     async (personaToConfirm: AgentPersona) => {
       if (personaToConfirm.sourceTeam) {
@@ -610,7 +623,12 @@ export function UserProfilePanel({
       }
 
       try {
-        await deletePersonaMutation.mutateAsync(personaToConfirm.id);
+        await deletePersonaMutation.mutateAsync({
+          id: personaToConfirm.id,
+          // The dialog named every orphaned remote unit above, so confirming
+          // it is the acknowledgement the backend pre-flight requires.
+          forceRemoteDelete: personaDeleteRemoteInstances.length > 0,
+        });
         toast.success(`Deleted ${personaToConfirm.displayName}.`);
         setPersonaToDelete(null);
         onClose();
@@ -620,7 +638,7 @@ export function UserProfilePanel({
         );
       }
     },
-    [deletePersonaMutation.mutateAsync, onClose],
+    [deletePersonaMutation.mutateAsync, onClose, personaDeleteRemoteInstances],
   );
 
   // Count of managed-agent instances backed by the persona being deleted.
@@ -952,6 +970,7 @@ export function UserProfilePanel({
         }
         personaDialogState={personaDialogState}
         personaToDelete={personaToDelete}
+        remoteInstances={personaDeleteRemoteInstances}
         runtimes={acpRuntimesQuery.data ?? []}
         runtimesLoading={acpRuntimesQuery.isLoading}
         updateError={

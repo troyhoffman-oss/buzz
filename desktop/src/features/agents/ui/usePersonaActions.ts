@@ -243,10 +243,22 @@ export function usePersonaActions() {
     }
   }
 
-  async function handleDelete(persona: AgentPersona) {
+  /**
+   * `forceRemoteDelete` must be set only by a caller whose confirmation named
+   * the remote units the cascade will orphan — it IS the acknowledgement the
+   * backend pre-flight is asking for, so sending it unconditionally would turn
+   * a two-step contract back into a one-step one.
+   */
+  async function handleDelete(
+    persona: AgentPersona,
+    forceRemoteDelete = false,
+  ) {
     clearFeedback("library");
     try {
-      await deletePersonaMutation.mutateAsync(persona.id);
+      await deletePersonaMutation.mutateAsync({
+        id: persona.id,
+        forceRemoteDelete,
+      });
       setPersonaNoticeMessage(`Deleted ${persona.displayName}.`);
       setPersonaToDelete(null);
     } catch (error) {

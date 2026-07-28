@@ -100,11 +100,6 @@ const overrides = new Map([
   // -5: create-time arg normalization moved behind `create_time_agent_args`,
   // which replaces the inlined local-only `normalize_agent_args` block here.
   ["src-tauri/src/commands/agents.rs", 1413],
-  // agent-lifecycle-fixes: cascade-delete in delete_persona restructured into
-  // 3-phase (stage/stop/commit) + commit_cascade_agents injectable helper for
-  // retry-safety. Load-bearing reviewer-required change; queued to split.
-  // Consolidation removed the legacy persona-card import/export codecs.
-  ["src-tauri/src/commands/personas/mod.rs", 984],
   // #1418 read-path fix: get_thread_replies' blocker fix (shared TIMELINE_KINDS
   // const + build_thread_replies_filter helper, mirroring the channel sibling so
   // the two p-gate filters can't drift) plus two guard unit tests. The file was
