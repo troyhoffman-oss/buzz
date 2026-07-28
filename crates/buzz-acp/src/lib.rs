@@ -1371,7 +1371,7 @@ impl Drop for RespawnGuard {
 fn durable_session_store(agents: u32, pubkey_hex: &str) -> Option<SessionStore> {
     if agents > 1 {
         tracing::info!(
-            target: "pool::session",
+            target: "buzz_acp::pool::session",
             agents,
             "durable session resume disabled — sessions are per-agent-process with --agents > 1"
         );
@@ -1380,7 +1380,7 @@ fn durable_session_store(agents: u32, pubkey_hex: &str) -> Option<SessionStore> 
     let store = SessionStore::for_agent(pubkey_hex);
     if store.is_none() {
         tracing::warn!(
-            target: "pool::session",
+            target: "buzz_acp::pool::session",
             "no platform data directory — sessions will not survive a restart"
         );
     }
@@ -1729,7 +1729,7 @@ async fn tokio_main() -> Result<()> {
 
     if !config.memory_enabled {
         tracing::info!(
-            target: "engram::core",
+            target: "buzz_acp::engram::core",
             "NIP-AE core memory injection disabled (re-enable by removing --no-memory / BUZZ_ACP_NO_MEMORY)"
         );
     }
@@ -2933,8 +2933,9 @@ fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
 }
 
 /// Split a kind:9 mention of this agent into `(command, args)` when its content
-/// starts with a `!token`. Ownership is NOT checked here — callers re-check the
-/// author so a non-owner's `!cancel` still reaches the agent as a prompt.
+/// starts with a `!token`, or with an `@mention` followed by one. Ownership is
+/// NOT checked here — callers re-check the author so a non-owner's `!cancel`
+/// still reaches the agent as a prompt.
 fn owner_control_command<'a>(
     event: &'a nostr::Event,
     kind_u32: u32,
@@ -2944,6 +2945,18 @@ fn owner_control_command<'a>(
         return None;
     }
     let content = event.content.trim();
+    // Mentioning is how a client addresses an agent, so `@Name !model` is the
+    // natural gesture, and a display name may hold spaces (`@Codex (Sol)`).
+    // Skip past the mention to the first `!`-initiated token rather than
+    // matching the name: the `p` tag already proved the mention is ours.
+    let content = if content.starts_with('@') {
+        content
+            .char_indices()
+            .find(|&(i, c)| c == '!' && content[..i].ends_with(char::is_whitespace))
+            .map_or("", |(i, _)| &content[i..])
+    } else {
+        content
+    };
     if !content.starts_with('!') {
         return None;
     }
@@ -4498,6 +4511,18 @@ mod owner_control_command_tests {
             // `("!shutdown", "please")` matches no arm and falls through.
             ("!shutdown please", Some(("!shutdown", "please"))),
             ("!bogus", Some(("!bogus", ""))),
+            // Clients address an agent by mention, and a display name may hold
+            // spaces, so a leading mention is skipped without matching a name.
+            ("@Claude !model", Some(("!model", ""))),
+            ("@Claude !model haiku", Some(("!model", "haiku"))),
+            ("@Will Pfleger !model", Some(("!model", ""))),
+            ("@Codex (Sol) !model opus", Some(("!model", "opus"))),
+            ("@Claude", None),
+            // A leading `@` arms the scan for the rest of the content, so a
+            // bang anywhere after one is a command.
+            ("@Claude please run !model haiku", Some(("!model", "haiku"))),
+            // Without that leading `@`, a bang never fires.
+            ("hello @Claude !model", None),
             ("hello !model haiku", None),
             ("", None),
         ] {
