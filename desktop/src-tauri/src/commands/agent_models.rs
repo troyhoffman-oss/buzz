@@ -1099,8 +1099,12 @@ pub(super) fn normalize_agent_models(
                         if seen_ids.insert(value.to_string()) {
                             models.push(AgentModelInfo {
                                 id: value.to_string(),
+                                // The schema field is `name`; `displayName` is
+                                // a pre-standardization spelling some adapters
+                                // still emit. Same order as buzz-acp's reader.
                                 name: o
-                                    .get("displayName")
+                                    .get("name")
+                                    .or_else(|| o.get("displayName"))
                                     .and_then(|v| v.as_str())
                                     .map(str::to_string),
                                 description: o

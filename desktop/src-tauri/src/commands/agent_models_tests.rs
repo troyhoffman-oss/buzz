@@ -579,12 +579,13 @@ fn is_databricks_provider_matches_both_variants() {
 }
 
 #[test]
-fn stable_config_options_carry_their_description() {
+fn stable_config_options_carry_their_label_and_description() {
     // Verbatim shape of `claude-agent-acp models --json` (v0.62.0): every
     // model sits in the stable half with a populated `description`, and
     // `unstable` is null. The description is the only thing separating the
     // two default-vs-explicit Opus rows, so dropping it here blanks the
     // option's secondary line in the picker no matter what the frontend does.
+    // The last row carries the pre-standardization `displayName` spelling.
     let raw = serde_json::json!({
         "agent": { "name": "claude-agent-acp", "version": "0.62.0" },
         "stable": {
@@ -602,7 +603,7 @@ fn stable_config_options_carry_their_description() {
                         "name": "claude-opus-5",
                         "description": "Custom Opus model"
                     },
-                    { "value": "claude-sonnet-5", "name": "Sonnet" }
+                    { "value": "claude-sonnet-5", "displayName": "Sonnet" }
                 ]
             }]
         },
@@ -613,14 +614,23 @@ fn stable_config_options_carry_their_description() {
 
     assert_eq!(response.models.len(), 3);
     assert_eq!(response.models[0].id, "default");
+    // The schema field is `name`. Reading only `displayName` leaves every
+    // claude row nameless, and the picker falls back to showing the raw id.
+    assert_eq!(
+        response.models[0].name.as_deref(),
+        Some("Default (recommended)")
+    );
     assert_eq!(
         response.models[0].description.as_deref(),
         Some("Use the default model (currently Opus 5)")
     );
+    assert_eq!(response.models[1].name.as_deref(), Some("claude-opus-5"));
     assert_eq!(
         response.models[1].description.as_deref(),
         Some("Custom Opus model")
     );
+    // `displayName` still answers for adapters that never standardized.
+    assert_eq!(response.models[2].name.as_deref(), Some("Sonnet"));
     // An option that omits the field still normalizes to `None` rather than
     // an empty string, so the frontend renders one line for it.
     assert_eq!(response.models[2].description, None);
