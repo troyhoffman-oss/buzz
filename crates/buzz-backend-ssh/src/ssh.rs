@@ -16,6 +16,7 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::protocol::SshConfig;
@@ -129,8 +130,8 @@ impl Session {
             drop(stdin);
         });
 
-        let stdout = drain(child.stdout.take());
-        let stderr = drain(child.stderr.take());
+        let stdout = Drain::start(child.stdout.take());
+        let stderr = Drain::start(child.stderr.take());
 
         // Poll to a deadline rather than blocking on `wait`, the repo's standard
         // pattern (`discovery::probe_codex_acp_major_version`).
@@ -141,7 +142,7 @@ impl Session {
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(25));
                 }
-                Ok(None) => break Err(format!("ssh timed out after {}s", timeout.as_secs())),
+                Ok(None) => break Err(stderr.with_bytes(|buffered| timed_out(timeout, buffered))),
                 Err(e) => break Err(format!("ssh wait failed: {e}")),
             }
         };
@@ -155,30 +156,81 @@ impl Session {
 
         Ok(Output {
             status: outcome?,
-            stdout: stdout.join().unwrap_or_default(),
-            stderr: stderr.join().unwrap_or_default(),
+            stdout: stdout.finish(),
+            stderr: stderr.finish(),
         })
     }
 }
 
-/// Read a pipe to EOF on its own thread, capped. Both pipes must be drained
-/// concurrently with the wait or a chatty remote fills one and blocks.
-fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
-    std::thread::spawn(move || {
-        let Some(mut pipe) = pipe else {
-            return String::new();
-        };
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 8192];
-        while buf.len() < OUTPUT_CAP {
-            match pipe.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+/// A pipe being read to EOF on its own thread, capped at [`OUTPUT_CAP`]. Both
+/// pipes must be drained concurrently with the wait or a chatty remote fills
+/// one and blocks.
+///
+/// The buffer is shared rather than returned by the thread so a caller can read
+/// what has arrived so far without waiting on the child — which is the only
+/// safe shape on the timeout path, where a descendant holding the pipe open
+/// would leave a `join()` blocked forever.
+struct Drain {
+    buffer: Arc<Mutex<Vec<u8>>>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Drain {
+    fn start<R: Read + Send + 'static>(pipe: Option<R>) -> Self {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&buffer);
+        let thread = std::thread::spawn(move || {
+            let Some(mut pipe) = pipe else { return };
+            let mut chunk = [0u8; 8192];
+            loop {
+                // Read outside the lock: holding it across a blocking read
+                // would stall every peek for as long as the remote is quiet.
+                let Ok(read @ 1..) = pipe.read(&mut chunk) else {
+                    return;
+                };
+                let mut buffer = lock(&sink);
+                if buffer.len() >= OUTPUT_CAP {
+                    return;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                buffer.truncate(OUTPUT_CAP);
             }
-        }
-        buf.truncate(OUTPUT_CAP);
-        String::from_utf8_lossy(&buf).into_owned()
-    })
+        });
+        Self { buffer, thread }
+    }
+
+    /// Read what has arrived so far, in place. Never waits on the child, so it
+    /// is safe on the timeout path.
+    fn with_bytes<T>(&self, f: impl FnOnce(&[u8]) -> T) -> T {
+        f(&lock(&self.buffer))
+    }
+
+    /// Everything, once the pipe closes.
+    fn finish(self) -> String {
+        let _ = self.thread.join();
+        String::from_utf8_lossy(&lock(&self.buffer)).into_owned()
+    }
+}
+
+/// A timeout that still reports whatever the child managed to say. The drained
+/// stderr used to be dropped on this path — exactly when it is most wanted, on
+/// a host that printed a diagnosis and then hung. Scrubbed through the same
+/// `snippet` as [`Output::failure`], because it is raw remote output.
+fn timed_out(timeout: Duration, buffered: &[u8]) -> String {
+    let detail = crate::protocol::snippet(&String::from_utf8_lossy(buffered));
+    let seconds = timeout.as_secs();
+    if detail.is_empty() {
+        format!("ssh timed out after {seconds}s")
+    } else {
+        format!("ssh timed out after {seconds}s: {detail}")
+    }
+}
+
+/// The drain thread cannot panic while holding the buffer, so poisoning is
+/// unreachable; recovering rather than unwrapping keeps that from ever becoming
+/// a way to take the provider down.
+fn lock(buffer: &Mutex<Vec<u8>>) -> std::sync::MutexGuard<'_, Vec<u8>> {
+    buffer.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Windows ships OpenSSH in System32 but does not always put it on a GUI
@@ -322,6 +374,24 @@ mod tests {
             panic!("a command past its deadline must be killed, not awaited");
         };
         assert!(error.contains("timed out"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_still_reports_what_the_host_managed_to_say() {
+        // The stderr of a host that diagnoses itself and *then* hangs is
+        // exactly the output worth keeping, and it used to be dropped.
+        let session = Session {
+            binary: PathBuf::from("/bin/sh"),
+            args: vec!["-s".into()],
+        };
+        let Err(error) = session.run(
+            "printf 'disk is full\\n' >&2; sleep 30",
+            Duration::from_millis(300),
+        ) else {
+            panic!("a command past its deadline must be killed, not awaited");
+        };
+        assert!(error.contains("disk is full"), "{error}");
     }
 
     #[test]
