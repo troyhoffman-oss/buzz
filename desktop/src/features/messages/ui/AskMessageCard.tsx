@@ -8,6 +8,7 @@ import {
   askAcceleratorIndex,
   askAnswerLabels,
   askReplyContent,
+  askReplyMentions,
   askRovingIndex,
   canAnswerAsk,
 } from "@/features/messages/lib/askCard";
@@ -106,7 +107,10 @@ export function AskMessageCard({
           content,
           questionId,
           undefined,
-          undefined,
+          // Without this the answer reaches the relay but never the agent:
+          // the harness's subscription is mention-filtered. See
+          // `askReplyMentions`.
+          askReplyMentions({ signerPubkey: message.signerPubkey }),
           undefined,
           undefined,
           undefined,
@@ -125,7 +129,7 @@ export function AskMessageCard({
         );
       }
     },
-    [channelId, questionId, queryClient],
+    [channelId, message.signerPubkey, questionId, queryClient],
   );
 
   const commit = React.useCallback(

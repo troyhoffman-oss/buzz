@@ -2305,6 +2305,12 @@ async fn tokio_main() -> Result<()> {
                                     );
                                     continue; // consume event — do NOT push to queue
                                 }
+                                // Everything else — including `!skip`, which the
+                                // ask card sends and which parses like a command
+                                // — falls through. `!skip` is answered by the
+                                // elicitation check below; an arm here would
+                                // consume it and hang the question. See
+                                // `owner_control_command_leaves_skip_to_the_elicitation_check`.
                                 _ => {}
                             }
 
@@ -2365,12 +2371,26 @@ async fn tokio_main() -> Result<()> {
                             if kind_u32 == KIND_STREAM_MESSAGE
                                 && owner_cache.get() == Some(buzz_event.event.pubkey.to_hex().as_str())
                             {
-                                let answers_question = pool
-                                    .pending_elicitation_question(buzz_event.channel_id)
-                                    .is_some_and(|question_id| {
-                                        queue::parse_thread_tags(&buzz_event.event).parent_event_id
-                                            == Some(question_id)
-                                    });
+                                let pending =
+                                    pool.pending_elicitation_question(buzz_event.channel_id);
+                                let parent =
+                                    queue::parse_thread_tags(&buzz_event.event).parent_event_id;
+                                let answers_question = pending.is_some() && parent == pending;
+                                if !answers_question && parent.is_some() {
+                                    // Silence here is what made the missing `p`
+                                    // tag on ask-card answers cost hours: a lost
+                                    // answer and a thinking agent looked
+                                    // identical in the journal. Say when a
+                                    // threaded owner reply reaches the harness
+                                    // but matches no pending question.
+                                    tracing::debug!(
+                                        target: "buzz_acp::acp::elicitation",
+                                        channel_id = %buzz_event.channel_id,
+                                        parent_event_id = ?parent,
+                                        pending_question = ?pending,
+                                        "threaded owner reply answers no pending question — dispatching as a prompt"
+                                    );
+                                }
                                 if answers_question {
                                     let content = buzz_event.event.content.trim();
                                     let reply = if content == "!skip" {
@@ -4511,6 +4531,12 @@ mod owner_control_command_tests {
             // `("!shutdown", "please")` matches no arm and falls through.
             ("!shutdown please", Some(("!shutdown", "please"))),
             ("!bogus", Some(("!bogus", ""))),
+            // `!skip` is a question answer, not a control command. It parses
+            // like one — and now that ask-card answers p-tag the agent, it
+            // reaches this parser on every skipped question — but it matches
+            // no arm and falls through to the elicitation check. See
+            // `owner_control_command_leaves_skip_to_the_elicitation_check`.
+            ("!skip", Some(("!skip", ""))),
             // Clients address an agent by mention, and a display name may hold
             // spaces, so a leading mention is skipped without matching a name.
             ("@Claude !model", Some(("!model", ""))),
@@ -4547,6 +4573,38 @@ mod owner_control_command_tests {
 
         let other_agent = make_event(KIND_STREAM_MESSAGE, "!rotate", Some(&"cd".repeat(32)));
         assert!(owner_control_command(&other_agent, KIND_STREAM_MESSAGE, &agent).is_none());
+    }
+
+    /// `!skip` must stay unclaimed by the control-command match.
+    ///
+    /// It is the ask card's skip reply, and every ask-card answer p-tags the
+    /// asking agent — so `owner_control_command` parses `!skip` into
+    /// `Some(("!skip", ""))` on the owner's every skip. That is load-bearing
+    /// only because no arm matches it: the event falls through to the
+    /// elicitation check, which turns it into `ElicitationReply::Skip` and
+    /// unblocks the waiting question. An arm added here would consume the
+    /// event instead and hang the turn until it was cancelled.
+    #[test]
+    fn owner_control_command_leaves_skip_to_the_elicitation_check() {
+        // Scoped to production code: everything before the first `#[cfg(test)]`
+        // module. The needle is assembled at runtime so it cannot match itself,
+        // and the test tables below are excluded by the split.
+        let src = include_str!("lib.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let arm = format!("Some((\"{}\", ", "!skip");
+        assert!(
+            !production.contains(&arm),
+            "a control-command arm now claims `!skip` — read this test's doc comment first",
+        );
+
+        let agent = "ab".repeat(32);
+        let event = make_event(KIND_STREAM_MESSAGE, "!skip", Some(&agent));
+        assert_eq!(
+            owner_control_command(&event, KIND_STREAM_MESSAGE, &agent),
+            Some(("!skip", "")),
+            "`!skip` must remain a plain parse result with no control arm \
+             behind it — see this test's doc comment before adding one",
+        );
     }
 
     /// Durable resume is single-process only: with more agent slots than one,
