@@ -45,6 +45,58 @@ impl fmt::Display for Secret {
     }
 }
 
+/// An op failure, plus the optional machine-readable recovery the desktop needs
+/// to offer the user a way out.
+///
+/// A struct rather than an error enum: exactly one failure in this crate has a
+/// recovery, and an enum would make every unremarkable `format!` in five files
+/// name a variant. The `From<String>`/`From<&str>` conversions keep every
+/// existing `?` compiling; there is deliberately **no** `From<Failure> for
+/// String`, which would silently drop `auth_url` at the first caller that
+/// propagated one.
+#[derive(Debug)]
+pub struct Failure {
+    pub message: String,
+    /// A `https://login.tailscale.com/a/…` URL built by
+    /// [`crate::tailscale::auth_url_in`]. Never anything else.
+    pub auth_url: Option<String>,
+}
+
+impl Failure {
+    /// The tailnet's ACL asks for a browser re-auth (Tailscale SSH's `check`
+    /// action), which `BatchMode` cannot answer.
+    ///
+    /// The message stands alone: a desktop too old to read `recovery` still
+    /// tells the user what happened and where to go.
+    pub fn tailscale_auth(url: String) -> Self {
+        Self {
+            message: format!("this host requires Tailscale SSH authentication in a browser: {url}"),
+            auth_url: Some(url),
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            auth_url: None,
+        }
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_string())
+    }
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Strip credential-shaped tokens out of text that came from somewhere we do
 /// not control (remote stderr, mostly). Mirrors the desktop's own prefix rule
 /// in `managed_agents::backend::redact_secrets_with` so a leak needs two

@@ -29,11 +29,14 @@ mod tailscale;
 
 use std::io::Read;
 
-use protocol::SshConfig;
+use protocol::{Failure, SshConfig};
 use ssh::Session;
 
 fn main() {
-    let response = match read_request().and_then(|request| run(&request)) {
+    let response = match read_request()
+        .map_err(Failure::from)
+        .and_then(|request| run(&request))
+    {
         Ok(response) => response,
         Err(error) => {
             // Human detail on stderr, machine-readable failure on stdout. The
@@ -41,7 +44,15 @@ fn main() {
             // the first. `error` is already credential-scrubbed by whoever
             // produced it, and the desktop scrubs it again on the way in.
             eprintln!("buzz-backend-ssh: {error}");
-            serde_json::json!({ "ok": false, "error": error })
+            let mut response = serde_json::json!({ "ok": false, "error": error.message });
+            // An optional key, in both directions: a desktop that does not know
+            // it still renders `error`, which names the problem and carries the
+            // URL as text, and a desktop that does know it finds nothing here
+            // from an older provider. No negotiation, no flag.
+            if let Some(url) = error.auth_url {
+                response["recovery"] = serde_json::json!({ "action": "open_url", "url": url });
+            }
+            response
         }
     };
     println!("{response}");
@@ -59,7 +70,7 @@ fn read_request() -> Result<serde_json::Value, String> {
     serde_json::from_str(input.trim()).map_err(|e| format!("request is not valid JSON: {e}"))
 }
 
-fn run(request: &serde_json::Value) -> Result<serde_json::Value, String> {
+fn run(request: &serde_json::Value) -> Result<serde_json::Value, Failure> {
     let op = request
         .get("op")
         .and_then(|v| v.as_str())
@@ -71,7 +82,7 @@ fn run(request: &serde_json::Value) -> Result<serde_json::Value, String> {
     match op {
         "info" => return Ok(protocol::info_response()),
         "check" | "discover_harnesses" | "probe_models" | "deploy" => {}
-        _ => return Err(format!("unsupported op '{op}'")),
+        _ => return Err(format!("unsupported op '{op}'").into()),
     }
 
     let config = SshConfig::from_request(request)?;
@@ -117,7 +128,7 @@ mod tests {
             "provider_config": { "ssh_host": "vps.invalid" },
         }))
         .unwrap_err();
-        assert!(error.contains("teleport"), "{error}");
+        assert!(error.message.contains("teleport"), "{error}");
     }
 
     #[test]
@@ -131,7 +142,7 @@ mod tests {
         // reports the missing field instead of a connection failure.
         for op in ["check", "discover_harnesses", "probe_models", "deploy"] {
             let error = run(&serde_json::json!({ "op": op })).unwrap_err();
-            assert!(error.contains("provider_config"), "{op}: {error}");
+            assert!(error.message.contains("provider_config"), "{op}: {error}");
         }
     }
 

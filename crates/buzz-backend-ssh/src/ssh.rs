@@ -19,7 +19,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::protocol::SshConfig;
+use crate::protocol::{Failure, SshConfig};
 
 /// Remote output is wrapped into this provider's own stdout, which the desktop
 /// caps at 1 MB. Refusing to buffer more than that here makes the failure a
@@ -107,7 +107,14 @@ impl Session {
     }
 
     /// Feed `script` to the remote shell and collect its output.
-    pub fn run(&self, script: &str, timeout: Duration) -> Result<Output, String> {
+    ///
+    /// A tailnet ACL asking for a browser re-auth is classified here rather
+    /// than at the five call sites: `ssh` prints the URL and then blocks, so
+    /// every op would otherwise burn its whole budget — 8s to 300s — and report
+    /// a bare timeout for something one click fixes. Owning it here also keeps
+    /// the marker out of the callers, so no one is tempted to match on the
+    /// string.
+    pub fn run(&self, script: &str, timeout: Duration) -> Result<Output, Failure> {
         let mut command = Command::new(&self.binary);
         command
             .args(&self.args)
@@ -139,11 +146,21 @@ impl Session {
         let outcome = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Ok(status.code()),
-                Ok(None) if Instant::now() < deadline => {
+                Ok(None) => {
+                    // Scanning what has arrived, rather than waiting for EOF,
+                    // is what turns the whole budget into one poll interval:
+                    // the auth prompt is printed and *then* ssh blocks. Checked
+                    // before the deadline so the timeout path cannot discard an
+                    // answer already sitting in the buffer.
+                    if let Some(url) = stderr.with_bytes(crate::tailscale::auth_url_in) {
+                        break Err(Failure::tailscale_auth(url));
+                    }
+                    if Instant::now() >= deadline {
+                        break Err(stderr.with_bytes(|buffered| timed_out(timeout, buffered)));
+                    }
                     std::thread::sleep(Duration::from_millis(25));
                 }
-                Ok(None) => break Err(stderr.with_bytes(|buffered| timed_out(timeout, buffered))),
-                Err(e) => break Err(format!("ssh wait failed: {e}")),
+                Err(e) => break Err(format!("ssh wait failed: {e}").into()),
             }
         };
         if outcome.is_err() {
@@ -154,10 +171,17 @@ impl Session {
         // stdin handle, and a live handle keeps a killed child's pipe open.
         let _ = writer.join();
 
+        let status = outcome?;
+        let stderr = stderr.finish();
+        // The same classification for a host that printed the URL and then
+        // exited on its own, so both shapes reach the caller as one failure.
+        if let Some(url) = crate::tailscale::auth_url_in(stderr.as_bytes()) {
+            return Err(Failure::tailscale_auth(url));
+        }
         Ok(Output {
-            status: outcome?,
+            status,
             stdout: stdout.finish(),
-            stderr: stderr.finish(),
+            stderr,
         })
     }
 }
@@ -166,10 +190,11 @@ impl Session {
 /// pipes must be drained concurrently with the wait or a chatty remote fills
 /// one and blocks.
 ///
-/// The buffer is shared rather than returned by the thread so a caller can read
-/// what has arrived so far without waiting on the child — which is the only
-/// safe shape on the timeout path, where a descendant holding the pipe open
-/// would leave a `join()` blocked forever.
+/// The buffer is shared rather than returned by the thread so the poll loop can
+/// read what has arrived so far without waiting on the child — which is what
+/// makes the Tailscale check detectable, and is also the only safe shape on the
+/// timeout path, where a descendant holding the pipe open would leave a
+/// `join()` blocked forever.
 struct Drain {
     buffer: Arc<Mutex<Vec<u8>>>,
     thread: std::thread::JoinHandle<()>,
@@ -216,13 +241,13 @@ impl Drain {
 /// stderr used to be dropped on this path — exactly when it is most wanted, on
 /// a host that printed a diagnosis and then hung. Scrubbed through the same
 /// `snippet` as [`Output::failure`], because it is raw remote output.
-fn timed_out(timeout: Duration, buffered: &[u8]) -> String {
+fn timed_out(timeout: Duration, buffered: &[u8]) -> Failure {
     let detail = crate::protocol::snippet(&String::from_utf8_lossy(buffered));
     let seconds = timeout.as_secs();
     if detail.is_empty() {
-        format!("ssh timed out after {seconds}s")
+        format!("ssh timed out after {seconds}s").into()
     } else {
-        format!("ssh timed out after {seconds}s: {detail}")
+        format!("ssh timed out after {seconds}s: {detail}").into()
     }
 }
 
@@ -373,7 +398,7 @@ mod tests {
         let Err(error) = session.run("sleep 30", Duration::from_millis(300)) else {
             panic!("a command past its deadline must be killed, not awaited");
         };
-        assert!(error.contains("timed out"), "{error}");
+        assert!(error.message.contains("timed out"), "{error}");
     }
 
     #[cfg(unix)]
@@ -391,7 +416,53 @@ mod tests {
         ) else {
             panic!("a command past its deadline must be killed, not awaited");
         };
-        assert!(error.contains("disk is full"), "{error}");
+        assert!(error.message.contains("disk is full"), "{error}");
+        assert!(error.auth_url.is_none(), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tailscale_auth_prompt_fails_fast_instead_of_burning_the_budget() {
+        let session = Session {
+            binary: PathBuf::from("/bin/sh"),
+            args: vec!["-s".into()],
+        };
+        let started = Instant::now();
+        // The shape ssh prints under a `check`-action tailnet ACL: the URL,
+        // then a wait for a human who is not there.
+        let Err(error) = session.run(
+            "printf '# To authenticate, visit: https://login.tailscale.com/a/abc123\\n' >&2\nsleep 30\n",
+            Duration::from_secs(10),
+        ) else {
+            panic!("a host asking for browser auth must fail, not hang");
+        };
+        assert_eq!(
+            error.auth_url.as_deref(),
+            Some("https://login.tailscale.com/a/abc123")
+        );
+        // The fail-fast IS the feature: waiting out the budget is the bug.
+        assert!(started.elapsed() < Duration::from_secs(5), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tailscale_auth_prompt_on_a_failing_exit_is_classified_the_same_way() {
+        // ssh can also print the URL and give up on its own, which lands past
+        // the poll loop entirely.
+        let session = Session {
+            binary: PathBuf::from("/bin/sh"),
+            args: vec!["-s".into()],
+        };
+        let Err(error) = session.run(
+            "printf 'visit: https://login.tailscale.com/a/xyz789\\n' >&2; exit 255",
+            Duration::from_secs(10),
+        ) else {
+            panic!("a host asking for browser auth must fail, not succeed");
+        };
+        assert_eq!(
+            error.auth_url.as_deref(),
+            Some("https://login.tailscale.com/a/xyz789")
+        );
     }
 
     #[test]
