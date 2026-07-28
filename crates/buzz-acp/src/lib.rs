@@ -2371,12 +2371,26 @@ async fn tokio_main() -> Result<()> {
                             if kind_u32 == KIND_STREAM_MESSAGE
                                 && owner_cache.get() == Some(buzz_event.event.pubkey.to_hex().as_str())
                             {
-                                let answers_question = pool
-                                    .pending_elicitation_question(buzz_event.channel_id)
-                                    .is_some_and(|question_id| {
-                                        queue::parse_thread_tags(&buzz_event.event).parent_event_id
-                                            == Some(question_id)
-                                    });
+                                let pending =
+                                    pool.pending_elicitation_question(buzz_event.channel_id);
+                                let parent =
+                                    queue::parse_thread_tags(&buzz_event.event).parent_event_id;
+                                let answers_question = pending.is_some() && parent == pending;
+                                if !answers_question && parent.is_some() {
+                                    // Silence here is what made the missing `p`
+                                    // tag on ask-card answers cost hours: a lost
+                                    // answer and a thinking agent looked
+                                    // identical in the journal. Say when a
+                                    // threaded owner reply reaches the harness
+                                    // but matches no pending question.
+                                    tracing::debug!(
+                                        target: "buzz_acp::acp::elicitation",
+                                        channel_id = %buzz_event.channel_id,
+                                        parent_event_id = ?parent,
+                                        pending_question = ?pending,
+                                        "threaded owner reply answers no pending question — dispatching as a prompt"
+                                    );
+                                }
                                 if answers_question {
                                     let content = buzz_event.event.content.trim();
                                     let reply = if content == "!skip" {
