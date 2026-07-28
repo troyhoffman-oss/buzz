@@ -56,6 +56,10 @@ const overrides = new Map([
   // queued for a broader composition-root split. Bumped for the
   // archive/unarchive/transfer community-management commands (web parity).
   ["src-tauri/src/lib.rs", 1013],
+  // 999 -> 1012: the ask-card answer command — comma-safe option matching and
+  // the answer's visible echo into the channel. The file sat 1 line under the
+  // limit before that feature; queued to split the message-event commands out.
+  ["src-tauri/src/events.rs", 1012],
   // persona-events rebase: build_deploy_payload threads `state` for the
   // read-time relay-URL workspace fallback while keeping the create-time env
   // pin (the credential-leak guard). Load-bearing feature growth from the
