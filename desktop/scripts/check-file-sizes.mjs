@@ -191,7 +191,9 @@ const overrides = new Map([
   // one drops a stale known-runtime pin) are disjoint blocks that each stayed
   // under the 1000 default alone; the union crosses it. Test-only; queued to
   // split.
-  ["src-tauri/src/managed_agents/persona_events/tests.rs", 1022],
+  // +34: the runtime half of the same backend scoping — a provider record keeps
+  // its harness through a persona sync, a local one still mirrors the definition.
+  ["src-tauri/src/managed_agents/persona_events/tests.rs", 1056],
   // runtime.rs re-entered the list after the #1968 merge: main's
   // definition-authoritative resolver comments grew it to 982, and this PR's
   // typed harness-descriptor resolution in spawn_agent_child (+38) lands on

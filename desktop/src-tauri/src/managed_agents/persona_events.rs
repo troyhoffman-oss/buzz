@@ -372,10 +372,12 @@ pub struct PersonaSnapshot {
     pub model: Option<String>,
     pub provider: Option<String>,
     /// Preferred ACP runtime ID, copied verbatim from the persona (including
-    /// `None`). Unlike `model`/`provider`, there is no record-fallback: the
-    /// materialized instance `runtime` must mirror the definition so that
-    /// definition edits propagate on the next spawn rather than being silently
-    /// shadowed by the stale materialized value.
+    /// `None`). Unlike `model`/`provider`, there is no record-fallback: a LOCAL
+    /// instance's `runtime` must mirror the definition so that definition edits
+    /// propagate on the next spawn rather than being silently shadowed by the
+    /// stale materialized value. Provider-backed records are exempt — their
+    /// harness is chosen from the remote host's catalog, so a locally-resolved
+    /// id is not authoritative over it. See `apply_persona_snapshot`.
     pub runtime: Option<String>,
     /// `persona_content_hash` of the persona at snapshot time; the drift basis.
     pub source_version: String,
@@ -422,9 +424,9 @@ pub fn apply_persona_snapshot(record: &mut ManagedAgentRecord, persona: &AgentDe
     }
     record.model = snapshot.model;
     record.provider = snapshot.provider;
-    record.runtime = snapshot.runtime;
-    // Drop a stale create-time harness pin when the definition names a
-    // different known runtime; custom commands stay pinned.
+    // Mirror the definition's runtime and drop a stale create-time harness pin
+    // when the definition names a different known runtime; custom commands stay
+    // pinned.
     //
     // LOCAL RECORDS ONLY. For a provider-backed record the pin is not a
     // local-runtime preference that the definition may override — it is the
@@ -437,7 +439,14 @@ pub fn apply_persona_snapshot(record: &mut ManagedAgentRecord, persona: &AgentDe
     // ultimately `default_agent_command()` = `buzz-agent` — and the next
     // deploy would provision the wrong harness. The persona's runtime is not
     // authoritative over a remote harness choice, so the pin survives.
+    //
+    // `record.runtime` is scoped the same way and for the same reason: it names
+    // a harness id, `record_agent_command` resolves the deploy's command from it
+    // once the pin is absent, and the definition's id was chosen against the
+    // LOCAL catalog. Overwriting it on a provider record would let a local
+    // snapshot silently redirect a remote agent's harness.
     if record.backend == BackendKind::Local {
+        record.runtime = snapshot.runtime;
         if let Some(def_runtime) = persona
             .runtime
             .as_deref()
