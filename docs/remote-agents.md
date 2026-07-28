@@ -223,6 +223,29 @@ Errors are `{"ok": false, "error": "…"}` on stdout, human detail on stderr, an
 A non-zero exit makes `invoke_provider` discard stdout entirely and report raw stderr, which throws
 the structured error away.
 
+A failure the user can act on may carry an optional `recovery` alongside `error`:
+
+```json
+{ "ok": false,
+  "error": "this host requires Tailscale SSH authentication in a browser: https://login.tailscale.com/a/…",
+  "recovery": { "action": "open_url", "url": "https://login.tailscale.com/a/…" } }
+```
+
+`recovery` is optional in both directions, so there is no negotiation and no flag: a desktop that
+does not read it still renders `error`, which names the problem and carries the URL as text, and a
+desktop that does read it finds nothing there from an older provider. The only `action` today is
+`open_url`, and the only URL is Tailscale's login host — the SSH provider **constructs** that URL
+from a fixed prefix plus a charset-constrained token rather than parsing one out of remote output,
+so no host, scheme, or query from the host can reach the browser opener. The desktop re-validates
+the prefix anyway before opening, on the same "the provider is a subprocess, not a trusted peer"
+footing as its secret re-redaction.
+
+The provider emits this when a tailnet ACL uses Tailscale SSH's `check` action, which makes `ssh`
+print the URL and then block for a human that `BatchMode` cannot supply. It is detected by peeking
+at buffered stderr during the poll loop, so the op fails in one 25 ms tick instead of burning its
+whole budget (8 s for `check`, 300 s for `deploy`) and reporting a bare timeout. Recovery is a
+manual retry: the user authenticates in the browser and runs the op again.
+
 ## Configuration
 
 `validate_provider_config` rejects any config key whose word-split contains
