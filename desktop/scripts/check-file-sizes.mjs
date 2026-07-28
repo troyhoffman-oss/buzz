@@ -727,7 +727,11 @@ const overrides = new Map([
   // documents. Ratcheted down; the `!model` prefill prop landed inside it.
   // 1178 -> 1172: the identical hideProviderIds memo both dialogs carried
   // moved to its one owner (`hiddenProviderIdsForBuild`).
-  ["src/features/agents/ui/AgentInstanceEditDialog.tsx", 1172],
+  // 1172 -> 1170: the definition-model write landed (+), and paid for itself
+  // twice — the local/pinned Model branch collapsed into EditAgentModelField
+  // (the file that owns both halves), and the post-save "saved while stopped"
+  // toast joined the profile-sync warning it already sat beside. Ratcheted.
+  ["src/features/agents/ui/AgentInstanceEditDialog.tsx", 1170],
   // AgentDefinitionDialog grew past 1000 with the following load-bearing fixes:
   // isRuntimeAutoSeededRef tracking for edit-mode seeding (Fizz shows models);
   // runtimeSupportsLlmProviderSelection guard on discovery provider (codex fix);

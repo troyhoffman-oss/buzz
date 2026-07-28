@@ -1,3 +1,5 @@
+import type * as React from "react";
+
 import type { AcpRuntimeCatalogEntry } from "@/shared/api/types";
 import type { PinnedHarness } from "@/features/agents/lib/pinnedHarness";
 import { cn } from "@/shared/lib/cn";
@@ -155,6 +157,7 @@ export function EditAgentPinnedModelField({
   disabled,
   harnessLabel,
   model,
+  modelBlockedMessage,
   onModelChange,
   required,
 }: {
@@ -162,6 +165,13 @@ export function EditAgentPinnedModelField({
   /** The pinned harness's human label, for the hint line. */
   harnessLabel: string;
   model: string;
+  /**
+   * Why this model change cannot be saved, when it cannot. Present means Save
+   * is blocked, so it replaces the hint line rather than sitting beneath it —
+   * this sentence explains a dead button and must not read as an aside. See
+   * `resolveInstanceModelDefinitionWrite`.
+   */
+  modelBlockedMessage?: string;
   onModelChange: (value: string) => void;
   required: boolean;
 }) {
@@ -197,11 +207,17 @@ export function EditAgentPinnedModelField({
           value={model}
         />
       </div>
-      <p className="text-xs text-muted-foreground">
-        Models come from the host, which this computer cannot list. Enter an id{" "}
-        {harnessLabel} supports there, or leave it empty for its default. Saved
-        changes take effect on the next start.
-      </p>
+      {modelBlockedMessage ? (
+        <p className="text-xs text-destructive" role="alert">
+          {modelBlockedMessage}
+        </p>
+      ) : (
+        <p className="text-xs text-muted-foreground">
+          Models come from the host, which this computer cannot list. Enter an
+          id {harnessLabel} supports there, or leave it empty for its default.
+          Saved changes take effect on the next start.
+        </p>
+      )}
     </div>
   );
 }
@@ -300,4 +316,44 @@ export function EditAgentLocalModelField({
       ) : null}
     </div>
   );
+}
+
+/**
+ * The instance dialog's Model field: the pinned control for a provider-backed
+ * record, the catalog dropdown for a local one.
+ *
+ * The choice lives here rather than at the call site because this file already
+ * owns both halves and the reason they differ — the host's catalog is
+ * unreachable from this computer, so a pinned record names its own model
+ * instead of being offered this machine's. Splitting the branch from the
+ * branches would put half that explanation in a dialog that otherwise never
+ * needs to know a remote catalog exists.
+ */
+export function EditAgentModelField({
+  modelBlockedMessage,
+  pinnedHarness,
+  ...local
+}: React.ComponentProps<typeof EditAgentLocalModelField> & {
+  /**
+   * Why a model change cannot be saved. Only a pinned record can be blocked —
+   * the block comes from the definition write the pinned path performs (see
+   * `useInstanceModelDefinitionWrite`), and the local path has no such write.
+   */
+  modelBlockedMessage?: string;
+  /** The record's harness pin, or `null` when it runs on this computer. */
+  pinnedHarness: PinnedHarness | null;
+}) {
+  if (pinnedHarness) {
+    return (
+      <EditAgentPinnedModelField
+        disabled={local.disabled}
+        harnessLabel={pinnedHarness.label}
+        model={local.model}
+        modelBlockedMessage={modelBlockedMessage}
+        onModelChange={local.onModelChange}
+        required={local.required}
+      />
+    );
+  }
+  return <EditAgentLocalModelField {...local} />;
 }

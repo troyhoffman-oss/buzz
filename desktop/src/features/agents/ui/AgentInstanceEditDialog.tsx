@@ -1,7 +1,6 @@
 import * as React from "react";
 import { ChevronDown } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { toast } from "sonner";
 
 import {
   useAcpRuntimesQuery,
@@ -12,7 +11,6 @@ import {
   useUpdateManagedAgentMutation,
 } from "@/features/agents/hooks";
 import { agentLocationLabel } from "@/features/agents/lib/agentLocationLabel";
-import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import { providerRecordHarness } from "@/features/agents/lib/pinnedHarness";
 import type {
   ManagedAgent,
@@ -29,8 +27,7 @@ import { setManagedAgentAutoRestart } from "@/shared/api/tauriManagedAgents";
 import { EditAgentAdvancedFields } from "./EditAgentAdvancedFields";
 import {
   EditAgentHarnessFields,
-  EditAgentLocalModelField,
-  EditAgentPinnedModelField,
+  EditAgentModelField,
 } from "./EditAgentHarnessFields";
 import {
   AUTO_PROVIDER_DROPDOWN_VALUE,
@@ -94,7 +91,11 @@ import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { resolveModelFieldStatusMessage } from "./agentConfigControls";
 import { AdvancedRequiredBadge } from "./AdvancedRequiredBadge";
-import { showAgentProfileSyncWarning } from "./agentProfileSyncWarning";
+import {
+  showAgentProfileSyncWarning,
+  showAgentSavedWhileStoppedToast,
+} from "./agentProfileSyncWarning";
+import { useInstanceModelDefinitionWrite } from "./instanceModelDefinitionWrite";
 
 const ADVANCED_FIELDS_MOTION_TRANSITION = {
   duration: 0.18,
@@ -607,6 +608,18 @@ export function AgentInstanceEditDialog({
     originalRuntimeSupportsProvider,
   });
 
+  // A provider-backed linked record's model has to reach the DEFINITION — the
+  // record's own column is never read for one, and this dialog is its only
+  // editable surface. See `useInstanceModelDefinitionWrite`.
+  const modelDefinitionWrite = useInstanceModelDefinitionWrite({
+    isProviderRecord: pinnedRuntimeId !== null,
+    personaId: agent.personaId,
+    linkedPersona,
+    model,
+    originalModel: agent.model,
+    resetKey: open ? agent.pubkey : null,
+  });
+
   async function handleSubmit() {
     try {
       const parsedParallelism = Number.parseInt(parallelism, 10);
@@ -718,6 +731,12 @@ export function AgentInstanceEditDialog({
             : undefined,
       };
 
+      // Definition-first: the model write lands before the record update, so a
+      // failure surfaces as an error with nothing saved rather than as a record
+      // update the owner reads as "the model saved too". The subsequent record
+      // update is what re-reads the definition into the summary.
+      await modelDefinitionWrite.perform();
+
       const result = await updateMutation.mutateAsync(input);
       if (autoRestartOnConfigChange !== agent.autoRestartOnConfigChange) {
         // Standalone setter (mirrors start-on-app-launch) — not part of
@@ -730,29 +749,9 @@ export function AgentInstanceEditDialog({
       showAgentProfileSyncWarning(result.agent.name, result.profileSyncError);
       handleOpenChange(false);
       onUpdated?.(result.agent);
-      // The auto-restart policy deliberately never fires for a stopped or
-      // failing agent (a broken agent must not auto-loop), so an edit meant
-      // to FIX one silently waits for a manual start. Offer that start
-      // explicitly instead of relying on the user to know the policy.
-      if (!isManagedAgentActive(result.agent)) {
-        const startedName = result.agent.name;
-        toast(`${startedName} saved while stopped.`, {
-          action: {
-            label: "Start now",
-            onClick: () => {
-              startMutation.mutate(result.agent.pubkey, {
-                onSuccess: () => toast.success(`${startedName} started.`),
-                onError: (error) =>
-                  toast.error(
-                    error instanceof Error
-                      ? `${startedName} failed to start: ${error.message}`
-                      : `${startedName} failed to start.`,
-                  ),
-              });
-            },
-          },
-        });
-      }
+      showAgentSavedWhileStoppedToast(result.agent, (pubkey, handlers) =>
+        startMutation.mutate(pubkey, handlers),
+      );
     } catch {
       // React Query stores the error; keep dialog open and render it inline.
     }
@@ -823,7 +822,11 @@ export function AgentInstanceEditDialog({
     }) &&
     providerValid &&
     !modelBlocked &&
+    // A model change with no honest destination blocks Save rather than
+    // being accepted and dropped.
+    !modelDefinitionWrite.blocked &&
     !updateMutation.isPending &&
+    !modelDefinitionWrite.isPending &&
     !isAvatarUploadPending;
 
   // Provider field derived state
@@ -1048,31 +1051,21 @@ export function AgentInstanceEditDialog({
               />
             ) : null}
 
-            {/* Model — the host's catalog is unreachable, so a pinned record
-                names its own model instead of offering this computer's. */}
-            {pinnedHarness ? (
-              <EditAgentPinnedModelField
-                disabled={updateMutation.isPending}
-                harnessLabel={pinnedHarness.label}
-                model={model}
-                onModelChange={setModel}
-                required={modelRequired}
-              />
-            ) : (
-              <EditAgentLocalModelField
-                customModelVisible={showCustomModelInput}
-                disabled={updateMutation.isPending}
-                discoveryLoading={modelDiscoveryLoading}
-                model={model}
-                modelBlocked={modelBlocked}
-                onModelChange={setModel}
-                onModelSelect={handleModelDropdownChange}
-                options={modelDropdownOptions}
-                required={modelRequired}
-                selectValue={modelSelectValue}
-                statusMessage={modelStatusMessage}
-              />
-            )}
+            <EditAgentModelField
+              customModelVisible={showCustomModelInput}
+              disabled={updateMutation.isPending}
+              discoveryLoading={modelDiscoveryLoading}
+              model={model}
+              modelBlocked={modelBlocked}
+              modelBlockedMessage={modelDefinitionWrite.blockedMessage}
+              onModelChange={setModel}
+              onModelSelect={handleModelDropdownChange}
+              options={modelDropdownOptions}
+              pinnedHarness={pinnedHarness}
+              required={modelRequired}
+              selectValue={modelSelectValue}
+              statusMessage={modelStatusMessage}
+            />
 
             <AgentAiDefaultsNotice
               onEditDefaults={() => setAiDefaultsOpen(true)}
@@ -1157,8 +1150,13 @@ export function AgentInstanceEditDialog({
               </AnimatePresence>
             </div>
 
-            {/* Error */}
-            {updateMutation.error instanceof Error ? (
+            {/* Error — either leg of the save can fail; the definition write
+                runs first, so its message is the one to show when both are set. */}
+            {modelDefinitionWrite.error ? (
+              <p className="text-sm text-destructive">
+                {modelDefinitionWrite.error.message}
+              </p>
+            ) : updateMutation.error instanceof Error ? (
               <p className="text-sm text-destructive">
                 {updateMutation.error.message}
               </p>
