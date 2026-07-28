@@ -8,6 +8,98 @@ const STDERR_CAP: usize = 65536;
 /// buggy or malicious provider from OOM-ing the desktop process.
 const STDOUT_CAP: usize = 1_048_576; // 1 MB
 
+/// The one control-server URL a provider is allowed to send us to, and the one
+/// prefix `ProviderRecovery::from_response` will accept.
+const TAILSCALE_AUTH_PREFIX: &str = "https://login.tailscale.com/a/";
+
+/// An actionable step the user can take to clear a provider failure.
+///
+/// Deliberately not a free-form URL: this is the only enum, and each variant
+/// names both the affordance and the destination, so adding a second one is a
+/// deliberate act rather than a provider's choice at runtime.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ProviderRecovery {
+    /// Open `url` in the user's browser. The URL is validated against
+    /// [`TAILSCALE_AUTH_PREFIX`] before it is ever constructed.
+    OpenUrl { url: String },
+}
+
+impl ProviderRecovery {
+    /// Read the optional `recovery` key of a provider's failure response.
+    ///
+    /// **Fails closed and validates here, not at the opener.** The SSH provider
+    /// builds this URL from a fixed prefix rather than parsing one out of
+    /// remote stderr, but that guarantee does not cross the process boundary:
+    /// the desktop treats a provider as a subprocess it merely discovered, not
+    /// a trusted peer — which is why it re-redacts secrets on the way in on the
+    /// very next line. Checking on entry rather than at `open_url` means an
+    /// unvalidated URL never exists in desktop memory at all, so no later
+    /// reader of the payload can become a second, unguarded way to open it.
+    ///
+    /// Anything unrecognized yields `None`: the failure still surfaces with its
+    /// message, minus a button.
+    fn from_response(response: &serde_json::Value) -> Option<Self> {
+        let recovery = response.get("recovery")?;
+        if recovery.get("action").and_then(|v| v.as_str()) != Some("open_url") {
+            return None;
+        }
+        let url = recovery.get("url").and_then(|v| v.as_str())?;
+        let token = url.strip_prefix(TAILSCALE_AUTH_PREFIX)?;
+        // The prefix alone is not enough: `…/a/` followed by anything would
+        // still be a match, and userinfo/query/fragment bytes are exactly how a
+        // look-alike destination would be smuggled past a `starts_with` check.
+        let unreserved = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~');
+        if token.is_empty() || token.len() > 128 || !token.chars().all(unreserved) {
+            return None;
+        }
+        Some(Self::OpenUrl {
+            url: url.to_string(),
+        })
+    }
+}
+
+/// A provider op failure, plus the optional recovery the UI needs to offer a
+/// way out. Mirrors the provider's own `Failure` type across the process
+/// boundary.
+///
+/// A struct rather than an error enum for the same reason it is one there:
+/// almost every failure in this path is an unremarkable `format!`, and an enum
+/// would make each one name a variant. `From<String>`/`From<&str>` keep those
+/// compiling unchanged. There is deliberately **no** `From<ProviderFailure> for
+/// String` — that is the type-level guard against a caller flattening the
+/// recovery away, which is exactly the bug this type exists to prevent.
+///
+/// It serializes as `{message, recovery?}`, which is the shape the frontend's
+/// `toTauriError` already turns into a `TauriInvokeError` carrying `payload`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderFailure {
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<ProviderRecovery>,
+}
+
+impl From<String> for ProviderFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            recovery: None,
+        }
+    }
+}
+
+impl From<&str> for ProviderFailure {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_string())
+    }
+}
+
+impl std::fmt::Display for ProviderFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Invoke a provider binary: write JSON to stdin, read JSON from stdout.
 ///
 /// Reader threads stream lines/chunks over channels so the caller can receive
@@ -20,7 +112,7 @@ pub fn invoke_provider(
     binary: &Path,
     request: &serde_json::Value,
     timeout: Duration,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, ProviderFailure> {
     let request_bytes = format!(
         "{}\n",
         serde_json::to_string(request).map_err(|e| e.to_string())?
@@ -98,7 +190,7 @@ pub fn invoke_provider(
     if let Err(e) = stdin_result {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(format!("stdin write failed: {e}"));
+        return Err(format!("stdin write failed: {e}").into());
     }
 
     // Poll try_wait with a deadline, collecting stdout chunks and draining
@@ -132,14 +224,14 @@ pub fn invoke_provider(
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!("provider timed out after {timeout_secs}s"));
+                    return Err(format!("provider timed out after {timeout_secs}s").into());
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("wait error: {e}"));
+                return Err(format!("wait error: {e}").into());
             }
         }
     };
@@ -199,7 +291,10 @@ pub fn invoke_provider(
                 format!("provider failed ({exit_info}). stderr: {stderr_snippet}")
             }
             None => format!("provider failed ({exit_info}, empty stderr)"),
-        });
+        }
+        // No recovery: the provider died without emitting a structured
+        // response, so there is nothing to have carried one.
+        .into());
     }
 
     // Incremental JSON parse: try each line, then try the entire buffer.
@@ -221,7 +316,13 @@ pub fn invoke_provider(
 
     if response.get("ok").and_then(|v| v.as_bool()) == Some(false) {
         let error = response["error"].as_str().unwrap_or("unknown error");
-        return Err(redact_secrets_with(error, &env_secret_refs));
+        return Err(ProviderFailure {
+            message: redact_secrets_with(error, &env_secret_refs),
+            // The message stands alone whether or not this resolves: it names
+            // the problem and, for the Tailscale case, carries the URL as text.
+            // The recovery only adds a button.
+            recovery: ProviderRecovery::from_response(&response),
+        });
     }
 
     // A successful op's stderr is not an error, but it is not nothing either:
@@ -386,7 +487,7 @@ pub fn provider_deploy(
     binary: &Path,
     agent: &serde_json::Value,
     provider_config: &serde_json::Value,
-) -> Result<String, String> {
+) -> Result<String, ProviderFailure> {
     let request = serde_json::json!({
         "op": "deploy",
         "request_id": uuid::Uuid::new_v4().to_string(),
@@ -397,7 +498,7 @@ pub fn provider_deploy(
     resp["agent_id"]
         .as_str()
         .map(String::from)
-        .ok_or_else(|| "deploy response missing agent_id".to_string())
+        .ok_or_else(|| "deploy response missing agent_id".into())
 }
 
 /// Ask a provider which harnesses exist on the machine it deploys to.
@@ -414,7 +515,7 @@ pub fn provider_deploy(
 pub fn provider_discover_harnesses(
     binary: &Path,
     provider_config: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, ProviderFailure> {
     let request = serde_json::json!({
         "op": "discover_harnesses",
         "request_id": uuid::Uuid::new_v4().to_string(),
@@ -435,7 +536,7 @@ pub fn provider_probe_models(
     provider_config: &serde_json::Value,
     harness: &serde_json::Value,
     env_vars: &std::collections::BTreeMap<String, String>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, ProviderFailure> {
     let request = serde_json::json!({
         "op": "probe_models",
         "request_id": uuid::Uuid::new_v4().to_string(),
@@ -758,6 +859,113 @@ pub struct BackendProviderInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider failure response carrying the recovery shape.
+    fn failure_with_recovery(url: &str) -> serde_json::Value {
+        serde_json::json!({
+            "ok": false,
+            "error": "this host requires Tailscale SSH authentication in a browser",
+            "recovery": { "action": "open_url", "url": url },
+        })
+    }
+
+    #[test]
+    fn a_tailscale_login_url_is_the_one_recovery_that_survives() {
+        let response = failure_with_recovery("https://login.tailscale.com/a/1a2b3c4d");
+        assert_eq!(
+            ProviderRecovery::from_response(&response),
+            Some(ProviderRecovery::OpenUrl {
+                url: "https://login.tailscale.com/a/1a2b3c4d".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_provider_cannot_send_the_desktop_anywhere_else() {
+        // The provider is a discovered subprocess, not a trusted peer: a
+        // compromised or merely buggy one must not be able to pick the
+        // destination of a browser the desktop opens.
+        for url in [
+            "https://login.tailscale.com.evil.test/a/tok",
+            "https://evil.test/https://login.tailscale.com/a/tok",
+            "http://login.tailscale.com/a/tok",
+            "https://user@login.tailscale.com/a/tok",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            // Prefix-correct but with a payload a bare `starts_with` would pass.
+            "https://login.tailscale.com/a/tok?next=https://evil.test",
+            "https://login.tailscale.com/a/tok#/../../evil",
+            "https://login.tailscale.com/a/tok/../../evil",
+            // Nothing after the marker is not a link, it is a 404.
+            "https://login.tailscale.com/a/",
+        ] {
+            assert_eq!(
+                ProviderRecovery::from_response(&failure_with_recovery(url)),
+                None,
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_absent_recovery_is_simply_dropped() {
+        // Fails closed in every direction: the failure still surfaces with its
+        // message, minus a button.
+        assert_eq!(
+            ProviderRecovery::from_response(&serde_json::json!({ "ok": false, "error": "no" })),
+            None
+        );
+        assert_eq!(
+            ProviderRecovery::from_response(&serde_json::json!({
+                "ok": false, "error": "no",
+                "recovery": { "action": "run_command", "command": "rm -rf /" },
+            })),
+            None
+        );
+        assert_eq!(
+            ProviderRecovery::from_response(&serde_json::json!({
+                "ok": false, "error": "no", "recovery": "https://login.tailscale.com/a/tok",
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn an_overlong_token_is_refused_rather_than_truncated() {
+        let at_cap = format!("https://login.tailscale.com/a/{}", "a".repeat(128));
+        assert!(ProviderRecovery::from_response(&failure_with_recovery(&at_cap)).is_some());
+        let over_cap = format!("https://login.tailscale.com/a/{}", "a".repeat(129));
+        assert_eq!(
+            ProviderRecovery::from_response(&failure_with_recovery(&over_cap)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_failure_serializes_as_the_shape_the_frontend_reads() {
+        // `toTauriError` turns this into a `TauriInvokeError` whose `payload`
+        // is the object, which is what `providerRecoveryOf` reads.
+        let failure = ProviderFailure {
+            message: "nope".to_string(),
+            recovery: Some(ProviderRecovery::OpenUrl {
+                url: "https://login.tailscale.com/a/tok".to_string(),
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&failure).unwrap(),
+            serde_json::json!({
+                "message": "nope",
+                "recovery": { "action": "open_url", "url": "https://login.tailscale.com/a/tok" },
+            })
+        );
+        // Without a recovery the key is absent, not null — an older frontend
+        // reading `.recovery` sees undefined either way, and the wire stays the
+        // same size for the overwhelmingly common failure.
+        assert_eq!(
+            serde_json::to_value(ProviderFailure::from("plain")).unwrap(),
+            serde_json::json!({ "message": "plain" })
+        );
+    }
 
     #[test]
     fn provider_stderr_notice_skips_blank_and_keeps_warnings() {
