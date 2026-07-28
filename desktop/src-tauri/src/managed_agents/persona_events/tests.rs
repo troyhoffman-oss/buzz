@@ -831,7 +831,7 @@ fn provider_record_keeps_its_remote_harness_pin() {
 }
 
 /// The rest of the snapshot still applies to a provider record — only the
-/// harness pin is exempt.
+/// harness fields are exempt.
 #[test]
 fn provider_record_still_takes_the_definition_quad() {
     let mut record = snapshot_record(BackendKind::Provider {
@@ -844,6 +844,40 @@ fn provider_record_still_takes_the_definition_quad() {
 
     assert_eq!(record.model.as_deref(), Some("claude-opus-4"));
     assert_eq!(record.provider.as_deref(), Some("anthropic"));
+}
+
+/// `record.runtime` is harness state, scoped exactly like the pin above. It
+/// names the harness the deploy resolves once no pin is present, and the
+/// definition's id was chosen against the LOCAL catalog — so a persona sync
+/// must not redirect a remote agent's harness with it.
+#[test]
+fn provider_record_keeps_its_runtime_through_a_persona_sync() {
+    let mut record = snapshot_record(BackendKind::Provider {
+        id: "ssh".into(),
+        config: serde_json::json!({ "host": "example" }),
+    });
+    record.runtime = Some("claude".into());
+    let persona = sample_persona(); // runtime = "goose", a local id
+
+    apply_persona_snapshot(&mut record, &persona);
+
+    assert_eq!(
+        record.runtime.as_deref(),
+        Some("claude"),
+        "a local snapshot must not overwrite a remote record's harness"
+    );
+}
+
+/// The local half of the same rule: a local record still mirrors the
+/// definition, so a definition edit propagates on the next spawn.
+#[test]
+fn local_record_mirrors_the_definition_runtime() {
+    let mut record = snapshot_record(BackendKind::Local);
+    record.runtime = Some("claude".into());
+    let persona = sample_persona(); // runtime = "goose"
+
+    apply_persona_snapshot(&mut record, &persona);
+
     assert_eq!(record.runtime.as_deref(), Some("goose"));
 }
 

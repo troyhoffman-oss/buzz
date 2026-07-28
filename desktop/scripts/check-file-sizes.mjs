@@ -191,7 +191,9 @@ const overrides = new Map([
   // one drops a stale known-runtime pin) are disjoint blocks that each stayed
   // under the 1000 default alone; the union crosses it. Test-only; queued to
   // split.
-  ["src-tauri/src/managed_agents/persona_events/tests.rs", 1022],
+  // +34: the runtime half of the same backend scoping — a provider record keeps
+  // its harness through a persona sync, a local one still mirrors the definition.
+  ["src-tauri/src/managed_agents/persona_events/tests.rs", 1056],
   // runtime.rs re-entered the list after the #1968 merge: main's
   // definition-authoritative resolver comments grew it to 982, and this PR's
   // typed harness-descriptor resolution in spawn_agent_child (+38) lands on
@@ -708,17 +710,19 @@ const overrides = new Map([
   // credential questions from the HOST's catalog, so each local-runtime
   // requirement it suspends needs its own reason recorded here. Queued to
   // split with the create-mode surface.
-  // +7 (1087 -> 1094): the typed-model catalog gate — see the note on
-  // AgentInstanceEditDialog above; every dialog that writes a model runs the
-  // same rule, from the one owner in agentAiConfigurationPolicy.
-  ["src/features/agents/ui/AgentDefinitionDialog.tsx", 1094],
-  // 997 -> 1011: the third model writer takes the same typed-model catalog
+  // 1087 -> 1063: two lanes met here — the harness auto-seed effects moved
+  // out to useCreateRuntimeSeed.ts (-30), and the typed-model catalog gate
+  // landed (+7, see the note on AgentInstanceEditDialog above; every dialog
+  // that writes a model runs the same rule, from the one owner in
+  // agentAiConfigurationPolicy). Ratcheted to the merged count.
+  ["src/features/agents/ui/AgentDefinitionDialog.tsx", 1064],
+  // 997 -> 1006: the third model writer takes the same typed-model catalog
   // gate as the two dialogs above. This file sat 3 lines under the limit, so
   // the shared rule could not land anywhere in it without crossing; the gate
   // logic itself lives in agentAiConfigurationPolicy and only the call site is
   // here. First over-limit entry for this file — it is queued to split with
   // the agent-config surface, not to grow.
-  ["src/features/agents/ui/AgentConfigFields.tsx", 1011],
+  ["src/features/agents/ui/AgentConfigFields.tsx", 1007],
 ]);
 
 await runFileSizeCheck({
