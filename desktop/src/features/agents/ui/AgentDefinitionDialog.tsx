@@ -197,6 +197,12 @@ export function AgentDefinitionDialog({
   // Without this, clearing runtime back to "" via "No preference" would re-
   // trigger the effect (the `runtime` dep would pass the length guard) and
   // snap the dropdown back to the default — an edit-mode regression.
+  //
+  // One deliberate exception: shedding the seed for a remote create re-arms
+  // this, so returning "Where to run" to this computer seeds the local default
+  // again rather than leaving a create that requires a local harness with none.
+  // That path cannot collide with the "No preference" case above — an explicit
+  // dropdown choice clears `isRuntimeAutoSeededRef`, which the shed requires.
   const hasSeededForOpenRef = React.useRef(false);
   const [showAdvancedFields, setShowAdvancedFields] = React.useState(false);
   const [isAvatarUploadPending, setIsAvatarUploadPending] =
@@ -328,6 +334,7 @@ export function AgentDefinitionDialog({
       initialModel: initialValues.model,
       initialProvider: initialValues.provider,
       initialModelProviderEditableWithoutRuntime,
+      runsRemotely: createRunsRemotely,
     });
     const namePool = parsePersonaNamePoolText(namePoolText);
     const namePoolInput =
