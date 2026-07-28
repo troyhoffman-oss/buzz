@@ -216,15 +216,6 @@ const overrides = new Map([
   // +1 #3023 credential-helper slash normalization (MinGW bash treats
   // backslashes as escapes).
   ["src-tauri/src/managed_agents/runtime.rs", 986],
-  // backend.rs crossed the 1000 default with the backend-provider protocol:
-  // the two remote read commands (provider_discover_harnesses,
-  // provider_probe_models) with the doc comments explaining why a remote
-  // harness/model catalog cannot be answered by the local probe, the Windows
-  // PATHEXT ∩ SAFE_EXEC_EXTENSIONS allowlist (a security boundary — `.cmd`
-  // and `.bat` would put cmd.exe's quoting in front of a stdin private-key
-  // handoff), and provider stderr redaction/capping. Queued to split along
-  // the invoke / discovery / exec-resolution seams.
-  ["src-tauri/src/managed_agents/backend.rs", 1146],
   // applyWorkspace reposDir parameter plus the validateReposDir binding,
   // threaded through Tauri invokes for configurable repos_dir, plus the
   // harness-persona-sync `harnessOverride` create-input bit — load-bearing
@@ -260,7 +251,10 @@ const overrides = new Map([
   // team-instructions-first-class: createManagedAgent Tauri bridge threads the
   // new teamId input through to the backend (+1 line).
   // +2 for model_source field in RawManagedAgent + fromRawManagedAgent mapping.
-  ["src/shared/api/tauri.ts", 1307],
+  // Ratcheted 1307 → 1229 by extracting the backend-provider bindings into
+  // `tauriBackendProviders.ts`. Still queued to split further; the remaining
+  // ceiling only ever ratchets DOWN.
+  ["src/shared/api/tauri.ts", 1229],
   // doctor-npm-eacces-preflight: hint field added to InstallStepResult (+1 line).
   // codex-acp-package-swap: "adapter_outdated" variant added to AcpAvailabilityStatus (+1 line).
   // doctor-install-reliability: AuthStatus tagged union + nodeRequired/authStatus/
