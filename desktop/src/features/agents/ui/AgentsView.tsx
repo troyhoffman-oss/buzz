@@ -30,7 +30,24 @@ import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlA
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { Button } from "@/shared/ui/button";
 import { PageHeader } from "@/shared/ui/PageHeader";
+import type { AgentPersona } from "@/shared/api/types";
 import { getInheritedAgentDefaults } from "./bakedEnvHelpers";
+
+/**
+ * The instance dialog's "Edit avatar" hand-off, or `undefined` when there is
+ * no editable definition behind the record.
+ *
+ * The avatar is definition-level identity, so the instance dialog renders it
+ * read-only and delegates back here. Entering the definition dialog closes
+ * this one on the way, exactly as the profile panel's mount does.
+ */
+function editLinkedPersonaHandler(
+  persona: AgentPersona | null,
+  openEditDefinition: (persona: AgentPersona) => void,
+) {
+  if (!persona) return undefined;
+  return () => openEditDefinition(persona);
+}
 
 export function AgentsView() {
   const { openPersonaProfilePanel, openProfilePanel } = useProfilePanel();
@@ -308,6 +325,29 @@ export function AgentsView() {
           open={personas.personaDialogState !== null}
           submitLabel={personas.personaDialogState.submitLabel}
           title={personas.personaDialogState.title}
+        />
+      ) : null}
+      {personas.agentToEditInstance ? (
+        // Rule 19: the card's Edit on a provider-backed agent edits the record
+        // itself. The definition dialog reads an AgentDefinition, which carries
+        // no backend or agent_command, so a remote target would open on a blank
+        // harness and be re-seeded with this computer's default. Local personas
+        // keep the definition-edit mount above. `personaCardEditAction` owns
+        // the decision; the definition it carries is the avatar hand-off, so
+        // routing here costs nothing the definition dialog would have offered.
+        <AgentDialog
+          agent={personas.agentToEditInstance.agent}
+          mode="instance-edit"
+          onEditLinkedPersona={editLinkedPersonaHandler(
+            personas.agentToEditInstance.persona,
+            personas.openEditDefinition,
+          )}
+          onOpenChange={(open) => {
+            if (!open) {
+              personas.setAgentToEditInstance(null);
+            }
+          }}
+          open
         />
       ) : null}
       {personas.personaToDelete ? (
