@@ -70,6 +70,7 @@ import { AgentConfigurationFocusedView } from "@/features/profile/ui/UserProfile
 import { UserProfileAgentSettingsMenuSlot } from "@/features/profile/ui/UserProfileAgentActions";
 import { useProfileAgentDeletion } from "@/features/profile/ui/UserProfilePanelDeletion";
 import { useProfileFieldBuckets } from "@/features/profile/ui/UserProfilePanelFields";
+import { profileEditAgentTarget } from "@/features/profile/ui/profileEditAgentTarget";
 import { submitProfilePersonaDialog } from "@/features/profile/ui/UserProfilePanelPersonaSubmit";
 import { UserProfilePersonaDialogs } from "@/features/profile/ui/UserProfilePersonaDialogs";
 import { UserProfileSnapshotExportDialog } from "@/features/profile/ui/UserProfileSnapshotExportDialog";
@@ -398,12 +399,16 @@ export function UserProfilePanel({
   });
 
   const handleEditAgent = React.useCallback(() => {
-    if (resolvedPersona) {
+    if (
+      profileEditAgentTarget({ managedAgent, resolvedPersona }) ===
+        "definition" &&
+      resolvedPersona
+    ) {
       setPersonaDialogState(editPersonaDialogState(resolvedPersona));
       return;
     }
     setEditAgentOpen(true);
-  }, [resolvedPersona]);
+  }, [managedAgent, resolvedPersona]);
 
   const { deleteManagedAgentRecord, deleteManagedAgentsForPersona } =
     useProfileAgentDeletion({
