@@ -205,3 +205,99 @@ export function EditAgentPinnedModelField({
     </div>
   );
 }
+
+/**
+ * The Model control for a LOCAL record: a dropdown over the catalog this
+ * computer probed, with the custom-model input the dropdown falls back to and
+ * the discovery status line.
+ *
+ * Extracted from `AgentInstanceEditDialog` so it sits beside the pinned
+ * counterpart above — the two are the same field answering the two different
+ * questions this file already documents, and keeping them apart made the split
+ * read as an accident of file size rather than a rule.
+ */
+export function EditAgentLocalModelField({
+  customModelVisible,
+  disabled,
+  discoveryLoading,
+  model,
+  modelBlocked,
+  onModelChange,
+  onModelSelect,
+  options,
+  required,
+  selectValue,
+  statusMessage,
+}: {
+  /** The dropdown resolved to "Custom model…", so the free-text input shows. */
+  customModelVisible: boolean;
+  disabled: boolean;
+  discoveryLoading: boolean;
+  model: string;
+  /** The status line explains a dead Save button, so it cannot render as a hint. */
+  modelBlocked: boolean;
+  onModelChange: (value: string) => void;
+  onModelSelect: (value: string) => void;
+  options: PersonaDropdownOption[];
+  required: boolean;
+  selectValue: string;
+  statusMessage: string | null | undefined;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <label
+        className="text-sm font-medium text-foreground"
+        htmlFor="edit-agent-model"
+      >
+        Model
+        {required ? (
+          <span className="ml-1 text-destructive" aria-hidden="true">
+            *
+          </span>
+        ) : (
+          <span className={PERSONA_LABEL_OPTIONAL_CLASS}>Optional</span>
+        )}
+      </label>
+      <PersonaDropdownField
+        disabled={disabled || discoveryLoading}
+        id="edit-agent-model"
+        onValueChange={onModelSelect}
+        options={options}
+        placeholder="Default model"
+        value={selectValue}
+      />
+      {customModelVisible ? (
+        <div
+          className={cn(
+            "mt-2 flex min-h-11 items-center px-3",
+            PERSONA_FIELD_SHELL_CLASS,
+          )}
+        >
+          <Input
+            aria-label="Custom model ID"
+            autoCorrect="off"
+            className={cn(
+              "h-8 px-0 py-0 leading-6",
+              PERSONA_FIELD_CONTROL_CLASS,
+            )}
+            disabled={disabled}
+            id="edit-agent-custom-model"
+            onChange={(event) => onModelChange(event.target.value)}
+            placeholder="Custom model ID"
+            value={model}
+          />
+        </div>
+      ) : null}
+      {statusMessage ? (
+        <p
+          className={cn(
+            "text-xs",
+            modelBlocked ? "text-warning" : "text-muted-foreground",
+          )}
+        >
+          {statusMessage}
+        </p>
+      ) : null}
+    </div>
+  );
+}

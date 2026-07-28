@@ -57,12 +57,29 @@ test("instance-edit routes to AgentInstanceEditDialog with its contract props", 
   assert.equal(element.type, AgentInstanceEditDialog);
   assert.deepEqual(element.props, {
     agent,
+    modelPrefill: undefined,
     onEditLinkedPersona: undefined,
     onOpenChange,
     onUpdated,
     open: true,
     initialFocus: undefined,
   });
+});
+
+test("instance-edit carries a requested model prefill through", () => {
+  // The `!model` draft path: an owner-reviewed request names a model, and for
+  // a provider-backed target that review happens in the instance dialog, whose
+  // pinned-model field is the only surface that can show a host-side model id.
+  const element = AgentDialog({
+    mode: "instance-edit",
+    agent: { pubkey: "abc", name: "test-agent" },
+    modelPrefill: "gpt-5-codex",
+    onOpenChange: noop,
+    open: true,
+  });
+
+  assert.equal(element.type, AgentInstanceEditDialog);
+  assert.equal(element.props.modelPrefill, "gpt-5-codex");
 });
 
 test("create mode routes to the internal create router, not a form directly", () => {

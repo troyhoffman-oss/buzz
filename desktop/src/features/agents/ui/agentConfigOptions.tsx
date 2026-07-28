@@ -396,6 +396,23 @@ export function buildTemplateModelDropdownOptions(
 }
 
 /**
+ * Which provider ids this build hides, given the env keys baked into it.
+ *
+ * The rule is one fact — "a build with a baked provider hides Databricks v1,
+ * because its boot migration rewrites v1 to v2" — and both dialogs asked it
+ * with byte-identical code. One owner, so the two can never answer differently.
+ */
+export function hiddenProviderIdsForBuild(
+  bakedEnvKeys: readonly string[] | undefined,
+): ReadonlySet<string> {
+  return (bakedEnvKeys ?? []).includes("BUZZ_AGENT_PROVIDER")
+    ? BLOCK_BUILD_HIDDEN_PROVIDER_IDS
+    : EMPTY_HIDDEN_PROVIDER_IDS;
+}
+
+const EMPTY_HIDDEN_PROVIDER_IDS: ReadonlySet<string> = new Set<string>();
+
+/**
  * Build the provider dropdown options for a persona/instance dialog.
  *
  * `hideProviderIds` suppresses specific provider ids from the base list while

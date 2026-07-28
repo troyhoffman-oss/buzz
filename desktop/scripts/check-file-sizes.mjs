@@ -704,7 +704,13 @@ const overrides = new Map([
   // adapter's default at runtime and the agent silently runs the wrong model.
   // Includes the tone branch on the status line: this message explains a dead
   // Save button, so it cannot render in the same grey as an ordinary hint.
-  ["src/features/agents/ui/AgentInstanceEditDialog.tsx", 1214],
+  // 1214 -> 1178: the local Model control moved out to
+  // EditAgentHarnessFields.tsx beside its pinned counterpart — the two are one
+  // field answering the local and remote questions that file already
+  // documents. Ratcheted down; the `!model` prefill prop landed inside it.
+  // 1178 -> 1172: the identical hideProviderIds memo both dialogs carried
+  // moved to its one owner (`hiddenProviderIdsForBuild`).
+  ["src/features/agents/ui/AgentInstanceEditDialog.tsx", 1172],
   // AgentDefinitionDialog grew past 1000 with the following load-bearing fixes:
   // isRuntimeAutoSeededRef tracking for edit-mode seeding (Fizz shows models);
   // runtimeSupportsLlmProviderSelection guard on discovery provider (codex fix);
@@ -719,7 +725,9 @@ const overrides = new Map([
   // landed (+7, see the note on AgentInstanceEditDialog above; every dialog
   // that writes a model runs the same rule, from the one owner in
   // agentAiConfigurationPolicy). Ratcheted to the merged count.
-  ["src/features/agents/ui/AgentDefinitionDialog.tsx", 1064],
+  // 1064 -> 1058: same hideProviderIds extraction, minus the edit-mode seed
+  // guard prop this PR adds.
+  ["src/features/agents/ui/AgentDefinitionDialog.tsx", 1058],
   // 997 -> 1006: the third model writer takes the same typed-model catalog
   // gate as the two dialogs above. This file sat 3 lines under the limit, so
   // the shared rule could not land anywhere in it without crossing; the gate

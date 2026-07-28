@@ -6,6 +6,7 @@ import {
   requestTargetsEditablePersona,
   type AgentManagementRequest,
 } from "./agentManagement";
+import { agentManagementUpdateTarget } from "./agentManagementUpdateTarget";
 import { subscribeAgentManagementRequests } from "./observerRelayStore";
 import {
   managedAgentsQueryKey,
@@ -284,9 +285,24 @@ export function useAgentManagement() {
     );
   }, [currentPersona, request]);
 
+  // The provider-backed record this draft targets, if any — see
+  // `agentManagementUpdateTarget`. Non-null routes the dialog to the instance
+  // editor, the only surface that reads a remote record's own harness.
+  const editInstanceTarget = React.useMemo(() => {
+    if (request?.action !== "update") return null;
+    return agentManagementUpdateTarget({
+      agents: managedAgentsQuery.data,
+      agentName: request.request.agentName,
+      personaId: currentPersona?.id,
+    });
+  }, [currentPersona?.id, managedAgentsQuery.data, request]);
+
   const editError = React.useMemo(() => {
     if (request?.action !== "update") return error;
     if (error) return error;
+    // The instance editor owns its own error surface and resolves the record
+    // directly, so the definition-path name diagnostics below do not apply.
+    if (editInstanceTarget) return null;
     if (matchingPersonas.length > 1) {
       return "More than one personal agent has that name. Rename it in Agents, then ask the agent again.";
     }
@@ -294,12 +310,21 @@ export function useAgentManagement() {
       return "Agents can only update a personal agent profile by its current name.";
     }
     return null;
-  }, [currentPersona, error, matchingPersonas.length, request]);
+  }, [
+    currentPersona,
+    editInstanceTarget,
+    error,
+    matchingPersonas.length,
+    request,
+  ]);
 
   return {
     request,
     createInitialValues,
     editInitialValues,
+    editInstanceTarget,
+    editModelPrefill:
+      request?.action === "update" ? (request.request.model ?? null) : null,
     editError,
     error,
     ...createdAgentAttachment,

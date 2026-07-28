@@ -45,6 +45,8 @@ type AgentDialogInstanceEditProps = {
   onOpenChange: (open: boolean) => void;
   onUpdated?: (agent: ManagedAgent) => void;
   initialFocus?: EditAgentFocusTarget;
+  /** Model an owner-reviewed `!model` draft asked for — see AgentInstanceEditDialog. */
+  modelPrefill?: string | null;
   /**
    * Called when the user clicks "Edit avatar" inside the instance-edit dialog.
    * Caller (UserProfilePanel) is responsible for closing this dialog and
@@ -69,6 +71,12 @@ type AgentDialogDefinitionEditProps = {
   onSubmit: (
     input: CreatePersonaInput | UpdatePersonaInput,
   ) => Promise<unknown>;
+  /**
+   * The definition being edited backs a provider record. Suppresses the local
+   * harness auto-seed — see `createRuntimeSeedAction`. Callers now route such
+   * records to instance-edit instead, so this is the belt-and-braces path.
+   */
+  editsProviderRecord?: boolean;
 };
 
 type AgentDialogProps =
@@ -90,6 +98,7 @@ export function AgentDialog(props: AgentDialogProps) {
     return (
       <AgentInstanceEditDialog
         agent={props.agent}
+        modelPrefill={props.modelPrefill}
         onEditLinkedPersona={props.onEditLinkedPersona}
         onOpenChange={props.onOpenChange}
         onUpdated={props.onUpdated}

@@ -29,11 +29,12 @@ import { setManagedAgentAutoRestart } from "@/shared/api/tauriManagedAgents";
 import { EditAgentAdvancedFields } from "./EditAgentAdvancedFields";
 import {
   EditAgentHarnessFields,
+  EditAgentLocalModelField,
   EditAgentPinnedModelField,
 } from "./EditAgentHarnessFields";
 import {
   AUTO_PROVIDER_DROPDOWN_VALUE,
-  BLOCK_BUILD_HIDDEN_PROVIDER_IDS,
+  hiddenProviderIdsForBuild,
   CUSTOM_PROVIDER_DROPDOWN_VALUE,
   formatRuntimeOptionLabel,
   getDefaultLlmModelLabel,
@@ -103,6 +104,7 @@ const ADVANCED_FIELDS_MOTION_TRANSITION = {
 export function AgentInstanceEditDialog({
   agent,
   initialFocus,
+  modelPrefill,
   open,
   onEditLinkedPersona,
   onOpenChange,
@@ -111,6 +113,12 @@ export function AgentInstanceEditDialog({
   agent: ManagedAgent;
   /** Optional field to scroll/focus when the dialog opens from a card deep-link. */
   initialFocus?: EditAgentFocusTarget;
+  /**
+   * Model requested by an owner-reviewed agent draft (`!model`), shown instead
+   * of the record's current model so the owner reviews what was asked for. The
+   * record still supplies every other field.
+   */
+  modelPrefill?: string | null;
   open: boolean;
   /** Present only when the linked definition is editable (non-built-in, resolved). Caller closes this dialog and enters definition-edit. */
   onEditLinkedPersona?: () => void;
@@ -200,7 +208,7 @@ export function AgentInstanceEditDialog({
       setAgentArgs(agent.agentArgs.join(","));
       setParallelism(String(agent.parallelism));
       setSystemPrompt(agent.systemPrompt ?? "");
-      setModel(agent.model ?? "");
+      setModel(modelPrefill?.trim() || (agent.model ?? ""));
       setIsCustomModelEditing(false);
       setProvider(agent.provider ?? "");
       setIsCustomProviderEditing(false);
@@ -820,13 +828,7 @@ export function AgentInstanceEditDialog({
 
   // Provider field derived state
   const trimmedProvider = provider.trim();
-  const hideProviderIds = React.useMemo(
-    () =>
-      (bakedEnvKeys ?? []).includes("BUZZ_AGENT_PROVIDER")
-        ? BLOCK_BUILD_HIDDEN_PROVIDER_IDS
-        : new Set<string>(),
-    [bakedEnvKeys],
-  );
+  const hideProviderIds = hiddenProviderIdsForBuild(bakedEnvKeys);
   const providerOptions = getPersonaProviderOptions(
     trimmedProvider,
     selectedRuntime?.id ?? "",
@@ -1057,63 +1059,19 @@ export function AgentInstanceEditDialog({
                 required={modelRequired}
               />
             ) : (
-              <div className="space-y-1.5">
-                <label
-                  className="text-sm font-medium text-foreground"
-                  htmlFor="edit-agent-model"
-                >
-                  Model
-                  {modelRequired ? (
-                    <span className="ml-1 text-destructive" aria-hidden="true">
-                      *
-                    </span>
-                  ) : (
-                    <span className={PERSONA_LABEL_OPTIONAL_CLASS}>
-                      Optional
-                    </span>
-                  )}
-                </label>
-                <PersonaDropdownField
-                  disabled={updateMutation.isPending || modelDiscoveryLoading}
-                  id="edit-agent-model"
-                  onValueChange={handleModelDropdownChange}
-                  options={modelDropdownOptions}
-                  placeholder="Default model"
-                  value={modelSelectValue}
-                />
-                {showCustomModelInput ? (
-                  <div
-                    className={cn(
-                      "mt-2 flex min-h-11 items-center px-3",
-                      PERSONA_FIELD_SHELL_CLASS,
-                    )}
-                  >
-                    <Input
-                      aria-label="Custom model ID"
-                      autoCorrect="off"
-                      className={cn(
-                        "h-8 px-0 py-0 leading-6",
-                        PERSONA_FIELD_CONTROL_CLASS,
-                      )}
-                      disabled={updateMutation.isPending}
-                      id="edit-agent-custom-model"
-                      onChange={(event) => setModel(event.target.value)}
-                      placeholder="Custom model ID"
-                      value={model}
-                    />
-                  </div>
-                ) : null}
-                {modelStatusMessage ? (
-                  <p
-                    className={cn(
-                      "text-xs",
-                      modelBlocked ? "text-warning" : "text-muted-foreground",
-                    )}
-                  >
-                    {modelStatusMessage}
-                  </p>
-                ) : null}
-              </div>
+              <EditAgentLocalModelField
+                customModelVisible={showCustomModelInput}
+                disabled={updateMutation.isPending}
+                discoveryLoading={modelDiscoveryLoading}
+                model={model}
+                modelBlocked={modelBlocked}
+                onModelChange={setModel}
+                onModelSelect={handleModelDropdownChange}
+                options={modelDropdownOptions}
+                required={modelRequired}
+                selectValue={modelSelectValue}
+                statusMessage={modelStatusMessage}
+              />
             )}
 
             <AgentAiDefaultsNotice

@@ -41,7 +41,7 @@ import {
 import {
   AUTO_MODEL_DROPDOWN_VALUE,
   AUTO_PROVIDER_DROPDOWN_VALUE,
-  BLOCK_BUILD_HIDDEN_PROVIDER_IDS,
+  hiddenProviderIdsForBuild,
   CUSTOM_PROVIDER_DROPDOWN_VALUE,
   computeLocalModeGate,
   formatRuntimeOptionLabel,
@@ -142,6 +142,8 @@ type AgentDefinitionDialogProps = {
    * `buzz-agent` keys the local catalog uses. Null until a harness is pinned.
    */
   createRemoteHarnessId?: string | null;
+  /** This EDIT's definition backs a provider record — see `createRuntimeSeedAction`. */
+  editsProviderRecord?: boolean;
 };
 
 const ADVANCED_FIELDS_MOTION_TRANSITION = {
@@ -167,6 +169,7 @@ export function AgentDefinitionDialog({
   createRemoteModelDiscovery = null,
   createRemoteHarnessLabel = null,
   createRemoteHarnessId = null,
+  editsProviderRecord = false,
 }: AgentDefinitionDialogProps) {
   const [displayName, setDisplayName] = React.useState("");
   const [aiDefaultsOpen, setAiDefaultsOpen] = React.useState(false);
@@ -269,6 +272,7 @@ export function AgentDefinitionDialog({
   useCreateRuntimeSeed({
     aiConfigurationMode,
     createRunsRemotely,
+    editsProviderRecord,
     defaultRuntime,
     hasSeededForOpenRef,
     initialValues,
@@ -574,17 +578,7 @@ export function AgentDefinitionDialog({
     customAiPairSatisfied &&
     !modelBlocked &&
     !isAvatarUploadPending;
-  // On internal Block builds, BUZZ_AGENT_PROVIDER is baked in and a boot
-  // migration rewrites any persisted Databricks v1 values → v2. Hide the v1
-  // option there so it is not offered for new selections. OSS builds have no
-  // baked provider, so v1 remains visible.
-  const hideProviderIds = React.useMemo(
-    () =>
-      (bakedEnvKeys ?? []).includes("BUZZ_AGENT_PROVIDER")
-        ? BLOCK_BUILD_HIDDEN_PROVIDER_IDS
-        : new Set<string>(),
-    [bakedEnvKeys],
-  );
+  const hideProviderIds = hiddenProviderIdsForBuild(bakedEnvKeys);
   const providerOptions = getPersonaProviderOptions(
     trimmedProvider,
     runtime,
