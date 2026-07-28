@@ -15,6 +15,8 @@ type CreateRuntimeSeedInput = {
   aiConfigurationMode: AgentAiConfigurationMode;
   /** "Where to run" targets a backend provider — see `createRuntimeSeedAllowed`. */
   createRunsRemotely: boolean;
+  /** This edit's record is provider-backed — see `createRuntimeSeedAction`. */
+  editsProviderRecord: boolean;
   defaultRuntime: AcpRuntimeCatalogEntry | null;
   initialValues: CreatePersonaInput | UpdatePersonaInput | null;
   open: boolean;
@@ -41,6 +43,7 @@ type CreateRuntimeSeedInput = {
 export function useCreateRuntimeSeed({
   aiConfigurationMode,
   createRunsRemotely,
+  editsProviderRecord,
   defaultRuntime,
   initialValues,
   open,
@@ -54,6 +57,7 @@ export function useCreateRuntimeSeed({
     const action = createRuntimeSeedAction({
       defaultRuntimeId: defaultRuntime?.id ?? null,
       definitionRuntime: initialValues?.runtime,
+      editsProviderRecord,
       hasInitialValues: initialValues !== null,
       hasSeededForOpen: hasSeededForOpenRef.current,
       isAutoSeeded: isRuntimeAutoSeededRef.current,
@@ -83,6 +87,7 @@ export function useCreateRuntimeSeed({
   }, [
     createRunsRemotely,
     defaultRuntime,
+    editsProviderRecord,
     hasSeededForOpenRef,
     initialValues,
     isRuntimeAutoSeededRef,
@@ -93,6 +98,8 @@ export function useCreateRuntimeSeed({
   ]);
 
   // Keep an inherited Create runtime synced with defaults saved in-place.
+  // Create-only (`"id" in initialValues` bails on every edit), so the
+  // provider-record guard has nothing to add here.
   React.useEffect(() => {
     if (
       !open ||

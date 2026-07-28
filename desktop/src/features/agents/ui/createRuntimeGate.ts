@@ -62,15 +62,19 @@ export function createGateHarnessId({
 /**
  * Whether the dialog may seed its harness field from this computer's default.
  *
- * Never for a remote create. `runtime` is the definition's harness preference,
- * and a provider-backed agent takes its harness from the HOST's catalog via
- * "Where to run" — so seeding the local default stamps a harness of the wrong
+ * Never when the agent runs somewhere else. `runtime` is the definition's
+ * harness preference, and a provider-backed agent takes its harness from the
+ * HOST's catalog — so seeding the local default stamps a harness of the wrong
  * machine (`buzz-agent` on most installs) onto a record that runs somewhere
  * else, and every surface reading the record back reports it as the harness the
  * agent runs on. The remote pin travels via `BackendIntent.harness` instead.
+ *
+ * `targetsRemoteHost` covers both shapes of that one fact: "Where to run"
+ * pointing at a provider during a create, and an edit whose record is already
+ * provider-backed.
  */
-export function createRuntimeSeedAllowed(runsRemotely: boolean): boolean {
-  return !runsRemotely;
+export function createRuntimeSeedAllowed(targetsRemoteHost: boolean): boolean {
+  return !targetsRemoteHost;
 }
 
 /**
@@ -90,6 +94,7 @@ export type CreateRuntimeSeedAction =
 export function createRuntimeSeedAction({
   defaultRuntimeId,
   definitionRuntime,
+  editsProviderRecord = false,
   hasInitialValues,
   hasSeededForOpen,
   isAutoSeeded,
@@ -102,6 +107,18 @@ export function createRuntimeSeedAction({
   defaultRuntimeId: string | null;
   /** The definition's own runtime preference, which the seed never overrides. */
   definitionRuntime: string | null | undefined;
+  /**
+   * This EDIT is opened for a provider-backed record.
+   *
+   * `runsRemotely` answers the same question for a create, from a control that
+   * only exists there — so it is false in edit mode, and the seed happily
+   * stamped this computer's default onto a definition whose record runs
+   * somewhere else. The record's blank runtime is not an absence to be filled:
+   * `to_definition_view` drops the harness on purpose, because the real one is
+   * the host's. Belt and braces behind the routing fixes — a surface that still
+   * reaches this dialog for a remote record must not invent a harness for it.
+   */
+  editsProviderRecord?: boolean;
   hasInitialValues: boolean;
   hasSeededForOpen: boolean;
   isAutoSeeded: boolean;
@@ -110,7 +127,7 @@ export function createRuntimeSeedAction({
   runtime: string;
   runtimesLoading: boolean;
 }): CreateRuntimeSeedAction {
-  if (!createRuntimeSeedAllowed(runsRemotely)) {
+  if (!createRuntimeSeedAllowed(runsRemotely || editsProviderRecord)) {
     return isAutoSeeded ? { type: "shed" } : { type: "none" };
   }
   if (

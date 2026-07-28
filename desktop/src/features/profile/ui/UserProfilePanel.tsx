@@ -32,6 +32,7 @@ import {
   buildInstanceInputForDefinition,
   resolveStartRuntimeForDefinition,
 } from "@/features/agents/lib/instanceInputForDefinition";
+import { providerRecordHarness } from "@/features/agents/lib/pinnedHarness";
 import { describeLogFile } from "@/features/agents/ui/agentUi";
 import { AgentDialog } from "@/features/agents/ui/AgentDialog";
 import { useAgentLifecycleActions } from "@/features/profile/ui/useAgentLifecycleActions";
@@ -930,6 +931,17 @@ export function UserProfilePanel({
           createPersonaMutation.error instanceof Error
             ? createPersonaMutation.error
             : null
+        }
+        // Edit-only, and the shape is what says so: this one dialog is driven
+        // by three handlers, and Duplicate seeds a CREATE (no `id`) from the
+        // same provider-backed profile an Edit would. The guard shed the
+        // create's harness while `useCreateRuntimeSeed`'s create-only effect
+        // re-seeded it, so the two fought until React gave up.
+        editsProviderRecord={
+          personaDialogState?.initialValues != null &&
+          "id" in personaDialogState.initialValues &&
+          managedAgent !== undefined &&
+          providerRecordHarness(managedAgent) !== null
         }
         instanceCount={personaDeleteInstanceCount}
         isPending={

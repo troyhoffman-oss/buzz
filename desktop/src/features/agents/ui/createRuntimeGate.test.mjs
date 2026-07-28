@@ -6,6 +6,7 @@ import {
   createRuntimeIsAvailable,
   createRuntimeOptionDisabled,
   createRuntimeSeedAction,
+  createRuntimeSeedAllowed,
   createRuntimeSelectionSatisfied,
   runtimeDropdownOptions,
   runtimeDropdownPlaceholder,
@@ -299,6 +300,102 @@ test("the seed never overrides a definition's own runtime or a loaded catalog", 
     { type: "none" },
     "the seed fires at most once per dialog-open",
   );
+});
+
+// The edit-mode half of the same defect. `runsRemotely` comes from the "Where
+// to run" control, which exists only during a create — so it is false here and
+// the seed happily stamped this computer's default onto a definition whose
+// record runs on a host. The blank runtime is deliberate: `to_definition_view`
+// drops the harness because the real one is the host's.
+test("editing a provider record never seeds the local default", () => {
+  assert.deepEqual(
+    createRuntimeSeedAction(seedInput({ editsProviderRecord: true })),
+    { type: "none" },
+    "a blank definition runtime on a remote record is not an absence to fill",
+  );
+});
+
+test("an already-seeded provider-record edit sheds the local default", () => {
+  assert.deepEqual(
+    createRuntimeSeedAction(
+      seedInput({
+        editsProviderRecord: true,
+        runtime: "buzz-agent",
+        isAutoSeeded: true,
+        hasSeededForOpen: true,
+      }),
+    ),
+    { type: "shed" },
+    "the phantom seed is what armed needsProviderSelection and blocked Save",
+  );
+});
+
+test("a local edit is untouched by the provider-record guard", () => {
+  assert.deepEqual(
+    createRuntimeSeedAction(seedInput({ editsProviderRecord: false })),
+    { type: "seed", runtimeId: "buzz-agent" },
+  );
+});
+
+// The guard is EDIT-only, and its call site is where that can be got wrong:
+// the profile panel drives ONE dialog from three handlers -- Edit agent, Edit
+// persona and Duplicate -- and only the first two seed an `id`. Handing the
+// panel's provider-backed answer straight through armed the guard on a CREATE,
+// where the sibling effect in `useCreateRuntimeSeed` (create-only: it bails on
+// `"id" in initialValues`) immediately put the shed harness back. The two
+// effects then swapped the same field forever -- "Maximum update depth
+// exceeded" on the usual remote shape, where the duplicate's model and
+// provider are both blank.
+test("duplicating a provider-backed persona seeds like any other local create", () => {
+  // A duplicate arrives with no harness of its own: `to_definition_view` drops
+  // the host's, so the persona it copies has none to carry over.
+  const duplicate = seedInput({
+    definitionRuntime: undefined,
+    editsProviderRecord: false,
+  });
+  assert.deepEqual(createRuntimeSeedAction(duplicate), {
+    type: "seed",
+    runtimeId: "buzz-agent",
+  });
+  assert.deepEqual(
+    createRuntimeSeedAction({
+      ...duplicate,
+      runtime: "buzz-agent",
+      isAutoSeeded: true,
+      hasSeededForOpen: true,
+    }),
+    { type: "none" },
+    "the seed settles in one pass -- nothing sheds what the create just seeded",
+  );
+});
+
+// Why the fix belongs at the call site and not inside this function: the two
+// effects have no shared state to negotiate with, so they can only agree by
+// asking the same question. On a create -- the only shape the sibling effect
+// acts on -- the shed must therefore turn on `runsRemotely` alone, which is
+// exactly what that effect's own `createRuntimeSeedAllowed` bail reads.
+test("on a create, only 'Where to run' can shed -- the same fact the sibling effect bails on", () => {
+  for (const runsRemotely of [false, true]) {
+    for (const isAutoSeeded of [false, true]) {
+      const action = createRuntimeSeedAction(
+        seedInput({
+          // Guaranteed by the call site: a create has no `id`, so it never
+          // carries the edit-only provider-record answer.
+          editsProviderRecord: false,
+          hasSeededForOpen: isAutoSeeded,
+          isAutoSeeded,
+          runsRemotely,
+          runtime: isAutoSeeded ? "buzz-agent" : "",
+        }),
+      );
+      const siblingWouldSeed = createRuntimeSeedAllowed(runsRemotely);
+      assert.equal(
+        action.type === "shed",
+        !siblingWouldSeed && isAutoSeeded,
+        `runsRemotely=${runsRemotely} isAutoSeeded=${isAutoSeeded}: a shed is only ever legal where the sibling effect has already bailed`,
+      );
+    }
+  }
 });
 
 test("an unpinned remote harness demands nothing yet", () => {
