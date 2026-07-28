@@ -10,6 +10,13 @@ import path from "node:path";
  * non-zero exit — lives here so the apps can never drift.
  */
 
+// `rules[].root` and the `overrides` keys are authored with `/`, but
+// path.relative yields `\` on Windows — so every comparison against them has
+// to happen in posix form or it silently matches nothing.
+function toPosixPath(relativePath) {
+  return relativePath.split(path.sep).join("/");
+}
+
 async function walkFiles(directory) {
   const entries = await fs.readdir(directory, { withFileTypes: true });
   const files = await Promise.all(
@@ -26,15 +33,7 @@ async function walkFiles(directory) {
   return files.flat();
 }
 
-/**
- * Rule roots and override keys are authored with `/`, so paths are normalized
- * to POSIX separators before either is matched — otherwise every lookup misses
- * on Windows, where `path.relative` yields `\`.
- */
-function toPosix(relativePath) {
-  return relativePath.split(path.sep).join("/");
-}
-
+// Callers pass an already-posix path (see `toPosixPath` at the walk site).
 function findRule(rules, relativePath) {
   return rules.find((rule) => relativePath.startsWith(`${rule.root}/`));
 }
@@ -78,7 +77,7 @@ export async function runFileSizeCheck({
   const unusedOverrides = new Set(overrides.keys());
 
   for (const filePath of candidateFiles) {
-    const relativePath = toPosix(path.relative(projectRoot, filePath));
+    const relativePath = toPosixPath(path.relative(projectRoot, filePath));
     const rule = findRule(rules, relativePath);
     if (!rule) {
       continue;
