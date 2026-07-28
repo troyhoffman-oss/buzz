@@ -946,6 +946,9 @@ enum SwitchOutcome {
     Switched,
     /// Not in the idle agent's cached catalog — pick rejected, session untouched.
     UnsupportedModel,
+    /// The process catalog has not been captured yet, so nothing can be
+    /// validated against — pick deferred, session untouched.
+    CatalogUnavailable,
     /// No turn in flight and no idle agent holds a session for the channel.
     NoActiveTurn,
 }
@@ -953,12 +956,19 @@ enum SwitchOutcome {
 impl SwitchOutcome {
     /// `control_result` status string. Consumed by the desktop's
     /// `awaitLiveSwitchOutcome` — do not change these without updating it.
+    ///
+    /// `CatalogUnavailable` reports as `unsupported_model` rather than adding a
+    /// status: both mean "pick rejected, session untouched", which is all the
+    /// desktop acts on. It is also unreachable from there, whose model list is
+    /// populated from this same catalog — with no catalog there is nothing to
+    /// pick. Only `!model`, which can be typed before the first session binds,
+    /// distinguishes the two, and it does so on the variant.
     fn status(&self) -> &'static str {
         match self {
             Self::Sent => "sent",
             Self::TurnEnding => "turn_ending",
             Self::Switched => "switched",
-            Self::UnsupportedModel => "unsupported_model",
+            Self::UnsupportedModel | Self::CatalogUnavailable => "unsupported_model",
             Self::NoActiveTurn => "no_active_turn",
         }
     }
@@ -966,10 +976,13 @@ impl SwitchOutcome {
 
 /// Switch the model backing `channel_id`.
 ///
-/// Pre-cancel guard: an unsupported pick is rejected against the process-wide
-/// catalog before anything is disturbed, on both paths. The catalog is only
-/// unknown before the first session of the process binds, in which case the
-/// pick is passed through and validated at apply time instead.
+/// Pre-cancel guard: every pick is validated against the process-wide catalog
+/// before anything is disturbed, on both paths. No catalog means nothing to
+/// validate against, so the pick is deferred rather than passed through: the
+/// window where the catalog is missing is the first turn's `session/new`, which
+/// is already registered in flight, so passing an unvalidated pick through
+/// there cancels and requeues a live turn on the strength of a possible typo —
+/// and the fresh session then falls back to the unchanged model anyway.
 ///
 /// Busy path: deliver `SwitchModel` over the in-flight task's oneshot — the
 /// task cancels the turn, sets `desired_model`, and requeues the batch so it
@@ -983,7 +996,10 @@ fn switch_model_for_channel(
     channel_id: Uuid,
     model_id: &str,
 ) -> SwitchOutcome {
-    if catalog.is_some_and(|caps| !caps.contains(model_id)) {
+    let Some(caps) = catalog else {
+        return SwitchOutcome::CatalogUnavailable;
+    };
+    if !caps.contains(model_id) {
         return SwitchOutcome::UnsupportedModel;
     }
 
@@ -1105,6 +1121,11 @@ fn handle_model_command(
             Some(listing) => format!("`{model_id}` isn't one of my models.\n\n{listing}"),
             None => format!("`{model_id}` isn't one of my models."),
         },
+        // Nothing to validate the pick against yet, so it was not applied. The
+        // no-argument branch above says the same thing for the same reason.
+        SwitchOutcome::CatalogUnavailable => {
+            "I don't know my model list yet — ask again in a moment.".to_string()
+        }
         // No agent holds a session for this channel, so there is nothing to
         // switch. Say so rather than claiming a switch that never happened.
         SwitchOutcome::NoActiveTurn => {
@@ -2957,6 +2978,19 @@ fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
 /// starts with a `!token`, or with an `@mention` followed by one. Ownership is
 /// NOT checked here — callers re-check the author so a non-owner's `!cancel`
 /// still reaches the agent as a prompt.
+///
+/// The bang must sit at **command position**: either first, or immediately
+/// after the run of leading `@mention` tokens that addresses the agent. Prose
+/// never arms it. Anything looser makes an ordinary question — `@Agent what
+/// happens if I run !shutdown` — indistinguishable from the command itself.
+///
+/// A mention is one whitespace-delimited `@token`, so a display name holding
+/// spaces (`@Will Pfleger !rotate`) does not reach command position and is
+/// delivered to the agent as an ordinary message instead. Without the name
+/// list — which the main loop does not have — where such a mention ends is
+/// genuinely ambiguous, and that ambiguity is the whole vulnerability: any
+/// rule permissive enough to end the mention at `Pfleger` also ends it at the
+/// last word of a sentence. Not firing is the safe side of that trade.
 fn owner_control_command<'a>(
     event: &'a nostr::Event,
     kind_u32: u32,
@@ -2965,19 +2999,20 @@ fn owner_control_command<'a>(
     if kind_u32 != KIND_STREAM_MESSAGE || !event_mentions_agent(event, agent_pubkey_hex) {
         return None;
     }
-    let content = event.content.trim();
+    let mut content = event.content.trim();
     // Mentioning is how a client addresses an agent, so `@Name !model` is the
-    // natural gesture, and a display name may hold spaces (`@Codex (Sol)`).
-    // Skip past the mention to the first `!`-initiated token rather than
-    // matching the name: the `p` tag already proved the mention is ours.
-    let content = if content.starts_with('@') {
-        content
-            .char_indices()
-            .find(|&(i, c)| c == '!' && content[..i].ends_with(char::is_whitespace))
-            .map_or("", |(i, _)| &content[i..])
-    } else {
-        content
-    };
+    // natural gesture, and a channel may address several agents at once
+    // (`@Sol @Eva !rotate`). Skip the leading mention tokens without matching a
+    // name — the `p` tag already proved the mention is ours. Every skipped
+    // token must itself start with `@`, which is what keeps the scan from
+    // running into prose.
+    while let Some(after_at) = content.strip_prefix('@') {
+        let token_len = after_at.find(char::is_whitespace).unwrap_or(after_at.len());
+        if token_len == 0 {
+            return None; // bare `@` — not a mention
+        }
+        content = after_at[token_len..].trim_start();
+    }
     if !content.starts_with('!') {
         return None;
     }
@@ -4550,20 +4585,30 @@ mod owner_control_command_tests {
             // no arm and falls through to the elicitation check. See
             // `owner_control_command_leaves_skip_to_the_elicitation_check`.
             ("!skip", Some(("!skip", ""))),
-            // Clients address an agent by mention, and a display name may hold
-            // spaces, so a leading mention is skipped without matching a name.
+            // The ask card's skip reaches the parser mention-prefixed too, and
+            // must still fall through to the elicitation check.
+            ("@Claude !skip", Some(("!skip", ""))),
+            // Clients address an agent by mention, so leading `@token`s are
+            // skipped without matching a name — including several at once.
             ("@Claude !model", Some(("!model", ""))),
             ("@Claude !model haiku", Some(("!model", "haiku"))),
-            ("@Will Pfleger !model", Some(("!model", ""))),
-            ("@Codex (Sol) !model opus", Some(("!model", "opus"))),
+            ("@Sol @Eva !cancel", Some(("!cancel", ""))),
             ("@Claude", None),
-            // A leading `@` arms the scan for the rest of the content, so a
-            // bang anywhere after one is a command.
-            ("@Claude please run !model haiku", Some(("!model", "haiku"))),
-            // Without that leading `@`, a bang never fires.
+            // The bang must be at command position. Prose after the mention
+            // never arms it, or asking the agent *about* a command runs it.
+            ("@Claude please run !model haiku", None),
+            ("@Claude what happens if I use !shutdown", None),
+            // A display name holding spaces does not reach command position:
+            // the parser has no name list, and any rule loose enough to end
+            // the mention at `Pfleger` also ends it mid-sentence.
+            ("@Will Pfleger !model", None),
+            ("@Codex (Sol) !model opus", None),
+            // A bang that is not first and not behind a leading mention is
+            // just text.
             ("hello @Claude !model", None),
             ("hello !model haiku", None),
             ("", None),
+            ("@", None),
         ] {
             let event = make_event(KIND_STREAM_MESSAGE, content, Some(&agent));
             assert_eq!(
@@ -4891,11 +4936,46 @@ mod owner_control_command_tests {
             handle_model_command(&mut pool, &empty, channel_id, ""),
             "I don't know my model list yet — ask again in a moment."
         );
-        // No catalog and no session: nothing to switch, and the reply must not
-        // claim otherwise.
+        // A named pick is deferred for the same reason, not passed through:
+        // there is nothing to validate it against.
         assert_eq!(
             handle_model_command(&mut pool, &empty, channel_id, "haiku"),
-            "I have no session for this channel yet — message me first, then `!model`."
+            "I don't know my model list yet — ask again in a moment."
+        );
+    }
+
+    /// The catalog is missing only until the process's first `session/new`
+    /// responds — and that call is already registered in flight. Passing an
+    /// unvalidated pick through there would cancel and requeue a live turn on
+    /// the strength of a possible typo, and the fresh session would then fall
+    /// back to the unchanged model anyway.
+    #[tokio::test]
+    async fn model_command_does_not_cancel_the_first_turn_without_a_catalog() {
+        let channel_id = Uuid::new_v4();
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let empty = pool::ModelCatalog::default();
+        let (control_tx, mut control_rx) = tokio::sync::oneshot::channel();
+        let abort_handle = pool.join_set.spawn(async {});
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: Some(control_tx),
+                steer_tx: None,
+                elicitation_tx: None,
+            },
+        );
+
+        assert_eq!(
+            handle_model_command(&mut pool, &empty, channel_id, "haiku"),
+            "I don't know my model list yet — ask again in a moment."
+        );
+        assert!(
+            control_rx.try_recv().is_err(),
+            "an unvalidatable pick must not cancel the in-flight turn"
         );
     }
 
@@ -4919,6 +4999,12 @@ mod owner_control_command_tests {
         assert_eq!(SwitchOutcome::Switched.status(), "switched");
         assert_eq!(
             SwitchOutcome::UnsupportedModel.status(),
+            "unsupported_model"
+        );
+        // Deliberately shares `unsupported_model`: both mean "rejected, session
+        // untouched", and the desktop cannot reach this variant anyway.
+        assert_eq!(
+            SwitchOutcome::CatalogUnavailable.status(),
             "unsupported_model"
         );
         assert_eq!(SwitchOutcome::NoActiveTurn.status(), "no_active_turn");
