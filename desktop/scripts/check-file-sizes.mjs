@@ -580,7 +580,11 @@ const overrides = new Map([
   // consumption point (review finding, Wren + Dawn).
   // +3: model options carry their `description` through normalize_agent_models
   // (claude-agent-acp >= 0.62.0 emits it) instead of dropping it to None.
-  ["src-tauri/src/commands/agent_models.rs", 1155],
+  // +4 (1155 -> 1159): normalize_agent_models reads the option label from the
+  // schema's `name` with `displayName` as the legacy fallback, mirroring
+  // buzz-acp's config_option_label. Without it every claude row is nameless
+  // and the picker renders raw ids.
+  ["src-tauri/src/commands/agent_models.rs", 1159],
   // global-agent-config: get_agent_config_surface / write_agent_config_field /
   // put_agent_session_config commands + GlobalAgentConfig serde types. New file
   // in this PR; queued to split with the command module refactor.
