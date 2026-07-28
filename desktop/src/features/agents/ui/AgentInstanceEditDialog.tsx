@@ -86,6 +86,7 @@ import {
   getBakedProviderInheritLabel,
 } from "./bakedEnvHelpers";
 import { getProviderApiKeyEnvVar } from "./agentConfigOptions";
+import { modelFieldStatus } from "./agentAiConfigurationPolicy";
 import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { AgentAiDefaultsNotice } from "./AgentAiDefaults";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
@@ -598,23 +599,6 @@ export function AgentInstanceEditDialog({
     originalRuntimeSupportsProvider,
   });
 
-  const canSubmit =
-    computeEditAgentFormValidity({
-      name,
-      parallelism,
-      agentAcpCommand: agent.acpCommand,
-      acpCommand,
-      respondTo,
-      respondToAllowlistLength: respondToAllowlist.length,
-      selectedRuntimeId,
-      inheritHarness,
-      agentCommand,
-      requiredEnvKeyMissing,
-    }) &&
-    providerValid &&
-    !updateMutation.isPending &&
-    !isAvatarUploadPending;
-
   async function handleSubmit() {
     try {
       const parsedParallelism = Number.parseInt(parallelism, 10);
@@ -800,11 +784,39 @@ export function AgentInstanceEditDialog({
     loadingValue: MODEL_DISCOVERY_LOADING_VALUE,
     options: effectiveModelOptions,
   });
-  const modelStatusMessage = resolveModelFieldStatusMessage({
-    discoveredModelOptions,
-    loading: modelDiscoveryLoading,
-    status: modelDiscoveryStatus,
+  const { blocked: modelBlocked, status: modelStatus } = modelFieldStatus({
+    catalog: discoveredModelOptions,
+    discoveryStatus: modelDiscoveryStatus,
+    isTypedEntry: isCustomModelEditing && showCustomModelInput,
+    model,
   });
+  const modelStatusMessage = modelBlocked
+    ? modelStatus?.message
+    : resolveModelFieldStatusMessage({
+        discoveredModelOptions,
+        loading: modelDiscoveryLoading,
+        status: modelDiscoveryStatus,
+      });
+
+  // Declared after the model catalog so a typed model the harness never
+  // offered blocks Save rather than silently resolving to its default.
+  const canSubmit =
+    computeEditAgentFormValidity({
+      name,
+      parallelism,
+      agentAcpCommand: agent.acpCommand,
+      acpCommand,
+      respondTo,
+      respondToAllowlistLength: respondToAllowlist.length,
+      selectedRuntimeId,
+      inheritHarness,
+      agentCommand,
+      requiredEnvKeyMissing,
+    }) &&
+    providerValid &&
+    !modelBlocked &&
+    !updateMutation.isPending &&
+    !isAvatarUploadPending;
 
   // Provider field derived state
   const trimmedProvider = provider.trim();
@@ -1092,7 +1104,12 @@ export function AgentInstanceEditDialog({
                   </div>
                 ) : null}
                 {modelStatusMessage ? (
-                  <p className="text-xs text-muted-foreground">
+                  <p
+                    className={cn(
+                      "text-xs",
+                      modelBlocked ? "text-warning" : "text-muted-foreground",
+                    )}
+                  >
                     {modelStatusMessage}
                   </p>
                 ) : null}

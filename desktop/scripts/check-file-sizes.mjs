@@ -693,7 +693,12 @@ const overrides = new Map([
   // hidden-key projection keeps the top-level secret out of Advanced rows.
   // +6 (1195 -> 1201): rebase onto main — this PR's model-source label wiring
   // lands on top of main's dialog growth. Queued to split.
-  ["src/features/agents/ui/AgentInstanceEditDialog.tsx", 1201],
+  // +13 (1201 -> 1214): the typed-model catalog gate — a model typed into the
+  // Custom input must be one the harness published, or Save resolves it to the
+  // adapter's default at runtime and the agent silently runs the wrong model.
+  // Includes the tone branch on the status line: this message explains a dead
+  // Save button, so it cannot render in the same grey as an ordinary hint.
+  ["src/features/agents/ui/AgentInstanceEditDialog.tsx", 1214],
   // AgentDefinitionDialog grew past 1000 with the following load-bearing fixes:
   // isRuntimeAutoSeededRef tracking for edit-mode seeding (Fizz shows models);
   // runtimeSupportsLlmProviderSelection guard on discovery provider (codex fix);
@@ -703,7 +708,17 @@ const overrides = new Map([
   // credential questions from the HOST's catalog, so each local-runtime
   // requirement it suspends needs its own reason recorded here. Queued to
   // split with the create-mode surface.
-  ["src/features/agents/ui/AgentDefinitionDialog.tsx", 1087],
+  // +7 (1087 -> 1094): the typed-model catalog gate — see the note on
+  // AgentInstanceEditDialog above; every dialog that writes a model runs the
+  // same rule, from the one owner in agentAiConfigurationPolicy.
+  ["src/features/agents/ui/AgentDefinitionDialog.tsx", 1094],
+  // 997 -> 1011: the third model writer takes the same typed-model catalog
+  // gate as the two dialogs above. This file sat 3 lines under the limit, so
+  // the shared rule could not land anywhere in it without crossing; the gate
+  // logic itself lives in agentAiConfigurationPolicy and only the call site is
+  // here. First over-limit entry for this file — it is queued to split with
+  // the agent-config surface, not to grow.
+  ["src/features/agents/ui/AgentConfigFields.tsx", 1011],
 ]);
 
 await runFileSizeCheck({

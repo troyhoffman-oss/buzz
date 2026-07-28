@@ -82,6 +82,7 @@ import {
   agentAiConfigurationModeSatisfied,
   agentAiConfigurationPairForMode,
   initialAgentAiConfigurationMode,
+  modelFieldStatus,
 } from "./agentAiConfigurationPolicy";
 import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { buildRuntimeModelProviderPayload } from "./agentDefinitionSubmitPayload";
@@ -544,21 +545,6 @@ export function AgentDefinitionDialog({
     selectedRuntime,
     hasLocalDefaultRuntime: defaultRuntime !== null,
   };
-  // Gate model/provider validity through missingNormalizedFields — single
-  // source of truth with the readiness gate so display and Save can't drift.
-  const canSubmit =
-    canSubmitPersonaDialog({ displayName, isPending }) &&
-    createRuntimeSelectionSatisfied(runtimeGate) &&
-    (!isCreateMode || !createSubmitBlocked) &&
-    // Crash-loop guard, create AND edit: an empty allowlist would crash
-    // every instance minted from this definition at startup.
-    personaBehaviorDraftValid(behaviorDraft) &&
-    // D1: localModeSatisfied covers both missingNormalizedFields AND
-    // missingEnvKeys — credential env keys now block submit, not just display.
-    localModeSatisfied &&
-    customAiPairSatisfied &&
-    !isAvatarUploadPending;
-
   const {
     discoveredModelOptions,
     modelDiscoveryLoading,
@@ -597,6 +583,27 @@ export function AgentDefinitionDialog({
     modelFieldVisible,
     provider: effectiveProvider,
   });
+  const { blocked: modelBlocked, status: modelStatus } = modelFieldStatus({
+    catalog: discoveredModelOptions,
+    discoveryStatus: modelDiscoveryStatus,
+    isTypedEntry: isCustomModelEditing && showCustomModelInput,
+    model,
+  });
+  // Gate model/provider validity through missingNormalizedFields — single
+  // source of truth with the readiness gate so display and Save can't drift.
+  const canSubmit =
+    canSubmitPersonaDialog({ displayName, isPending }) &&
+    createRuntimeSelectionSatisfied(runtimeGate) &&
+    (!isCreateMode || !createSubmitBlocked) &&
+    // Crash-loop guard, create AND edit: an empty allowlist would crash
+    // every instance minted from this definition at startup.
+    personaBehaviorDraftValid(behaviorDraft) &&
+    // D1: localModeSatisfied covers both missingNormalizedFields AND
+    // missingEnvKeys — credential env keys now block submit, not just display.
+    localModeSatisfied &&
+    customAiPairSatisfied &&
+    !modelBlocked &&
+    !isAvatarUploadPending;
   // On internal Block builds, BUZZ_AGENT_PROVIDER is baked in and a boot
   // migration rewrites any persisted Databricks v1 values → v2. Hide the v1
   // option there so it is not offered for new selections. OSS builds have no
@@ -981,7 +988,7 @@ export function AgentDefinitionDialog({
                     disabled={isPending}
                     isExplicitModelRequired={isExplicitModelRequired}
                     model={model}
-                    modelDiscoveryStatus={modelDiscoveryStatus}
+                    modelDiscoveryStatus={modelStatus}
                     modelDropdownOptions={modelDropdownOptions}
                     modelSelectValue={modelSelectValue}
                     onCustomModelChange={setModel}
