@@ -14,6 +14,7 @@ import {
   askAcceleratorIndex,
   askAnswerLabels,
   askReplyContent,
+  askReplyMentions,
   askRovingIndex,
   buildAskAnswerIndex,
   canAnswerAsk,
@@ -123,6 +124,16 @@ test("canAnswerAsk allows only the owner, never the asking agent", () => {
     false,
     "the agent's own client renders its question read-only",
   );
+});
+
+test("an answer p-tags the asking agent so the harness receives it", () => {
+  // The harness subscribes with `#p = [agent_pubkey]`. An answer with no `p`
+  // tag is stored by the relay and collapses the card, but never reaches the
+  // agent's REQ — the question then hangs until it is cancelled.
+  assert.deepEqual(askReplyMentions({ signerPubkey: AGENT }), [AGENT]);
+  assert.equal(askReplyMentions({ signerPubkey: undefined }), undefined);
+  assert.equal(askReplyMentions({ signerPubkey: "" }), undefined);
+  assert.equal(askReplyMentions({}), undefined);
 });
 
 test("buildAskAnswerIndex takes the owner's earliest reply", () => {

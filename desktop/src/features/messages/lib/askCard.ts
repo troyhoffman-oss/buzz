@@ -228,6 +228,22 @@ export function askReplyContent(indices: readonly number[]): string {
 }
 
 /**
+ * The pubkeys an answer must p-tag: the agent that asked, and only it.
+ *
+ * The harness subscribes with `#p = [agent_pubkey]` (`BUZZ_ACP_SUBSCRIBE`
+ * defaults to mentions), so an answer carrying no `p` tag is accepted and
+ * stored by the relay — the card collapses, the owner sees success — but is
+ * never delivered over the agent's REQ, and the question hangs until it is
+ * cancelled. `signerPubkey` is the key in that filter, and it is already the
+ * trust anchor `resolveAskQuestion` gates the card on.
+ */
+export function askReplyMentions(
+  message: Pick<TimelineMessage, "signerPubkey">,
+): string[] | undefined {
+  return message.signerPubkey ? [message.signerPubkey] : undefined;
+}
+
+/**
  * What the answered row shows for a reply — the option labels behind it, so a
  * numbered multi-select answer reads as "Postgres, SQLite" rather than "1, 2".
  *
