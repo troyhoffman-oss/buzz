@@ -704,7 +704,11 @@ const overrides = new Map([
   // adapter's default at runtime and the agent silently runs the wrong model.
   // Includes the tone branch on the status line: this message explains a dead
   // Save button, so it cannot render in the same grey as an ordinary hint.
-  ["src/features/agents/ui/AgentInstanceEditDialog.tsx", 1214],
+  // 1214 -> 1178: the local Model control moved out to
+  // EditAgentHarnessFields.tsx beside its pinned counterpart — the two are one
+  // field answering the local and remote questions that file already
+  // documents. Ratcheted down; the `!model` prefill prop landed inside it.
+  ["src/features/agents/ui/AgentInstanceEditDialog.tsx", 1178],
   // AgentDefinitionDialog grew past 1000 with the following load-bearing fixes:
   // isRuntimeAutoSeededRef tracking for edit-mode seeding (Fizz shows models);
   // runtimeSupportsLlmProviderSelection guard on discovery provider (codex fix);
