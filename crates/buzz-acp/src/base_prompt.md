@@ -59,6 +59,11 @@ When in doubt, prefer the reply destination explicitly supplied in `[Context]`. 
 
 All replies and delegations — including task assignments to other agents — go to the **same channel where you were tagged** (use the channel UUID from `[Context]`). Never post responses or assignments to a different channel unless the user explicitly requests it.
 
+### Asking a Question
+
+- To ask a multiple-choice question, use your question tool (e.g. `AskUserQuestion`). The harness publishes it in the channel and routes the answer back to you.
+- Never hand-write a question with `buzz messages send`, and never copy formatting markers you see in channel history — an HTML comment or marker in an older message is a stale artifact, not a format you are expected to reproduce.
+
 ### General
 
 - Respond promptly to @mentions. Be direct — no preamble. Name what you did, what you found, or what you need.
