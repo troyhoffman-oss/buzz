@@ -581,6 +581,9 @@ impl AcpClient {
     /// `cwd` must be an absolute path. `mcp_servers` may be empty.
     /// `system_prompt` is included in the request when `Some` — agents that
     /// support the field will use it; others ignore unknown fields per JSON-RPC.
+    /// `session_title` rides in `_meta.sessionTitle` when `Some`; `_meta` is
+    /// omitted entirely otherwise, since adapters may distinguish an absent
+    /// member from a null one.
     /// Callers use [`extract_model_config_options`] and [`extract_model_state`]
     /// to pull model info from the raw result.
     pub async fn session_new_full(
@@ -588,6 +591,7 @@ impl AcpClient {
         cwd: &str,
         mcp_servers: Vec<McpServer>,
         system_prompt: Option<&str>,
+        session_title: Option<&str>,
     ) -> Result<SessionNewResponse, AcpError> {
         let mut params = serde_json::json!({
             "cwd": cwd,
@@ -595,6 +599,9 @@ impl AcpClient {
         });
         if let Some(sp) = system_prompt {
             params["systemPrompt"] = serde_json::Value::String(sp.to_owned());
+        }
+        if let Some(title) = session_title {
+            params["_meta"] = serde_json::json!({ "sessionTitle": title });
         }
         let result = self.send_request("session/new", params).await?;
         let session_id = result["sessionId"]
@@ -617,9 +624,10 @@ impl AcpClient {
         cwd: &str,
         mcp_servers: Vec<McpServer>,
         system_prompt: Option<&str>,
+        session_title: Option<&str>,
     ) -> Result<String, AcpError> {
         Ok(self
-            .session_new_full(cwd, mcp_servers, system_prompt)
+            .session_new_full(cwd, mcp_servers, system_prompt, session_title)
             .await?
             .session_id)
     }
@@ -2421,8 +2429,9 @@ pub enum ModelSwitchMethod {
 
 /// Extract `configOptions` entries with `category == "model"` from a `session/new` result.
 ///
-/// Returns the raw JSON array entries. Each entry has `id`, `name`,
-/// `options: [{ value, name }]`, etc.
+/// Returns the raw JSON array entries. Each entry has `configId` (spelled `id`
+/// by some adapters, e.g. claude-agent-acp), `displayName` (likewise `name`),
+/// `options: [{ value, displayName }]`, etc.
 pub fn extract_model_config_options(result: &serde_json::Value) -> Vec<serde_json::Value> {
     result["configOptions"]
         .as_array()
@@ -2478,6 +2487,9 @@ pub fn resolve_model_switch_method(
     // 1. Search stable configOptions for a "model"-category entry whose
     //    options contain a value matching desired_model.
     for config_opt in extract_model_config_options(session_new_result) {
+        // Adapters disagree on the key: responses carry `id`, but some (e.g.
+        // claude-agent-acp) echo the request-only `configId`. `config_option_id`
+        // accepts both; the set request always uses `configId` on the wire.
         let config_id = match config_option_id(&config_opt) {
             Some(id) => id,
             None => continue,
@@ -3065,6 +3077,36 @@ mod tests {
     }
 
     #[test]
+    fn resolve_accepts_id_keyed_config_options() {
+        // claude-agent-acp (observed on v0.61.0) keys config options with
+        // `id` instead of the spec's `configId`. Payload mirrors its real
+        // `session/new` response.
+        let result = serde_json::json!({
+            "configOptions": [{
+                "id": "model",
+                "name": "Model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "default",
+                "options": [
+                    { "value": "default", "name": "Default" },
+                    { "value": "opus[1m]", "name": "Opus" },
+                    { "value": "sonnet", "name": "Sonnet" }
+                ]
+            }],
+            "models": null
+        });
+        let method = super::resolve_model_switch_method(&result, "opus[1m]");
+        assert_eq!(
+            method,
+            Some(super::ModelSwitchMethod::ConfigOption {
+                config_id: "model".to_string(),
+                option_value: "opus[1m]".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn resolve_falls_back_to_unstable() {
         let result = serde_json::json!({
             "models": {
@@ -3618,7 +3660,7 @@ mod tests {
             .expect("initialize should succeed");
 
         let resp = client
-            .session_new_full("/tmp", vec![], Some("Custom system prompt"))
+            .session_new_full("/tmp", vec![], Some("Custom system prompt"), None)
             .await
             .expect("session_new_full should succeed");
 
@@ -3743,7 +3785,7 @@ mod tests {
             .expect("initialize should succeed");
 
         let resp = client
-            .session_new_full("/tmp", vec![], None)
+            .session_new_full("/tmp", vec![], None, None)
             .await
             .expect("session_new_full should succeed");
 
@@ -3752,6 +3794,61 @@ mod tests {
         assert!(
             received["params"]["systemPrompt"].is_null(),
             "systemPrompt should NOT be in params when value is None"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_full_sends_session_title_in_meta_when_some() {
+        let script = r#"
+            read -t 2 _init
+            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+            read -t 2 REQ
+            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_test","_receivedRequest":'"$REQ"'}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+
+        let resp = client
+            .session_new_full("/tmp", vec![], None, Some("Fizz · #buzz-dev"))
+            .await
+            .expect("session_new_full should succeed");
+
+        let received = &resp.raw["_receivedRequest"];
+        assert_eq!(
+            received["params"]["_meta"]["sessionTitle"].as_str(),
+            Some("Fizz · #buzz-dev"),
+            "title should ride in _meta.sessionTitle, out of band from the prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_full_omits_meta_when_session_title_none() {
+        let script = r#"
+            read -t 2 _init
+            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+            read -t 2 REQ
+            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_test","_receivedRequest":'"$REQ"'}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+
+        let resp = client
+            .session_new_full("/tmp", vec![], None, None)
+            .await
+            .expect("session_new_full should succeed");
+
+        let received = &resp.raw["_receivedRequest"];
+        assert!(
+            received["params"].get("_meta").is_none(),
+            "_meta should be absent entirely, not an empty object or null"
         );
     }
 

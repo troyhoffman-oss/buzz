@@ -33,7 +33,7 @@ use crate::acp::{
     resolve_model_switch_method, AcpClient, AcpError, McpServer, ModelSwitchMethod,
     SessionNewResponse, StopReason,
 };
-use crate::config::{DedupMode, PermissionMode};
+use crate::config::{compose_session_title, DedupMode, PermissionMode};
 use crate::observer;
 use crate::queue::{
     CancelReason, ContextMessage, ConversationContext, FlushBatch, PromptChannelInfo,
@@ -830,6 +830,9 @@ pub struct PromptContext {
     pub turn_liveness_interval: Duration,
     pub dedup_mode: DedupMode,
     pub system_prompt: Option<String>,
+    /// Sanitized title for each new ACP session, sent as `_meta.sessionTitle`
+    /// on `session/new`. Never part of the prompt.
+    pub session_title: Option<String>,
     pub team_instructions: Option<String>,
     pub heartbeat_prompt: Option<String>,
     /// Base prompt content, or `None` if `--no-base-prompt` was passed.
@@ -1231,6 +1234,49 @@ const PERMISSION_MODE_TIMEOUT: Duration = Duration::from_secs(5);
 /// `session/resume` with when the transcript is gone.
 const SESSION_NOT_FOUND: i64 = -32002;
 
+/// Placeholder [`fetch_channel_info`] substitutes when a channel's metadata
+/// event carries no `name` tag. Not a real channel name — consumers that need
+/// an identifying name must treat it as absent.
+const UNKNOWN_CHANNEL_NAME: &str = "unknown";
+
+/// Channel-derived inputs for a new session — `(is_dm, title_channel)` — from
+/// **one** metadata resolve.
+///
+/// Both new-session consumers need the same lookup: the canvas block skips DMs
+/// (and fails closed when the channel type can't be determined), and the
+/// session title is qualified with the channel name. Resolving once is
+/// load-bearing rather than tidy: [`ChannelInfoResolver`] caches only `Some`,
+/// so two calls against an unresolvable channel pay the whole
+/// [`fetch_channel_info`] retry sequence twice — two `CONTEXT_FETCH_TIMEOUT`
+/// attempts plus `CONTEXT_FETCH_RETRY_DELAY` each, in front of `session/new`,
+/// precisely when the relay is already degraded.
+///
+/// `title_channel` is `None` whenever the channel can't usefully identify the
+/// session: an unresolved channel, a DM (no meaningful name), or the literal
+/// `"unknown"` that [`fetch_channel_info`] substitutes for a metadata event
+/// with no `name` tag. Composing that sentinel would title every unnamed
+/// channel identically (`Agent · #unknown`) — reintroducing the collision the
+/// suffix exists to remove, while naming a channel something it isn't. The
+/// startup cache already refuses `channel_type == "unknown"` for the same
+/// reason.
+///
+/// Renames do not retitle live sessions, and a **channel** rename is stickier
+/// than an agent rename: `invalidate_channel` drops the session but not the
+/// resolver's cached entry, so a renamed channel keeps its old suffix until the
+/// process restarts. An agent rename lands on the next spawn (the desktop
+/// restart badge covers it — see `spawn_config_hash`).
+async fn resolve_new_session_channel_context(
+    channel_info: &ChannelInfoResolver,
+    channel_id: Uuid,
+) -> (bool, Option<String>) {
+    let Some(info) = channel_info.resolve(channel_id).await else {
+        return (true, None);
+    };
+    let is_dm = info.channel_type == "dm";
+    let title_channel = (!is_dm && info.name != UNKNOWN_CHANNEL_NAME).then_some(info.name);
+    (is_dm, title_channel)
+}
+
 /// Create a new ACP session via `session_new_full()`, populate model capabilities
 /// on the agent (first session only), and apply `desired_model` if set.
 ///
@@ -1242,6 +1288,7 @@ async fn create_session_and_apply_model(
     ctx: &PromptContext,
     agent_core: Option<&str>,
     agent_canvas: Option<&str>,
+    channel_name: Option<&str>,
 ) -> Result<String, AcpError> {
     // Build base_prompt + system_prompt + agent core + canvas metadata into a
     // single prompt. Standard protocol-v2 agents receive it in `session/new`;
@@ -1261,6 +1308,11 @@ async fn create_session_and_apply_model(
         agent_canvas,
     );
 
+    let session_title = ctx
+        .session_title
+        .as_deref()
+        .map(|agent_name| compose_session_title(agent_name, channel_name));
+
     let resp = agent
         .acp
         .session_new_full(
@@ -1271,6 +1323,7 @@ async fn create_session_and_apply_model(
                 agent.protocol_version,
                 combined_system_prompt.as_deref(),
             ),
+            session_title.as_deref(),
         )
         .await?;
 
@@ -1488,12 +1541,18 @@ pub(crate) struct ResolvedSession {
 ///
 /// `pending_canvas` is committed only once a session is actually bound (I3), so
 /// a failed creation leaves no stale revision for the retry to reuse.
+///
+/// `channel_name` qualifies the title of a session this call *creates*
+/// (`Agent · #channel`). It is deliberately unused on the reuse and resume
+/// paths: those sessions already carry the title they were created with, and
+/// nothing in ACP retitles a live session.
 async fn resolve_channel_session(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
     channel_id: &Uuid,
     agent_core: Option<&str>,
     agent_canvas: Option<&str>,
+    channel_name: Option<&str>,
     pending_canvas: &mut Option<(Uuid, String)>,
 ) -> Result<ResolvedSession, AcpError> {
     if let Some(sid) = agent.state.sessions.get(channel_id) {
@@ -1522,7 +1581,8 @@ async fn resolve_channel_session(
         });
     }
 
-    let sid = create_session_and_apply_model(agent, ctx, agent_core, agent_canvas).await?;
+    let sid =
+        create_session_and_apply_model(agent, ctx, agent_core, agent_canvas, channel_name).await?;
     tracing::info!(
         target: "buzz_acp::pool::session",
         "created session {sid} for channel {channel_id}"
@@ -2057,18 +2117,20 @@ pub async fn run_prompt_task(
     // prevents a stale revision A surviving a failed create and being re-used by
     // the next attempt after the canvas was cleared.
     let mut pending_canvas: Option<(Uuid, String)> = None;
+    // Channel name for the session title, from the same single resolve the
+    // canvas DM check uses — see `resolve_new_session_channel_context`.
+    let mut title_channel: Option<String> = None;
     if let PromptSource::Channel(cid) = &source {
         let is_new_channel_session = !agent.state.sessions.contains_key(cid);
-        if is_new_channel_session && !agent.state.canvas_sections.contains_key(cid) {
-            // Resolve DM status: prefer the startup cache, lazy-fetch as fallback.
-            // Unknown → treat as DM (fail-closed).
-            let is_dm = ctx
-                .channel_info
-                .resolve(*cid)
-                .await
-                .map(|ci| ci.channel_type == "dm")
-                .unwrap_or(true);
-            if !is_dm {
+        let needs_canvas = is_new_channel_session && !agent.state.canvas_sections.contains_key(cid);
+        let needs_title = is_new_channel_session && ctx.session_title.is_some();
+        if needs_canvas || needs_title {
+            let (is_dm, resolved_channel) =
+                resolve_new_session_channel_context(&ctx.channel_info, *cid).await;
+            title_channel = resolved_channel;
+            // A confirmed DM never receives a canvas section; an undeterminable
+            // channel type fails closed as a DM for the same reason.
+            if needs_canvas && !is_dm {
                 if let Some(section) = fetch_canvas_section(*cid, &ctx.rest_client).await {
                     pending_canvas = Some((*cid, section));
                 }
@@ -2100,12 +2162,19 @@ pub async fn run_prompt_task(
     let mut resumed = false;
     let (session_id, is_new_session) = match &source {
         PromptSource::Channel(cid) => {
+            // When this resolves to a *created* session, its title is
+            // channel-qualified (`Agent · #channel`) so one agent in several
+            // channels doesn't produce identical session rows; `title_channel`
+            // comes from the single resolve above and is `None` for DM,
+            // unresolved, and unnamed channels. A resumed session keeps the
+            // title it was created with.
             match resolve_channel_session(
                 &mut agent,
                 &ctx,
                 cid,
                 agent_core.as_deref(),
                 agent_canvas.as_deref(),
+                title_channel.as_deref(),
                 &mut pending_canvas,
             )
             .await
@@ -2145,7 +2214,7 @@ pub async fn run_prompt_task(
             if let Some(sid) = &agent.state.heartbeat_session {
                 (sid.clone(), false)
             } else {
-                match create_session_and_apply_model(&mut agent, &ctx, None, None).await {
+                match create_session_and_apply_model(&mut agent, &ctx, None, None, None).await {
                     Ok(sid) => {
                         tracing::info!(
                             target: "buzz_acp::pool::session",
@@ -2904,7 +2973,7 @@ pub(crate) async fn fetch_channel_info(
                 }
                 let channel_type = crate::relay::channel_type_from_tags(tags);
                 Some(PromptChannelInfo {
-                    name: name.unwrap_or("unknown").to_string(),
+                    name: name.unwrap_or(UNKNOWN_CHANNEL_NAME).to_string(),
                     channel_type,
                 })
             }
@@ -4548,6 +4617,9 @@ mod tests {
 
     #[test]
     fn test_framed_system_prompt_both_present_carries_both_headers() {
+        // Also the regression guard against #2372: the session title travels
+        // out of band in `_meta.sessionTitle`, so this exact-bytes assertion is
+        // what pins the framing against a `[Session]` section reappearing here.
         let framed = framed_system_prompt("/", Some("base text"), Some("persona text"))
             .expect("both present yields Some");
         assert_eq!(framed, "[Base]\nbase text\n\n[System]\npersona text");
@@ -6151,6 +6223,7 @@ mod tests {
             turn_liveness_interval: Duration::ZERO,
             dedup_mode: DedupMode::Drop,
             system_prompt: None,
+            session_title: None,
             team_instructions: None,
             heartbeat_prompt: None,
             base_prompt: None,
@@ -6671,10 +6744,17 @@ mod tests {
         let mut agent = creating_agent(None, "ses_fresh").await;
         let mut pending_canvas = None;
 
-        let resolved =
-            resolve_channel_session(&mut agent, &ctx, &channel, None, None, &mut pending_canvas)
-                .await
-                .expect("creation must succeed");
+        let resolved = resolve_channel_session(
+            &mut agent,
+            &ctx,
+            &channel,
+            None,
+            None,
+            None,
+            &mut pending_canvas,
+        )
+        .await
+        .expect("creation must succeed");
 
         assert_eq!(
             resolved,
@@ -6706,10 +6786,17 @@ mod tests {
         let mut agent = resuming_agent(r#""result":{}"#).await;
         let mut pending_canvas = None;
 
-        let resolved =
-            resolve_channel_session(&mut agent, &ctx, &channel, None, None, &mut pending_canvas)
-                .await
-                .expect("resume must succeed");
+        let resolved = resolve_channel_session(
+            &mut agent,
+            &ctx,
+            &channel,
+            None,
+            None,
+            None,
+            &mut pending_canvas,
+        )
+        .await
+        .expect("resume must succeed");
 
         assert_eq!(
             resolved,
@@ -6743,10 +6830,17 @@ mod tests {
         .await;
         let mut pending_canvas = None;
 
-        let resolved =
-            resolve_channel_session(&mut agent, &ctx, &channel, None, None, &mut pending_canvas)
-                .await
-                .expect("creation must succeed after the miss");
+        let resolved = resolve_channel_session(
+            &mut agent,
+            &ctx,
+            &channel,
+            None,
+            None,
+            None,
+            &mut pending_canvas,
+        )
+        .await
+        .expect("creation must succeed after the miss");
 
         assert_eq!(
             resolved,
@@ -6779,10 +6873,17 @@ mod tests {
         agent.state.sessions.insert(channel, "ses_live".into());
         let mut pending_canvas = None;
 
-        let resolved =
-            resolve_channel_session(&mut agent, &ctx, &channel, None, None, &mut pending_canvas)
-                .await
-                .expect("the cached session must resolve");
+        let resolved = resolve_channel_session(
+            &mut agent,
+            &ctx,
+            &channel,
+            None,
+            None,
+            None,
+            &mut pending_canvas,
+        )
+        .await
+        .expect("the cached session must resolve");
 
         assert_eq!(
             resolved,
@@ -6837,9 +6938,17 @@ mod tests {
         ctx.session_store.as_ref().unwrap().clear(&channel);
         // The already-running task then finishes its pre-prompt phase and
         // persists a binding the owner never wanted.
-        resolve_channel_session(&mut agent, &ctx, &channel, None, None, &mut pending_canvas)
-            .await
-            .expect("creation must succeed");
+        resolve_channel_session(
+            &mut agent,
+            &ctx,
+            &channel,
+            None,
+            None,
+            None,
+            &mut pending_canvas,
+        )
+        .await
+        .expect("creation must succeed");
         assert_eq!(
             ctx.session_store.as_ref().unwrap().get(&channel).as_deref(),
             Some("ses_raced"),
@@ -7182,5 +7291,143 @@ mod tests {
             !section.contains("+00:00"),
             "timestamp must not use +00:00 offset"
         );
+    }
+
+    // ── new-session channel context (one resolve, two consumers) ─────────────
+
+    /// A [`ChannelInfoResolver`] whose lazy REST fallback is served by a local
+    /// HTTP server, plus a counter of the requests that actually reached it.
+    /// Counting real requests is the point: the composition tests are pure and
+    /// cannot see duplicated I/O.
+    async fn counting_resolver(
+        response: serde_json::Value,
+    ) -> (
+        ChannelInfoResolver,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test HTTP server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let body = response.to_string();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0; 8192];
+                let _ = socket.read(&mut buf).await;
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let rest = crate::relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        (
+            ChannelInfoResolver::new(std::collections::HashMap::new(), rest),
+            requests,
+            server,
+        )
+    }
+
+    fn channel_metadata_response(id: Uuid, tags: &[[&str; 2]]) -> serde_json::Value {
+        let mut event_tags = vec![json!(["d", id.to_string()])];
+        event_tags.extend(tags.iter().map(|[k, v]| json!([k, v])));
+        json!([{ "tags": event_tags }])
+    }
+
+    /// A normal channel yields a non-DM (canvas allowed) and its name for the
+    /// title suffix — and the second consumer reads it from cache, not the wire.
+    #[tokio::test]
+    async fn test_new_session_channel_context_qualifies_a_normal_channel() {
+        use std::sync::atomic::Ordering;
+
+        let id = Uuid::new_v4();
+        let response = channel_metadata_response(id, &[["name", "buzz-dev"], ["t", "stream"]]);
+        let (resolver, requests, server) = counting_resolver(response).await;
+
+        let (is_dm, title_channel) = resolve_new_session_channel_context(&resolver, id).await;
+        assert!(!is_dm, "a stream channel is not a DM");
+        assert_eq!(title_channel.as_deref(), Some("buzz-dev"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        let (_, again) = resolve_new_session_channel_context(&resolver, id).await;
+        assert_eq!(again.as_deref(), Some("buzz-dev"));
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "a resolved channel is cached — no second lookup"
+        );
+        server.abort();
+    }
+
+    /// A DM carries no useful name, so it gets the bare agent title (and no
+    /// canvas section).
+    #[tokio::test]
+    async fn test_new_session_channel_context_leaves_a_dm_unqualified() {
+        let id = Uuid::new_v4();
+        let response = channel_metadata_response(id, &[["name", "DM"], ["t", "dm"]]);
+        let (resolver, _requests, server) = counting_resolver(response).await;
+
+        let (is_dm, title_channel) = resolve_new_session_channel_context(&resolver, id).await;
+        assert!(is_dm);
+        assert_eq!(
+            title_channel, None,
+            "a DM name must never reach the session title"
+        );
+        server.abort();
+    }
+
+    /// The `"unknown"` placeholder `fetch_channel_info` substitutes for a
+    /// metadata event with no `name` tag is not a channel name: qualifying with
+    /// it would title every unnamed channel `Agent · #unknown`.
+    #[tokio::test]
+    async fn test_new_session_channel_context_treats_the_unknown_name_as_absent() {
+        let id = Uuid::new_v4();
+        let response = channel_metadata_response(id, &[["t", "stream"]]);
+        let (resolver, _requests, server) = counting_resolver(response).await;
+
+        let (is_dm, title_channel) = resolve_new_session_channel_context(&resolver, id).await;
+        assert!(!is_dm, "a nameless stream channel is still not a DM");
+        assert_eq!(
+            title_channel, None,
+            "the `unknown` placeholder must yield a bare title"
+        );
+        server.abort();
+    }
+
+    /// An unresolvable channel yields the bare title, fails closed as a DM, and
+    /// costs exactly ONE `fetch_channel_info` sequence — two attempts, because
+    /// `fetch_with_retry` retries once. `resolve()` caches only `Some`, so a
+    /// second resolve for the title would double this in front of `session/new`,
+    /// exactly when the relay is already degraded.
+    #[tokio::test]
+    async fn test_new_session_channel_context_attempts_an_unresolved_channel_once() {
+        use std::sync::atomic::Ordering;
+
+        let (resolver, requests, server) = counting_resolver(json!([])).await;
+
+        let (is_dm, title_channel) =
+            resolve_new_session_channel_context(&resolver, Uuid::new_v4()).await;
+        assert!(is_dm, "an undeterminable channel type must fail closed");
+        assert_eq!(title_channel, None, "unresolved channels get a bare title");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "one fetch_channel_info sequence (initial attempt + single retry)"
+        );
+        server.abort();
     }
 }

@@ -16,6 +16,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { RUNTIME_MARKS } from "./HarnessMarks.tsx";
 import { getHarnessLogoUrl, PRESET_LOGOS } from "./RuntimeIcon.tsx";
 
 const desktopRoot = path.resolve(
@@ -46,28 +47,19 @@ test("PRESET_HARNESSES parse found the preset ids", () => {
   );
 });
 
-const FALLBACK_ONLY_PRESETS = new Set([
-  // Cursor publishes official assets, but neither its brand page nor terms grant
-  // third parties permission to redistribute them. Keep the generic icon.
-  "cursor",
-]);
-
 for (const id of presetIds) {
-  test(`preset "${id}" has a bundled logo or an approved fallback`, () => {
-    const logoPath = PRESET_LOGOS[id];
-    if (FALLBACK_ONLY_PRESETS.has(id)) {
-      assert.equal(
-        logoPath,
-        undefined,
-        `preset "${id}" must keep the generic TerminalSquare fallback until ` +
-          "its vendor grants logo redistribution permission",
-      );
+  test(`preset "${id}" has a bundled logo or inline mark`, () => {
+    // Inline SVG marks (RUNTIME_MARKS) take precedence over bitmap logos —
+    // e.g. Cursor's mark ships as an inline CC0 simple-icons path, not a
+    // file under desktop/public.
+    if (RUNTIME_MARKS[id]) {
       return;
     }
+    const logoPath = PRESET_LOGOS[id];
     assert.ok(
       logoPath,
-      `preset "${id}" has no PRESET_LOGOS entry — it renders the generic ` +
-        `TerminalSquare fallback. Add desktop/public${logoPath ?? `/harness-logos/${id}.png`} ` +
+      `preset "${id}" has no RUNTIME_MARKS or PRESET_LOGOS entry — it renders ` +
+        `the generic TerminalSquare fallback. Add desktop/public${logoPath ?? `/harness-logos/${id}.png`} ` +
         `and map it in RuntimeIcon.tsx.`,
     );
     assert.ok(
@@ -111,15 +103,55 @@ test("an exact id still wins", () => {
 });
 
 test("a variant of an unmapped base earns no logo", () => {
-  // `buzz-agent` renders the BuzzMark (base `buzz` is unmapped), and `cursor`
-  // is deliberately unmapped — neither may be shortened into a logo it did not
-  // earn. A leading hyphen has no base at all.
+  // `buzz-agent` renders the BuzzMark (base `buzz` is unmapped), so it may not
+  // be shortened into artwork it did not earn. A leading hyphen has no base.
   assert.equal(getHarnessLogoUrl("buzz-agent"), null);
-  assert.equal(getHarnessLogoUrl("cursor-nightly"), null);
   assert.equal(getHarnessLogoUrl("totally-unknown"), null);
   assert.equal(getHarnessLogoUrl("-hermes"), null);
 });
 
 test("only the FIRST hyphen splits, so a deep variant still resolves its base", () => {
   assert.equal(getHarnessLogoUrl("hermes-team-matt"), PRESET_LOGOS.hermes);
+});
+
+test("a mark-backed base has no logo url, at the exact id and at a variant", () => {
+  // Goose and Cursor ship inline SVG marks rather than bitmaps, so the url
+  // lookup is empty for both spellings. The variant must not fall *through* a
+  // mark-backed base to the terminal glyph, though — that is the half this
+  // lookup cannot observe, so `RUNTIME_MARKS` is asserted directly.
+  for (const id of ["goose", "cursor"]) {
+    assert.ok(
+      RUNTIME_MARKS[id],
+      `${id} must keep its inline mark — a variant inherits it`,
+    );
+    assert.equal(getHarnessLogoUrl(id), null, `${id} has no bitmap logo`);
+    assert.equal(getHarnessLogoUrl(`${id}-nightly`), null);
+  }
+});
+
+test("an id naming an Object.prototype member earns no artwork", () => {
+  // Harness ids are catalog data — a remote host names its own entries — so a
+  // bare `TABLE[id]` would resolve `constructor` to Object itself. In
+  // RuntimeIcon that lands in the `Mark` slot and `<Mark />` throws, taking the
+  // settings panel down with it. Every lookup is own-property only.
+  for (const id of ["constructor", "__proto__", "toString", "valueOf"]) {
+    assert.equal(getHarnessLogoUrl(id), null, `${id} must not resolve artwork`);
+    assert.equal(getHarnessLogoUrl(`${id}-variant`), null);
+  }
+});
+
+test("codex ships no bundled mark or logo (vendor-removed OpenAI blossom)", () => {
+  // The OpenAI blossom was removed from simple-icons v16 at the vendor's
+  // request — Codex must render RuntimeIcon's neutral terminal-glyph
+  // fallback, not a re-bundled copy of the withdrawn mark.
+  assert.equal(
+    RUNTIME_MARKS.codex,
+    undefined,
+    "codex has a RUNTIME_MARKS entry — the OpenAI blossom must not ship without explicit approval",
+  );
+  assert.equal(
+    PRESET_LOGOS.codex,
+    undefined,
+    "codex has a PRESET_LOGOS entry — no bundled Codex logo is approved",
+  );
 });

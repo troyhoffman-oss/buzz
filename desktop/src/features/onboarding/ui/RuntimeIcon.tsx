@@ -3,17 +3,15 @@ import { TerminalSquare } from "lucide-react";
 
 import type { AcpRuntimeCatalogEntry } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
-import { useTheme } from "@/shared/theme/ThemeProvider";
 import { BuzzMark } from "@/shared/ui/buzz-logo/BuzzMark";
-import chatgptLogoUrl from "../assets/harness-logos/chatgpt.png?inline";
 import claudeLogoUrl from "../assets/harness-logos/claude.png?inline";
-import gooseLogoUrl from "../assets/harness-logos/goose.png?inline";
+import { RUNTIME_MARKS } from "./HarnessMarks";
 
 // Bundled logos for compiled-in runtimes (inline base64, no network fetch).
+// Monochrome marks live in RUNTIME_MARKS instead — inline SVGs that follow
+// `currentColor`, so they adapt to dark/light without bitmap filters.
 const RUNTIME_LOGOS: Record<string, string> = {
   claude: claudeLogoUrl,
-  codex: chatgptLogoUrl,
-  goose: gooseLogoUrl,
 };
 
 // Public-path logos for bundled presets. Served from /harness-logos/ at runtime.
@@ -38,39 +36,70 @@ export function getRuntimeDisplayLabel(
   return isBuzzRuntime(runtime) ? "Buzz" : runtime.label;
 }
 
+// Harness ids are catalog data — a remote host names its own entries — so every
+// lookup below is own-property only. A bare index would resolve `constructor`
+// or `__proto__` to an inherited Object member: `RUNTIME_MARKS.constructor` is
+// truthy, and rendering it as `<Mark />` throws.
+function ownLookup<T>(table: Record<string, T>, id: string): T | undefined {
+  return Object.hasOwn(table, id) ? table[id] : undefined;
+}
+
+/** The inline mark for a harness id, if it ships one. */
+function harnessMark(id: string) {
+  return ownLookup(RUNTIME_MARKS, id);
+}
+
+/** The bitmap logo url for a harness id, if it ships one. */
+function harnessLogoUrl(id: string): string | null {
+  return ownLookup(RUNTIME_LOGOS, id) ?? ownLookup(PRESET_LOGOS, id) ?? null;
+}
+
+/** Whether `id` names artwork of any kind — an inline mark or a bitmap logo. */
+function hasHarnessArtwork(id: string): boolean {
+  return Boolean(harnessMark(id)) || harnessLogoUrl(id) !== null;
+}
+
 /**
- * The logo for a harness id, and the id that logo BELONGS to.
+ * The id whose artwork a harness id should render.
  *
  * A remote catalog advertises one entry per identity on the host — `hermes-matt`
  * beside `hermes` — and an exact-id lookup renders every one of them as the
  * generic TerminalSquare next to the plain entry's real mark. So a full id that
  * maps nothing falls back to its base: the text before the FIRST hyphen, and
  * only when that base is itself a mapped id, so `buzz-agent` (base `buzz`,
- * unmapped) is untouched and no id can be shortened into a logo it did not earn.
+ * unmapped) is untouched and no id can be shortened into artwork it did not
+ * earn.
  *
- * The resolved id is returned alongside the url because the per-logo backdrop
- * classes below belong to the logo, not to the entry: a variant that borrows
- * `omp`'s white-on-black mark needs `omp`'s dark plate with it.
+ * Marks and logos are consulted together on purpose. They are two spellings of
+ * the same thing — Goose and Cursor ship inline SVG marks, Hermes and Grok ship
+ * bitmaps — so resolving against only one of them would give `hermes-matt` its
+ * base's artwork while leaving `goose-nightly` on the terminal glyph.
+ *
+ * The resolved id is what the caller keys everything off, because the per-logo
+ * backdrop classes below belong to the artwork, not to the entry: a variant
+ * that borrows `omp`'s white-on-black mark needs `omp`'s dark plate with it.
  *
  * Deliberately generic: nothing here knows what a Hermes profile is. Any
- * `<known>-<variant>` id gets the known harness's mark.
+ * `<known>-<variant>` id gets the known harness's artwork.
  */
-function resolveHarnessLogo(
-  harnessId: string,
-): { id: string; url: string } | null {
+function resolveHarnessArtworkId(harnessId: string): string {
   const id = harnessId.trim().toLowerCase();
-  const exact = RUNTIME_LOGOS[id] ?? PRESET_LOGOS[id];
-  if (exact) return { id, url: exact };
+  if (hasHarnessArtwork(id)) return id;
   const separator = id.indexOf("-");
-  if (separator <= 0) return null;
+  if (separator <= 0) return id;
   const base = id.slice(0, separator);
-  const inherited = RUNTIME_LOGOS[base] ?? PRESET_LOGOS[base];
-  return inherited ? { id: base, url: inherited } : null;
+  return hasHarnessArtwork(base) ? base : id;
 }
 
-/** The logo url for a harness id. See `resolveHarnessLogo`. */
+/**
+ * The bundled logo url for a harness id, or `null`.
+ *
+ * `null` covers both "no artwork at all" and "artwork is an inline mark, which
+ * has no url" — callers that need a url (pinned-harness chips) fall back to
+ * their own glyph either way.
+ */
 export function getHarnessLogoUrl(harnessId: string): string | null {
-  return resolveHarnessLogo(harnessId)?.url ?? null;
+  return harnessLogoUrl(resolveHarnessArtworkId(harnessId));
 }
 
 export function RuntimeIcon({
@@ -81,19 +110,23 @@ export function RuntimeIcon({
   runtime: AcpRuntimeCatalogEntry;
 }) {
   const [imageFailed, setImageFailed] = React.useState(false);
-  const { isDark } = useTheme();
-  // Only use bundled logo maps — never render user-supplied avatar URLs for
+  // Only use bundled artwork — never render user-supplied avatar URLs for
   // custom/preset entries (tracking pixel / spoofing vector, security line).
-  const logo = resolveHarnessLogo(runtime.id);
-  // The id the LOGO belongs to, so a variant entry gets its base's backdrop.
-  // With no logo there is nothing to plate, and the id itself is what decides
-  // the monochrome fallback treatment.
-  const id = logo?.id ?? runtime.id.trim().toLowerCase();
-  const imageUrl = logo?.url ?? null;
-  const shouldForceForegroundColor = !imageUrl && id === "goose";
+  //
+  // The id the ARTWORK belongs to, so a variant entry (`hermes-matt`,
+  // `goose-nightly`) gets its base's mark or logo — and its backdrop with it.
+  const id = resolveHarnessArtworkId(runtime.id);
+  const Mark = harnessMark(id);
+  const imageUrl = harnessLogoUrl(id);
 
   if (isBuzzRuntime(runtime)) {
-    return <BuzzMark className="h-7 w-10 text-foreground" />;
+    // The mark's wide viewBox letterboxes inside a square box, so honoring
+    // the caller's size keeps it optically in line with the square logos.
+    return <BuzzMark className={cn(className, "text-foreground")} />;
+  }
+
+  if (Mark) {
+    return <Mark className={cn(className, "p-0.5 text-foreground")} />;
   }
 
   if (imageUrl && !imageFailed) {
@@ -105,8 +138,6 @@ export function RuntimeIcon({
           className,
           id === "omp" && "bg-[#0d0d0d] p-1",
           id === "grok" && "bg-white p-1",
-          shouldForceForegroundColor &&
-            (isDark ? "brightness-0 invert" : "brightness-0"),
         )}
         onError={() => setImageFailed(true)}
         src={imageUrl}

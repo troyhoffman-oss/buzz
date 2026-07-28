@@ -149,6 +149,13 @@ type E2eConfig = {
       name?: string;
       expiresAt: string;
     } | null;
+    /** Optional policy returned by the native join-policy discovery command. */
+    joinPolicy?: {
+      terms_markdown?: string;
+      privacy_markdown?: string;
+      age_attestation_required: boolean;
+      version: string;
+    } | null;
     /** Delay Builderlab login completion so cancellation/retry UI can be tested. */
     builderlabLoginDelayMs?: number;
     /** Bound Builderlab Nostr identity. Null/omitted = not linked yet. */
@@ -187,6 +194,8 @@ type E2eConfig = {
     connectAcpRuntimeResult?: RawConnectAcpRuntimeResult;
     connectAcpRuntimeDelayMs?: number;
     connectAcpRuntimeError?: string;
+    /** Catalog returned after a successful mocked connect (sign-in). */
+    acpRuntimesCatalogAfterConnect?: RawAcpRuntimeCatalogEntry[];
     activePersonaIds?: string[];
     installAcpRuntimeDelayMs?: number;
     installAcpRuntimeResult?: RawInstallRuntimeResult;
@@ -1013,7 +1022,9 @@ declare global {
     }) => RelayEvent[];
     __BUZZ_E2E_EMIT_MOCK_TYPING__?: (input: {
       channelName: string;
+      createdAt?: number;
       pubkey?: string;
+      threadHeadId?: string;
     }) => RelayEvent;
     __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: (
       command: string,
@@ -4021,13 +4032,21 @@ function emitMockChannelMessage(
   return event;
 }
 
-function emitMockTypingIndicator(channelId: string, pubkey: string) {
+function emitMockTypingIndicator(
+  channelId: string,
+  pubkey: string,
+  threadHeadId?: string,
+  createdAt?: number,
+) {
   const event: RelayEvent = {
     id: crypto.randomUUID().replace(/-/g, ""),
     pubkey,
-    created_at: Math.floor(Date.now() / 1000),
+    created_at: createdAt ?? Math.floor(Date.now() / 1000),
     kind: 20002,
-    tags: [["h", channelId]],
+    tags: [
+      ["h", channelId],
+      ...(threadHeadId ? [["e", threadHeadId, "", "reply"]] : []),
+    ],
     content: "",
     sig: "mocksig".repeat(20).slice(0, 128),
   };
@@ -6823,7 +6842,24 @@ async function handleGetFeed(
   // For e2e, return a minimal feed structure with mentions.
   const limit = args.limit ?? 50;
   const mentionEvents = await relayQuery(config, [
-    { kinds: [9, 40002, 45001, 45003], "#p": [identity.pubkey], limit },
+    {
+      kinds: [
+        9,
+        40002,
+        1,
+        45001,
+        45003,
+        KIND_GIT_PULL_REQUEST,
+        KIND_GIT_PR_UPDATE,
+        KIND_GIT_ISSUE,
+        KIND_GIT_STATUS_OPEN,
+        KIND_GIT_STATUS_MERGED,
+        KIND_GIT_STATUS_CLOSED,
+        KIND_GIT_STATUS_DRAFT,
+      ],
+      "#p": [identity.pubkey],
+      limit,
+    },
   ]);
 
   // Look up channel names for feed items
@@ -6943,6 +6979,7 @@ function withMockRuntimeConfigMetadata(
 
 let runtimeCatalogDiscoveryCount = 0;
 let mockInstallCompleted = false;
+let mockConnectCompleted = false;
 
 async function handleDiscoverAcpRuntimes(
   config: E2eConfig | undefined,
@@ -6967,6 +7004,10 @@ async function handleDiscoverAcpRuntimes(
   const afterInstall = config?.mock?.acpRuntimesCatalogAfterInstall;
   if (mockInstallCompleted && afterInstall) {
     return afterInstall.map(withMockRuntimeConfigMetadata);
+  }
+  const afterConnect = config?.mock?.acpRuntimesCatalogAfterConnect;
+  if (mockConnectCompleted && afterConnect) {
+    return afterConnect.map(withMockRuntimeConfigMetadata);
   }
   const sequence = config?.mock?.acpRuntimesCatalogSequence;
   if (sequence && sequence.length > 0) {
@@ -7097,6 +7138,7 @@ async function handleConnectAcpRuntime(
   if (delayMs > 0) {
     await new Promise((resolve) => window.setTimeout(resolve, delayMs));
   }
+  mockConnectCompleted = true;
   return config?.mock?.connectAcpRuntimeResult ?? { launched: true };
 }
 
@@ -7968,10 +8010,60 @@ async function handleUpdateManagedAgent(args: {
   return { agent: cloneManagedAgent(agent), profile_sync_error: null };
 }
 
+/**
+ * Mock-mode `search_messages` predicate, mirroring the relay's filter contract.
+ *
+ * `since`/`until` are NIP-01 bounds and both inclusive — the relay keeps events
+ * where `since <= created_at <= until` (`crates/buzz-core/src/filter.rs`). The
+ * `before:` operator's exclusivity is encoded upstream in
+ * `parseSearchOperators`, which subtracts a second; the mock must not subtract
+ * it a second time.
+ *
+ * Exported so the boundary behavior is unit-testable without a browser.
+ */
+export function mockSearchHitMatches(
+  hit: Pick<
+    RawSearchHit,
+    "channel_id" | "pubkey" | "created_at" | "content" | "channel_name"
+  >,
+  filters: {
+    /** Lowercased FTS query; empty matches everything. */
+    query: string;
+    channelId?: string;
+    authorSet: Set<string> | null;
+    since?: number;
+    until?: number;
+  },
+): boolean {
+  if (filters.channelId && hit.channel_id !== filters.channelId) {
+    return false;
+  }
+  if (filters.authorSet && !filters.authorSet.has(hit.pubkey.toLowerCase())) {
+    return false;
+  }
+  if (filters.since != null && hit.created_at < filters.since) {
+    return false;
+  }
+  if (filters.until != null && hit.created_at > filters.until) {
+    return false;
+  }
+  if (!filters.query) {
+    return true;
+  }
+  return (
+    hit.content.toLowerCase().includes(filters.query) ||
+    (hit.channel_name?.toLowerCase().includes(filters.query) ?? false)
+  );
+}
+
 async function handleSearchMessages(
   args: {
     q: string;
     limit?: number;
+    channelId?: string;
+    authors?: string[];
+    since?: number;
+    until?: number;
   },
   config: E2eConfig | undefined,
 ): Promise<RawSearchResponse> {
@@ -8054,17 +8146,20 @@ async function handleSearchMessages(
       }
     }
 
-    const hits = mockHits
-      .filter((hit) => {
-        if (!query) {
-          return true;
-        }
+    const authorSet = args.authors?.length
+      ? new Set(args.authors.map((author) => author.toLowerCase()))
+      : null;
 
-        return (
-          hit.content.toLowerCase().includes(query) ||
-          (hit.channel_name?.toLowerCase().includes(query) ?? false)
-        );
-      })
+    const hits = mockHits
+      .filter((hit) =>
+        mockSearchHitMatches(hit, {
+          query,
+          channelId: args.channelId,
+          authorSet,
+          since: args.since,
+          until: args.until,
+        }),
+      )
       .slice(0, limit);
 
     return {
@@ -8073,11 +8168,26 @@ async function handleSearchMessages(
     };
   }
 
-  // NIP-50 search via POST /query
+  // NIP-50 search via POST /query — forward operator pushdown fields.
   const limit = args.limit ?? 20;
-  const events = await relayQuery(config, [
-    { kinds: [9, 40002], search: args.q, limit },
-  ]);
+  const filter: Record<string, unknown> = {
+    kinds: [9, 40002, 45001, 45003],
+    search: args.q,
+    limit,
+  };
+  if (args.channelId) {
+    filter["#h"] = [args.channelId];
+  }
+  if (args.authors?.length) {
+    filter.authors = args.authors;
+  }
+  if (args.since != null) {
+    filter.since = args.since;
+  }
+  if (args.until != null) {
+    filter.until = args.until;
+  }
+  const events = await relayQuery(config, [filter]);
   const hits = events.map((ev) => ({
     event_id: ev.id ?? "",
     pubkey: ev.pubkey ?? "",
@@ -9086,7 +9196,12 @@ export function maybeInstallE2eTauriMocks() {
     );
   };
   window.__BUZZ_E2E_PREPEND_MOCK_HISTORY__ = prependMockHistory;
-  window.__BUZZ_E2E_EMIT_MOCK_TYPING__ = ({ channelName, pubkey }) => {
+  window.__BUZZ_E2E_EMIT_MOCK_TYPING__ = ({
+    channelName,
+    createdAt,
+    pubkey,
+    threadHeadId,
+  }) => {
     const channel = mockChannels.find(
       (candidate) => candidate.name === channelName,
     );
@@ -9094,7 +9209,12 @@ export function maybeInstallE2eTauriMocks() {
       throw new Error(`Mock channel ${channelName} not found.`);
     }
 
-    return emitMockTypingIndicator(channel.id, pubkey ?? CHARLIE_PUBKEY);
+    return emitMockTypingIndicator(
+      channel.id,
+      pubkey ?? CHARLIE_PUBKEY,
+      threadHeadId,
+      createdAt,
+    );
   };
   window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__ = ({ channelName, kind }) => {
     const channel = mockChannels.find(
@@ -9493,6 +9613,8 @@ export function maybeInstallE2eTauriMocks() {
         // seeded empty/default path as valid so Add Community can continue to
         // relay-policy discovery.
         return;
+      case "fetch_join_policy":
+        return activeConfig?.mock?.joinPolicy ?? null;
       case "apply_workspace": {
         const applyDelayMs = activeConfig?.mock?.applyCommunityDelayMs ?? 0;
         if (applyDelayMs > 0) {
