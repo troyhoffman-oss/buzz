@@ -2187,6 +2187,39 @@ impl ElicitationField {
             .iter()
             .find(|o| o.value.eq_ignore_ascii_case(token) || o.title.eq_ignore_ascii_case(token))
     }
+
+    /// Whether an answer naming no option still reaches the agent — the single
+    /// source of truth behind the `ask` tag's `allowFreeText`, and therefore
+    /// behind the card's "answer in your own words" box.
+    ///
+    /// This mirrors what [`answer_elicitation_field`] actually does rather than
+    /// what the schema declares. Adapters (codex, claude) routinely send a bare
+    /// single-select — an `enum`/`oneOf` with no `<name>_custom` sibling — and
+    /// the harness has always accepted free text for it: `select` returns
+    /// `None` for a reply matching no option, so the reply falls through to
+    /// [`coerce_elicitation_answer`] and the agent receives the owner's words
+    /// verbatim under the field's own key. [`render_elicitation_field`] has
+    /// always advertised exactly that ("Reply with the number, your own answer,
+    /// or `!skip`"); only the card withheld the box, so the owner's one
+    /// affordance for "none of these" was to ignore the card and type into the
+    /// thread.
+    ///
+    /// Multi-select is the one shape left alone. A free-text reply to an array
+    /// field is split on `,` by [`coerce_elicitation_answer`] into whatever
+    /// tokens it contains, so the agent gets a list of arbitrary strings where
+    /// it asked for a list of enum members — a worse answer than the numbered
+    /// body already collects. It stays opt-in via a `<name>_custom` sibling.
+    fn accepts_free_text(&self) -> bool {
+        // No options at all: free text is the only possible answer.
+        if self.options.is_empty() {
+            return true;
+        }
+        // A paired `<name>_custom` sibling is the adapter asking for one.
+        if self.custom.is_some() {
+            return true;
+        }
+        self.ty != "array"
+    }
 }
 
 /// An `elicitation/create` request parked awaiting owner replies.
@@ -2303,9 +2336,10 @@ fn elicitation_ask_tag(
             })
             .collect::<Vec<_>>(),
         "multiSelect": field.ty == "array",
-        // A field with no options is free-text only; a paired `<name>_custom`
-        // sibling means an answer naming no option is still accepted.
-        "allowFreeText": field.options.is_empty() || field.custom.is_some(),
+        // Whether the answer path accepts words that name no option — see
+        // `ElicitationField::accepts_free_text`, which is deliberately wider
+        // than the schema: a bare single-select has always taken free text.
+        "allowFreeText": field.accepts_free_text(),
         "index": index,
         "total": total,
     });
@@ -4444,6 +4478,132 @@ mod tests {
                 .is_some(),
             "every label the card offers must resolve back to an option"
         );
+    }
+
+    /// Build the `ask` tag payload for the sole field of a one-field form.
+    fn ask_payload(properties: serde_json::Value) -> serde_json::Value {
+        let params = serde_json::json!({
+            "mode": "form",
+            "sessionId": "sess-test",
+            "message": "Which database?",
+            "requestedSchema": {"type": "object", "properties": properties},
+        });
+        let fields = parse_elicitation_fields(&params).expect("form must parse");
+        let tag = elicitation_ask_tag(&fields[0], 0, 1).expect("a small form fits the tag");
+        serde_json::from_str(&tag[1]).expect("the tag value is JSON")
+    }
+
+    #[test]
+    fn elicitation_bare_single_select_advertises_free_text() {
+        // The common codex/claude shape: an enum with no `_custom` sibling.
+        // The answer path has always accepted words that name no option, so
+        // the card must offer the box rather than forcing the owner out of it.
+        let payload = ask_payload(serde_json::json!({
+            "question_0": {"type": "string", "enum": ["Postgres", "SQLite"]},
+        }));
+        assert_eq!(payload["multiSelect"], false);
+        assert_eq!(
+            payload["allowFreeText"], true,
+            "a bare single-select accepts free text: `select` misses and the \
+             reply falls through to `coerce_elicitation_answer`"
+        );
+
+        // Same for the titled `oneOf` spelling of a bare single-select.
+        let titled = ask_payload(serde_json::json!({
+            "question_0": {
+                "type": "string",
+                "oneOf": [
+                    {"const": "Postgres", "title": "Postgres"},
+                    {"const": "SQLite", "title": "SQLite"},
+                ],
+            },
+        }));
+        assert_eq!(titled["allowFreeText"], true);
+    }
+
+    #[test]
+    fn elicitation_free_text_answer_to_a_bare_single_select_reaches_the_agent() {
+        // The round trip the synthesized flag promises: the owner types words
+        // naming no option, and the agent receives them under the field's own
+        // key rather than losing them.
+        let params = serde_json::json!({
+            "mode": "form",
+            "sessionId": "sess-test",
+            "message": "Which database?",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "question_0": {"type": "string", "enum": ["Postgres", "SQLite"]},
+                },
+            },
+        });
+        let fields = parse_elicitation_fields(&params).expect("form must parse");
+        assert!(fields[0].custom.is_none(), "no free-text sibling exists");
+        assert_eq!(
+            answer(&fields, "DuckDB, but only if it embeds"),
+            serde_json::json!({"question_0": "DuckDB, but only if it embeds"}),
+            "free text lands verbatim under the field's own key"
+        );
+        // The option path is untouched by the wider flag.
+        assert_eq!(
+            answer(&fields, "2"),
+            serde_json::json!({"question_0": "SQLite"})
+        );
+    }
+
+    #[test]
+    fn elicitation_paired_custom_sibling_keeps_its_existing_behavior() {
+        let payload = ask_payload(serde_json::json!({
+            "question_0": {"type": "string", "enum": ["Postgres", "SQLite"]},
+            "question_0_custom": {"type": "string", "title": "Other"},
+        }));
+        assert_eq!(payload["allowFreeText"], true);
+        assert_eq!(
+            answer(&ask_fields(), "DuckDB"),
+            serde_json::json!({"question_0_custom": "DuckDB"}),
+            "a paired sibling still receives the free-text answer"
+        );
+    }
+
+    #[test]
+    fn elicitation_multi_select_does_not_synthesize_free_text() {
+        // A free-text reply to an array field is comma-split into arbitrary
+        // strings where the agent asked for enum members — worse than the
+        // numbered body already collects, so multi-select stays opt-in.
+        let payload = ask_payload(serde_json::json!({
+            "question_0": {
+                "type": "array",
+                "items": {"enum": ["Rust", "Go", "Zig"]},
+            },
+        }));
+        assert_eq!(payload["multiSelect"], true);
+        assert_eq!(payload["allowFreeText"], false);
+
+        // …unless the adapter pairs one explicitly.
+        let paired = ask_payload(serde_json::json!({
+            "question_0": {
+                "type": "array",
+                "items": {"enum": ["Rust", "Go", "Zig"]},
+            },
+            "question_0_custom": {"type": "string", "title": "Other"},
+        }));
+        assert_eq!(paired["multiSelect"], true);
+        assert_eq!(paired["allowFreeText"], true);
+    }
+
+    #[test]
+    fn elicitation_optionless_fields_still_advertise_free_text() {
+        // Unchanged shapes: a field with no options is free-text only whatever
+        // its type says.
+        for ty in ["string", "boolean", "integer", "number"] {
+            let payload = ask_payload(serde_json::json!({
+                "question_0": {"type": ty},
+            }));
+            assert_eq!(
+                payload["allowFreeText"], true,
+                "an optionless {ty} field is answerable only as free text"
+            );
+        }
     }
 
     #[test]

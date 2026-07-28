@@ -1,4 +1,4 @@
-import { useEffect, useEffectEvent } from "react";
+import { useCallback, useEffect, useEffectEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
@@ -26,7 +26,9 @@ import {
 
 export { mergeMessages, mergeTimelineCacheMessages };
 import { splitOutgoingTags } from "@/features/messages/lib/imetaMediaMarkdown";
+import { agentReplyMentionPubkeys } from "@/features/messages/lib/agentReplyMention";
 import { messageMentionPubkeys } from "@/features/messages/lib/messageMentionPubkeys";
+import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
 import {
   clearTimeoutState,
   recordTimeoutFromRejection,
@@ -397,11 +399,69 @@ export function useChannelSubscription(channel: Channel | null) {
   }, [channelId, channelType]);
 }
 
+/**
+ * Look one event up across the caches a channel's messages live in, without
+ * touching the network: the projected timeline first, then every open thread
+ * subtree (a nested reply exists only in its `thread-replies` cache until the
+ * window is refetched).
+ *
+ * Used on the send path, where a miss must cost nothing — callers treat
+ * `undefined` as "no extra information", never as a reason to fetch.
+ */
+function findCachedChannelEvent(
+  queryClient: ReturnType<typeof useQueryClient>,
+  channelId: string,
+  eventId: string,
+): RelayEvent | undefined {
+  const timeline =
+    queryClient.getQueryData<RelayEvent[]>(channelMessagesKey(channelId)) ?? [];
+  const fromTimeline = timeline.find((event) => event.id === eventId);
+  if (fromTimeline) return fromTimeline;
+
+  for (const [, replies] of queryClient.getQueriesData<RelayEvent[]>({
+    queryKey: ["thread-replies", channelId],
+  })) {
+    const match = replies?.find((event) => event.id === eventId);
+    if (match) return match;
+  }
+  return undefined;
+}
+
 export function useSendMessageMutation(
   channel: Channel | null,
   identity: Identity | undefined,
 ) {
   const queryClient = useQueryClient();
+  // Content-stable per `useKnownAgentPubkeys` — re-identifies only when agent
+  // membership actually changes. Empty outside the provider, which degrades to
+  // today's behaviour rather than mis-tagging.
+  const knownAgentPubkeys = useKnownAgentPubkeys();
+
+  /**
+   * The full mention set for one send: what the composer resolved, plus the
+   * agent a typed thread reply is answering.
+   *
+   * `mutationFn` and `onMutate` must agree on this — the optimistic row's `p`
+   * tags are what the timeline renders until the accepted event replaces it,
+   * so a divergence here would show the owner tags the relay never received.
+   * See `agentReplyMentionPubkeys`: the harness delivers only `#p`-matched
+   * events, so a reply missing that tag hangs the agent's question forever.
+   */
+  const resolveSendMentions = useCallback(
+    (
+      channelId: string,
+      mentionPubkeys: string[] | undefined,
+      parentEventId: string | null | undefined,
+    ) => [
+      ...(mentionPubkeys ?? []),
+      ...agentReplyMentionPubkeys(
+        (eventId) => findCachedChannelEvent(queryClient, channelId, eventId),
+        parentEventId,
+        (pubkey) => knownAgentPubkeys.has(pubkey),
+      ),
+    ],
+    [knownAgentPubkeys, queryClient],
+  );
 
   return useMutation<
     RelayEvent,
@@ -462,7 +522,7 @@ export function useSendMessageMutation(
       const recipientPubkeys = messageMentionPubkeys(
         effectiveChannel,
         identity.pubkey,
-        mentionPubkeys,
+        resolveSendMentions(effectiveChannel.id, mentionPubkeys, parentEventId),
       );
 
       // Messages carrying media OR custom-emoji tags MUST go through REST so
@@ -571,7 +631,7 @@ export function useSendMessageMutation(
         content.trim(),
         identity,
         previousMessages,
-        mentionPubkeys ?? [],
+        resolveSendMentions(effectiveChannel.id, mentionPubkeys, parentEventId),
         parentEventId ?? null,
         mediaTags ?? [],
       );
