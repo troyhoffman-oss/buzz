@@ -272,6 +272,20 @@ with a TypeScript lookup table or an id comparison in a component.
       maps are the only permitted route). Do not add a host-supplied image
       path, and do not move the derivation to deploy time: the fleet already
       exists, and records minted before this carry an empty avatar forever.
+    - **Editing routes by the same question.** A provider record is edited in
+      the INSTANCE dialog, never the definition one. `AgentDefinition` has no
+      slot for `backend` or `agent_command` (`to_definition_view` drops both by
+      design), so the definition dialog can only show a remote record's harness
+      as blank — and then fill that blank from this computer's catalog, which
+      arms a provider requirement and an API-key demand for a machine the agent
+      never runs on. Both doors ask `providerRecordHarness`:
+      `profileEditAgentTarget` for the profile panel's Edit action and
+      `agentManagementUpdateTarget` for the owner-reviewed `!model` draft.
+      `createRuntimeSeedAction`'s `editsProviderRecord` is the backstop; the
+      blank runtime is deliberate, not an absence to fill. Do NOT widen
+      `AgentDefinition` to carry these fields instead: `into_agent_record`
+      silently reverts non-default `backend`/`agent_command`, turning a display
+      bug into data loss.
 
     The pin is editable only where it was made — at create/deploy.
     `personaManagedAgentUpdate` must NOT write a locally-discovered runtime's
@@ -314,6 +328,18 @@ with a TypeScript lookup table or an id comparison in a component.
   Also that an unknown host binary shows itself rather than a local guess — if
   a remote card starts naming a harness the host does not run, this is the test
   that should have caught it.
+- `../profile/ui/profileEditAgentTarget.test.mjs` and
+  `agentManagementUpdateTarget.test.mjs` — rule 19's editing route, once per
+  door. Both pin the same pair: a provider-backed record selects the instance
+  editor even though it has a personaId (every provider create does), and a
+  local persona-backed one still selects the definition editor. If a remote
+  agent's Edit starts demanding an API key again, these are the tests that
+  should have caught it. `tests/e2e/edit-agent-provider-routing.spec.ts` covers
+  the same route end to end.
+- `ui/createRuntimeGate.test.mjs` — the harness auto-seed, including the
+  edit-mode `editsProviderRecord` guard. Its create-mode sibling asks
+  `runsRemotely`, which is false in edit mode, so a remote record's blank
+  runtime was being filled with the local default.
 - `lib/agentAvatarUrl.test.mjs` — rule 19's precedence chain. A human's choice
   beats the agent's own published avatar beats the record's stamp beats the
   harness mark; a LOCAL record never reaches the harness step, so its rendering
