@@ -1371,7 +1371,7 @@ impl Drop for RespawnGuard {
 fn durable_session_store(agents: u32, pubkey_hex: &str) -> Option<SessionStore> {
     if agents > 1 {
         tracing::info!(
-            target: "pool::session",
+            target: "buzz_acp::pool::session",
             agents,
             "durable session resume disabled — sessions are per-agent-process with --agents > 1"
         );
@@ -1380,7 +1380,7 @@ fn durable_session_store(agents: u32, pubkey_hex: &str) -> Option<SessionStore> 
     let store = SessionStore::for_agent(pubkey_hex);
     if store.is_none() {
         tracing::warn!(
-            target: "pool::session",
+            target: "buzz_acp::pool::session",
             "no platform data directory — sessions will not survive a restart"
         );
     }
@@ -1729,7 +1729,7 @@ async fn tokio_main() -> Result<()> {
 
     if !config.memory_enabled {
         tracing::info!(
-            target: "engram::core",
+            target: "buzz_acp::engram::core",
             "NIP-AE core memory injection disabled (re-enable by removing --no-memory / BUZZ_ACP_NO_MEMORY)"
         );
     }

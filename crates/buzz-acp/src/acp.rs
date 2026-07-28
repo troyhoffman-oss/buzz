@@ -564,7 +564,7 @@ impl AcpClient {
         // on ACP v2 ahead of the upstream ACP RFD. Revisit when that RFD merges.
         let params = build_initialize_params();
         let result = self.send_request("initialize", params).await?;
-        tracing::debug!(target: "acp::init", "initialize response: {result}");
+        tracing::debug!(target: "buzz_acp::acp::init", "initialize response: {result}");
         Ok(result)
     }
 
@@ -601,7 +601,7 @@ impl AcpClient {
             .as_str()
             .ok_or_else(|| AcpError::Protocol("session/new response missing sessionId".into()))?
             .to_owned();
-        tracing::info!(target: "acp::session", "session created: {session_id}");
+        tracing::info!(target: "buzz_acp::acp::session", "session created: {session_id}");
         Ok(SessionNewResponse {
             session_id,
             raw: result,
@@ -650,7 +650,7 @@ impl AcpClient {
             .as_str()
             .unwrap_or(session_id)
             .to_owned();
-        tracing::info!(target: "acp::session", "session resumed: {resumed}");
+        tracing::info!(target: "buzz_acp::acp::session", "session resumed: {resumed}");
         Ok(SessionNewResponse {
             session_id: resumed,
             raw: result,
@@ -671,7 +671,7 @@ impl AcpClient {
     pub async fn session_close(&mut self, session_id: &str) -> Result<(), AcpError> {
         let params = serde_json::json!({ "sessionId": session_id });
         self.send_request("session/close", params).await?;
-        tracing::debug!(target: "acp::session", "session closed: {session_id}");
+        tracing::debug!(target: "buzz_acp::acp::session", "session closed: {session_id}");
         Ok(())
     }
 
@@ -774,7 +774,7 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
+        tracing::debug!(target: "buzz_acp::acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
         if let Err(e) = self.write_ndjson(&msg).await {
             self.last_prompt_id = None;
             self.current_hard_deadline = None;
@@ -943,7 +943,7 @@ impl AcpClient {
             return Ok(());
         };
         tracing::warn!(
-            target: "acp::elicitation",
+            target: "buzz_acp::acp::elicitation",
             "publishing the question for elicitation id={} failed — cancelling it",
             pending.id
         );
@@ -1058,7 +1058,7 @@ impl AcpClient {
                 let response = permission_response_cancelled(&perm_id);
                 self.write_ndjson(&response).await?;
                 tracing::debug!(
-                    target: "acp::cancel",
+                    target: "buzz_acp::acp::cancel",
                     "responded cancelled to pending permission id={perm_id}"
                 );
             }
@@ -1073,14 +1073,14 @@ impl AcpClient {
             let response = elicitation_response(&pending.id, "cancel", None);
             self.write_ndjson(&response).await?;
             tracing::debug!(
-                target: "acp::cancel",
+                target: "buzz_acp::acp::cancel",
                 "cancelled pending elicitation id={}", pending.id
             );
         }
 
         // Step 2: send session/cancel notification (no id)
         self.session_cancel(session_id).await?;
-        tracing::info!(target: "acp::cancel", "sent session/cancel for {session_id}");
+        tracing::info!(target: "buzz_acp::acp::cancel", "sent session/cancel for {session_id}");
         // Use a fixed 30s idle timeout during cleanup — the cancel notification
         // needs time to propagate and the agent may go silent while winding down.
         // The separate hard_deadline bounds agents that keep producing output
@@ -1148,7 +1148,7 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
+        tracing::debug!(target: "buzz_acp::acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
 
         // Wrap write + read in a single timeout so a hung agent can't block forever.
         // We cannot use an async block that borrows `self` mutably across two awaits
@@ -1190,7 +1190,7 @@ impl AcpClient {
                 Err(_) | Ok(None) => break,
                 Ok(Some(Ok(_))) => {
                     // Consumed one buffered line; loop to drain more.
-                    tracing::debug!(target: "acp::wire", "drained stale buffered line");
+                    tracing::debug!(target: "buzz_acp::acp::wire", "drained stale buffered line");
                 }
                 Ok(Some(Err(_))) => break,
             }
@@ -1213,7 +1213,7 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ (notification) {}", &serde_json::to_string(&msg).unwrap_or_default());
+        tracing::debug!(target: "buzz_acp::acp::wire", "→ (notification) {}", &serde_json::to_string(&msg).unwrap_or_default());
         self.write_ndjson(&msg).await?;
         Ok(())
     }
@@ -1255,7 +1255,7 @@ impl AcpClient {
             }
 
             // Only log and reset idle after we have a valid non-empty line.
-            tracing::debug!(target: "acp::wire", "← {trimmed}");
+            tracing::debug!(target: "buzz_acp::acp::wire", "← {trimmed}");
 
             let msg: serde_json::Value = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
@@ -1268,7 +1268,7 @@ impl AcpClient {
                         }),
                     );
                     tracing::warn!(
-                        target: "acp::wire",
+                        target: "buzz_acp::acp::wire",
                         "failed to parse line as JSON: {e} — skipping"
                     );
                     continue;
@@ -1320,7 +1320,7 @@ impl AcpClient {
                             // agent process is dead and continuing would hang.
                             self.write_ndjson(&err_resp).await?;
                         }
-                        tracing::debug!(target: "acp::wire", "ignoring unknown method: {other}");
+                        tracing::debug!(target: "buzz_acp::acp::wire", "ignoring unknown method: {other}");
                     }
                 }
             }
@@ -1501,7 +1501,7 @@ impl AcpClient {
                                 "params": params,
                             });
                             tracing::debug!(
-                                target: "acp::wire",
+                                target: "buzz_acp::acp::wire",
                                 "→ {}",
                                 serde_json::to_string(&msg).unwrap_or_default()
                             );
@@ -1596,7 +1596,7 @@ impl AcpClient {
                         continue;
                     }
 
-                    tracing::debug!(target: "acp::wire", "← {trimmed}");
+                    tracing::debug!(target: "buzz_acp::acp::wire", "← {trimmed}");
 
                     let msg: serde_json::Value = match serde_json::from_str(trimmed) {
                         Ok(v) => v,
@@ -1609,7 +1609,7 @@ impl AcpClient {
                                 }),
                             );
                             tracing::warn!(
-                                target: "acp::wire",
+                                target: "buzz_acp::acp::wire",
                                 "failed to parse line as JSON: {e} — skipping"
                             );
                             continue;
@@ -1713,7 +1713,7 @@ impl AcpClient {
                                     // agent process is dead and continuing would hang.
                                     self.write_ndjson(&err_resp).await?;
                                 }
-                                tracing::debug!(target: "acp::wire", "ignoring unknown method: {other}");
+                                tracing::debug!(target: "buzz_acp::acp::wire", "ignoring unknown method: {other}");
                             }
                         }
                     }
@@ -1743,7 +1743,7 @@ impl AcpClient {
         match update_type {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
-                    tracing::info!(target: "acp::stream", "{text}");
+                    tracing::info!(target: "buzz_acp::acp::stream", "{text}");
                 }
                 false
             }
@@ -1756,7 +1756,7 @@ impl AcpClient {
                     .get("kind")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                tracing::info!(target: "acp::tool", "tool_call: {title} ({kind})");
+                tracing::info!(target: "buzz_acp::acp::tool", "tool_call: {title} ({kind})");
                 true
             }
             "tool_call_update" => {
@@ -1765,16 +1765,16 @@ impl AcpClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or("?");
                 let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                tracing::info!(target: "acp::tool", "tool_call_update: {tool_id} → {status}");
+                tracing::info!(target: "buzz_acp::acp::tool", "tool_call_update: {tool_id} → {status}");
                 false
             }
             "plan" => {
-                tracing::info!(target: "acp::plan", "plan update received");
+                tracing::info!(target: "buzz_acp::acp::plan", "plan update received");
                 false
             }
             "agent_thought_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
-                    tracing::debug!(target: "acp::thought", "{text}");
+                    tracing::debug!(target: "buzz_acp::acp::thought", "{text}");
                 }
                 false
             }
@@ -1786,7 +1786,7 @@ impl AcpClient {
                     .map(|cmds| cmds.iter().filter_map(|c| c["name"].as_str()).collect())
                     .unwrap_or_default();
                 tracing::info!(
-                    target: "acp::update",
+                    target: "buzz_acp::acp::update",
                     "available_commands_update: {} commands [{}]",
                     names.len(),
                     names.join(", ")
@@ -1811,14 +1811,14 @@ impl AcpClient {
                     match goose_meta.get("activeRunId") {
                         Some(serde_json::Value::String(run_id)) => {
                             tracing::debug!(
-                                target: "acp::update",
+                                target: "buzz_acp::acp::update",
                                 "session_info_update: activeRunId={run_id}"
                             );
                             self.active_run_id = Some(run_id.clone());
                         }
                         Some(serde_json::Value::Null) => {
                             tracing::debug!(
-                                target: "acp::update",
+                                target: "buzz_acp::acp::update",
                                 "session_info_update: activeRunId cleared"
                             );
                             self.active_run_id = None;
@@ -1831,7 +1831,7 @@ impl AcpClient {
             }
             "keepalive" => false,
             other => {
-                tracing::debug!(target: "acp::update", "session/update: {other}");
+                tracing::debug!(target: "buzz_acp::acp::update", "session/update: {other}");
                 false
             }
         }
@@ -1849,7 +1849,7 @@ impl AcpClient {
             Some(p) => p,
             None => {
                 tracing::debug!(
-                    target: "acp::usage",
+                    target: "buzz_acp::acp::usage",
                     "_goose/unstable/session/update: missing params"
                 );
                 return;
@@ -1859,7 +1859,7 @@ impl AcpClient {
             Ok(notif) => {
                 if let GooseSessionUpdateVariant::UsageUpdate(payload) = &notif.update {
                     tracing::debug!(
-                        target: "acp::usage",
+                        target: "buzz_acp::acp::usage",
                         session_id = %notif.session_id,
                         input = payload.accumulated_input_tokens,
                         output = payload.accumulated_output_tokens,
@@ -1870,7 +1870,7 @@ impl AcpClient {
             }
             Err(e) => {
                 tracing::debug!(
-                    target: "acp::usage",
+                    target: "buzz_acp::acp::usage",
                     "_goose/unstable/session/update: deserialization error: {e}"
                 );
             }
@@ -1903,7 +1903,7 @@ impl AcpClient {
             .ok_or_else(|| AcpError::Protocol("permission request missing options".into()))?;
 
         tracing::debug!(
-            target: "acp::permission",
+            target: "buzz_acp::acp::permission",
             "session/request_permission id={id}, {} options",
             options.len()
         );
@@ -1918,14 +1918,14 @@ impl AcpClient {
                 .as_str()
                 .ok_or_else(|| AcpError::Protocol("allow_once option missing optionId".into()))?;
             tracing::info!(
-                target: "acp::permission",
+                target: "buzz_acp::acp::permission",
                 "auto-approving permission id={id} with allow_once optionId={option_id:?}"
             );
             permission_response_selected(&id, option_id)
         } else {
             // No allow_once — fall back to reject_once.
             tracing::warn!(
-                target: "acp::permission",
+                target: "buzz_acp::acp::permission",
                 "no allow_once option found in permission request id={id}, falling back to reject_once"
             );
             let reject = options
@@ -1987,7 +1987,7 @@ impl AcpClient {
         });
         let Some(fields) = fields else {
             tracing::warn!(
-                target: "acp::elicitation",
+                target: "buzz_acp::acp::elicitation",
                 "cancelling unanswerable elicitation id={id}"
             );
             return self
@@ -1996,7 +1996,7 @@ impl AcpClient {
         };
 
         tracing::info!(
-            target: "acp::elicitation",
+            target: "buzz_acp::acp::elicitation",
             "asking owner {} question(s) for elicitation id={id}",
             fields.len()
         );
@@ -2021,7 +2021,7 @@ impl AcpClient {
         let response = match reply {
             crate::pool::ElicitationReply::Skip => {
                 tracing::info!(
-                    target: "acp::elicitation",
+                    target: "buzz_acp::acp::elicitation",
                     "owner skipped elicitation id={}", pending.id
                 );
                 elicitation_response(&pending.id, "decline", None)
@@ -2059,7 +2059,7 @@ impl AcpClient {
             return;
         };
         if msg["params"].get("requestId") == Some(&parked.id) {
-            tracing::info!(target: "acp::elicitation", "agent cancelled elicitation id={}", parked.id);
+            tracing::info!(target: "buzz_acp::acp::elicitation", "agent cancelled elicitation id={}", parked.id);
             self.take_pending_elicitation();
         }
     }

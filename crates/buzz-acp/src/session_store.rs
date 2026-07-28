@@ -50,7 +50,7 @@ impl SessionStore {
     pub fn put(&self, channel_id: &Uuid, session_id: &str) {
         if let Err(error) = self.write(channel_id, session_id) {
             tracing::warn!(
-                target: "pool::session",
+                target: "buzz_acp::pool::session",
                 channel = %channel_id,
                 "failed to persist session binding: {error}"
             );
@@ -63,7 +63,7 @@ impl SessionStore {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => tracing::warn!(
-                target: "pool::session",
+                target: "buzz_acp::pool::session",
                 channel = %channel_id,
                 "failed to clear session binding: {error}"
             ),
