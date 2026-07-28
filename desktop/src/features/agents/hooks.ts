@@ -501,7 +501,15 @@ export function useDeletePersonaMutation() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (id: string) => deletePersona(id),
+    mutationFn: ({
+      id,
+      forceRemoteDelete,
+    }: {
+      id: string;
+      /** Acknowledges that provider-backed cascade instances leave their
+       * remote units running. The backend refuses the cascade without it. */
+      forceRemoteDelete?: boolean;
+    }) => deletePersona(id, forceRemoteDelete),
     onSettled: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: personasQueryKey }),

@@ -27,6 +27,7 @@ import { useTeamActions } from "./useTeamActions";
 import { useProfilePanel } from "@/shared/context/ProfilePanelContext";
 import { useBakedBuildEnvQuery } from "@/features/agents/hooks";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
+import { collectPersonaRemoteCascadeInstances } from "@/features/agents/lib/personaCascade";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { Button } from "@/shared/ui/button";
 import { PageHeader } from "@/shared/ui/PageHeader";
@@ -91,6 +92,19 @@ export function AgentsView() {
   // most providers persist the model as a provider env var (e.g. DATABRICKS_MODEL)
   // or inherit a baked build default, leaving `globalConfig.model` null.
   const configuredGlobalModel = inheritedDefaults.model.value;
+
+  // Cascade instances the delete cannot stop, named in the confirm dialog.
+  const personaToDeleteId = personas.personaToDelete?.id;
+  const personaDeleteRemoteInstances = React.useMemo(
+    () =>
+      personaToDeleteId
+        ? collectPersonaRemoteCascadeInstances(
+            agents.managedAgents ?? [],
+            personaToDeleteId,
+          )
+        : [],
+    [agents.managedAgents, personaToDeleteId],
+  );
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only; personas.handleImportSnapshotFile and teamActions.handleImportTeamSnapshotFile are stable
   React.useEffect(() => {
@@ -358,7 +372,12 @@ export function AgentsView() {
             ).length
           }
           onConfirm={(persona) => {
-            void personas.handleDelete(persona);
+            // The dialog named every orphaned remote unit above, so confirming
+            // it is the acknowledgement the backend pre-flight requires.
+            void personas.handleDelete(
+              persona,
+              personaDeleteRemoteInstances.length > 0,
+            );
           }}
           onOpenChange={(open) => {
             if (!open) {
@@ -367,6 +386,7 @@ export function AgentsView() {
           }}
           open={personas.personaToDelete !== null}
           persona={personas.personaToDelete}
+          remoteInstances={personaDeleteRemoteInstances}
         />
       ) : null}
       {personas.personaToShare ? (

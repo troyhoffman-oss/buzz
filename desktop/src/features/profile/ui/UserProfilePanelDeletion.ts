@@ -79,7 +79,17 @@ export function useProfileAgentDeletion({
         presenceLookup,
         relayAgents: relayAgents ?? [],
         removeAgentFromAllChannels,
-        skipRemoteDeleteConfirm: true,
+        // The profile panel routes every delete through
+        // AgentDeleteConfirmDialog, which names the remote unit and states
+        // that the delete does not stop it — so the fallback confirm would be
+        // the second modal on one click.
+        //
+        // Scope: this claim covers the single-record path only. The persona
+        // cascade below deliberately does not set it — that flow has no
+        // per-instance dialog to make the disclosure, so it must keep the
+        // fallback confirm. Anyone adding a new caller has to make the same
+        // judgement rather than copying this line.
+        remoteOrphanDisclosedByCaller: true,
       }),
     [
       channels,

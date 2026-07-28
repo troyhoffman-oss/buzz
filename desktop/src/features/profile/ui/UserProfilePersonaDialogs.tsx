@@ -4,6 +4,7 @@ import type {
   CreatePersonaInput,
   UpdatePersonaInput,
 } from "@/shared/api/types";
+import type { PersonaRemoteCascadeInstance } from "@/features/agents/lib/personaCascade";
 import { PersonaDeleteDialog } from "@/features/agents/ui/PersonaDeleteDialog";
 import { AgentDialog } from "@/features/agents/ui/AgentDialog";
 import type { PersonaDialogState } from "@/features/agents/ui/personaDialogState";
@@ -15,6 +16,7 @@ export function UserProfilePersonaDialogs({
   isPending,
   personaDialogState,
   personaToDelete,
+  remoteInstances = [],
   runtimes,
   runtimesLoading,
   updateError,
@@ -35,6 +37,8 @@ export function UserProfilePersonaDialogs({
   isPending: boolean;
   personaDialogState: PersonaDialogState | null;
   personaToDelete: AgentPersona | null;
+  /** Cascade instances whose remote deployment survives the delete. */
+  remoteInstances?: readonly PersonaRemoteCascadeInstance[];
   runtimes: AcpRuntimeCatalogEntry[];
   runtimesLoading: boolean;
   updateError: Error | null;
@@ -74,6 +78,7 @@ export function UserProfilePersonaDialogs({
         }}
         open={personaToDelete !== null}
         persona={personaToDelete}
+        remoteInstances={remoteInstances}
       />
     </>
   );
