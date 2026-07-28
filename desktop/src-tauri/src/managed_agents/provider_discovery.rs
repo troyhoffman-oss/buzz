@@ -65,8 +65,12 @@ enum ExecNaming {
 }
 
 impl ExecNaming {
-    /// Where `ext` (no leading dot) sits in this platform's preference order,
-    /// or `None` when it does not name an executable at all.
+    /// Where `ext` (no leading dot) sits in this platform's extension
+    /// precedence, or `None` when it does not name an executable at all.
+    ///
+    /// The order is `PATHEXT`'s, which `allowed_exec_extensions_from`
+    /// preserves: when one directory holds both `foo.com` and `foo.exe`,
+    /// Windows command lookup runs whichever extension `PATHEXT` lists first.
     fn rank(&self, ext: &str) -> Option<usize> {
         match self {
             ExecNaming::NoExtension => None,
@@ -172,40 +176,60 @@ pub fn discover_provider_candidates() -> Vec<(String, PathBuf)> {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        // Collect this directory's matches before taking any, so the winner of
-        // an in-directory tie is chosen by `PATHEXT` rank rather than by
-        // `read_dir` order — which is filesystem-dependent, so `foo.exe` and
-        // `foo.com` side by side would otherwise resolve differently run to
-        // run. Sorting by name as well keeps the whole result reproducible.
-        let mut found: Vec<(usize, String, PathBuf)> = entries
-            .flatten()
-            .filter_map(|entry| {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let id = provider_id_from_file_name(&name, &naming)?;
-                let rank = path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .and_then(|ext| naming.rank(ext))
-                    .unwrap_or(usize::MAX);
-                // Ids that `resolve_provider_binary` would reject are dropped
-                // here so the catalog never advertises a provider that can
-                // never be executed.
-                (provider_id_is_valid(&id) && is_executable(&path)).then_some((rank, id, path))
-            })
-            .collect();
-        found.sort();
-
-        // Dedupe on the id, not the file name: on Windows two extensions map to
-        // one id, and the earlier PATH entry must win as it would for any other
-        // command lookup.
-        for (_, id, path) in found {
+        let names = entries.flatten().filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Cheap name filter before the `is_executable` stat, so an
+            // unrelated directory entry never costs a metadata call.
+            (name.starts_with(PROVIDER_PREFIX) && is_executable(&entry.path())).then_some(name)
+        });
+        // Dedupe on the derived id, not the file name: on Windows two
+        // extensions map to one id, and the earlier PATH entry must win as it
+        // would for any other command lookup.
+        for (id, name) in provider_candidates_in_dir(names, &naming) {
             if seen.insert(id.clone()) {
-                results.push((id, path));
+                results.push((id, dir.join(name)));
             }
         }
     }
     results
+}
+
+/// Reduce one directory's file names to its `(id, file name)` providers,
+/// ordered so a same-id conflict resolves the way the platform's command
+/// lookup would.
+///
+/// `read_dir` has no defined iteration order, so a directory holding both
+/// `buzz-backend-foo.com` and `buzz-backend-foo.exe` — one id, two files —
+/// would otherwise yield whichever the filesystem happened to list first, and
+/// discovery could deploy a different binary than Windows would execute.
+/// Candidates are ranked by their extension's position in `PATHEXT` (which
+/// [`allowed_exec_extensions_from`] preserves) and only the winner per id is
+/// kept. Ids that `resolve_provider_binary` would reject are dropped here so
+/// the catalog never advertises a provider that can never be executed.
+fn provider_candidates_in_dir(
+    names: impl IntoIterator<Item = String>,
+    naming: &ExecNaming,
+) -> Vec<(String, String)> {
+    let mut ranked: Vec<(String, usize, String)> = names
+        .into_iter()
+        .filter_map(|name| {
+            let id = provider_id_from_file_name(&name, naming)?;
+            if !provider_id_is_valid(&id) {
+                return None;
+            }
+            let rank = Path::new(&name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(|ext| naming.rank(ext))
+                .unwrap_or(0);
+            Some((id, rank, name))
+        })
+        .collect();
+    // Sort by id so duplicates are adjacent, then by precedence; the file name
+    // breaks any remaining tie so the result never depends on `read_dir` order.
+    ranked.sort();
+    ranked.dedup_by(|a, b| a.0 == b.0);
+    ranked.into_iter().map(|(id, _, name)| (id, name)).collect()
 }
 
 /// Resolve a provider ID to a discovered, executable binary path.
@@ -460,21 +484,70 @@ mod tests {
     }
 
     #[test]
-    fn same_directory_ties_are_broken_by_pathext_order_not_read_dir_order() {
-        // `buzz-backend-ssh.exe` and `buzz-backend-ssh.com` in one directory
-        // both yield id "ssh". Which one wins must not depend on the order the
-        // filesystem happens to hand back, so the rank comes from `PATHEXT` —
-        // the same order Windows itself resolves a bare command name in.
-        let naming = windows_naming();
-        assert_eq!(naming.rank("com"), Some(0));
-        assert_eq!(naming.rank("exe"), Some(1));
-        assert_eq!(naming.rank("cmd"), None);
-        // A `PATHEXT` that lists .EXE first flips the preference with it.
-        let exe_first = ExecNaming::Extensions(allowed_exec_extensions_from(Some(".EXE;.COM")));
-        assert_eq!(exe_first.rank("exe"), Some(0));
-        assert_eq!(exe_first.rank("com"), Some(1));
-        // Unix has no extension preference at all.
-        assert_eq!(ExecNaming::NoExtension.rank("exe"), None);
+    fn same_directory_conflicts_resolve_by_pathext_precedence() {
+        // `read_dir` order is undefined, so both listings of the same
+        // directory must select the same file — the one Windows command
+        // lookup would run, i.e. the extension `PATHEXT` lists first.
+        let both = ["buzz-backend-foo.exe", "buzz-backend-foo.com"];
+        for order in [both, [both[1], both[0]]] {
+            let names = || order.iter().map(|s| s.to_string());
+
+            let com_first = ExecNaming::Extensions(allowed_exec_extensions_from(Some(".COM;.EXE")));
+            assert_eq!(
+                provider_candidates_in_dir(names(), &com_first),
+                vec![("foo".to_string(), "buzz-backend-foo.com".to_string())]
+            );
+
+            let exe_first = ExecNaming::Extensions(allowed_exec_extensions_from(Some(".EXE;.COM")));
+            assert_eq!(
+                provider_candidates_in_dir(names(), &exe_first),
+                vec![("foo".to_string(), "buzz-backend-foo.exe".to_string())]
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_ids_in_a_directory_all_survive_dedup() {
+        // Dedup collapses same-id conflicts only — unrelated providers in the
+        // same directory must all be discovered, and non-providers dropped.
+        let names = [
+            "buzz-backend-zed.exe",
+            "buzz-backend-ssh.com",
+            "buzz-backend-ssh.exe",
+            "buzz-backend-ssh.cmd", // script extension: never a provider
+            "buzz-backend-Bad.exe", // uppercase id: resolve would reject it
+            "unrelated.exe",
+        ];
+        let found = provider_candidates_in_dir(
+            names.iter().map(|s| s.to_string()),
+            &windows_naming(), // default PATHEXT → .COM before .EXE
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("ssh".to_string(), "buzz-backend-ssh.com".to_string()),
+                ("zed".to_string(), "buzz-backend-zed.exe".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn unix_directory_listing_needs_no_extension_ranking() {
+        // The unix arm has no extension precedence: every name is its own id,
+        // and ranking must not reorder or drop anything.
+        let found = provider_candidates_in_dir(
+            ["buzz-backend-ssh", "buzz-backend-zed"]
+                .iter()
+                .map(|s| s.to_string()),
+            &ExecNaming::NoExtension,
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("ssh".to_string(), "buzz-backend-ssh".to_string()),
+                ("zed".to_string(), "buzz-backend-zed".to_string()),
+            ]
+        );
     }
 
     #[test]
