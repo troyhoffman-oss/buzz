@@ -5,6 +5,7 @@ import {
   autoPickRemoteHarness,
   canSubmitWhereToRun,
   emptyWhereToRunDraft,
+  hostFailureOf,
   providerConfigComplete,
   remoteHarnessOptions,
   remoteHarnessSummaryLabel,
@@ -14,6 +15,7 @@ import {
   runTargetOptions,
   selectedRemoteHarness,
 } from "./whereToRunIntent.ts";
+import { TauriInvokeError } from "@/shared/api/tauri";
 
 const probed = {
   ok: true,
@@ -456,4 +458,37 @@ test("auto-pick never returns an unavailable entry", () => {
     ),
     null,
   );
+});
+
+// ── hostFailureOf: the one conversion every host `catch` goes through ────────
+
+test("hostFailureOf lifts a provider recovery alongside the message", () => {
+  const failure = hostFailureOf(
+    new TauriInvokeError("needs browser auth", {
+      message: "needs browser auth",
+      recovery: {
+        action: "open_url",
+        url: "https://login.tailscale.com/a/1a2b3c4d",
+      },
+    }),
+  );
+  assert.deepEqual(failure, {
+    message: "needs browser auth",
+    recovery: {
+      action: "open_url",
+      url: "https://login.tailscale.com/a/1a2b3c4d",
+    },
+  });
+});
+
+test("hostFailureOf reports an ordinary failure with no recovery", () => {
+  // The common case: the message renders alone, with no button.
+  assert.deepEqual(hostFailureOf(new Error("ssh failed (exit 255)")), {
+    message: "ssh failed (exit 255)",
+    recovery: null,
+  });
+  assert.deepEqual(hostFailureOf("host unreachable"), {
+    message: "host unreachable",
+    recovery: null,
+  });
 });

@@ -298,6 +298,39 @@ function toTauriError(error: unknown): Error {
 }
 
 /**
+ * An actionable step attached to a failed provider op, read off the error a
+ * provider command rejected with.
+ *
+ * The only action is opening a URL, and the only URL the Rust side will ever
+ * put here is a Tailscale login link — it validates the prefix and the token
+ * charset before the value reaches this process, and refuses anything else.
+ * See `ProviderRecovery` in `managed_agents/backend.rs`.
+ */
+export type ProviderRecovery = { action: "open_url"; url: string };
+
+/**
+ * The recovery on a rejected provider command, or `null`.
+ *
+ * Reads the wire payload rather than the message: `TauriInvokeError` already
+ * carries the whole rejected value, so a structured `{message, recovery}` needs
+ * no parsing of human text. Returns `null` for every other error shape, which
+ * is the overwhelmingly common case — a provider failure without a recovery is
+ * an ordinary failure and renders as its message alone.
+ */
+export function providerRecoveryOf(error: unknown): ProviderRecovery | null {
+  if (!(error instanceof TauriInvokeError)) return null;
+  const payload = error.payload;
+  if (typeof payload !== "object" || payload === null) return null;
+  const recovery = (payload as { recovery?: unknown }).recovery;
+  if (typeof recovery !== "object" || recovery === null) return null;
+  const { action, url } = recovery as { action?: unknown; url?: unknown };
+  if (action !== "open_url" || typeof url !== "string" || url === "") {
+    return null;
+  }
+  return { action, url };
+}
+
+/**
  * Inspect a Tauri error message and activate the shared rate-limit gate when
  * the Rust relay layer emitted an HTTP 429 response (`relay rate-limited:` prefix).
  *

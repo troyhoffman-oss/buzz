@@ -298,6 +298,35 @@ with a TypeScript lookup table or an id comparison in a component.
     THIS machine, so a working `hermes --profile marshall acp` would be
     replaced by a binary that does not exist on the host, from a dialog that
     never said it would touch the harness.
+20. **A host failure the user can fix carries a typed recovery, and the URL is
+    validated on entry.** A provider may answer a failed op with
+    `recovery: {action: "open_url", url}` (see `docs/remote-agents.md`); today
+    the only case is a tailnet ACL demanding browser re-auth. It reaches the UI
+    as `ProviderFailure {message, recovery}` — there is deliberately no
+    `From<ProviderFailure> for String`, which is the type-level guard against a
+    caller flattening the recovery away. The frontend reads it off
+    `TauriInvokeError.payload` with `providerRecoveryOf`; `hostFailureOf` is the
+    one place `WhereToRunSection` converts a rejection, so a new host call picks
+    the recovery up for free. Two rules for anything added here:
+    - **Validate where the value enters, not where it is used.**
+      `ProviderRecovery::from_response` checks the Tailscale prefix AND the
+      token charset before constructing the value, so an unvalidated URL never
+      exists in desktop memory and no later reader can become a second,
+      unguarded way to open it. A provider is a discovered subprocess, not a
+      trusted peer — the same footing that makes `invoke_provider` re-redact
+      secrets on the way in. Do not relax this to a bare `starts_with`, and do
+      not let a provider name the destination.
+    - **The message always stands alone.** The recovery only ever ADDS a button;
+      the copy names the problem without it, so an older provider (or a dropped
+      recovery) degrades to an ordinary failure rather than an empty one.
+      Nothing auto-retries: the desktop cannot observe a browser it does not
+      own, so "Check the host again" stays the retry.
+    - **Dropping it is allowed, silently doing so is not.** `start_managed_agent`
+      and `create_managed_agent`'s `spawn_error` render into a toast and a
+      reported field, neither of which has room for an action, so each converts
+      to the message at one named site. Do not turn that into a blanket `impl
+      From<ProviderFailure> for String` — the explicitness is the point. Give
+      the surface an action before widening it.
 
 ## The tests that enforce this
 

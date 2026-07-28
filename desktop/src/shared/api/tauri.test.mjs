@@ -270,6 +270,58 @@ test("fromRawRemoteHarness treats a false or null exclusive as not exclusive", (
   }
 });
 
+// ── providerRecoveryOf: the actionable half of a provider failure ────────────
+
+const { providerRecoveryOf, TauriInvokeError } = await import("./tauri.ts");
+
+/** A provider command rejection as `invokeTauri` produces it. */
+function rejection(payload) {
+  return new TauriInvokeError(payload.message ?? "failed", payload);
+}
+
+test("providerRecoveryOf reads the recovery off a structured provider failure", () => {
+  const recovery = providerRecoveryOf(
+    rejection({
+      message: "this host requires Tailscale SSH authentication in a browser",
+      recovery: {
+        action: "open_url",
+        url: "https://login.tailscale.com/a/1a2b3c4d",
+      },
+    }),
+  );
+  assert.deepEqual(recovery, {
+    action: "open_url",
+    url: "https://login.tailscale.com/a/1a2b3c4d",
+  });
+});
+
+test("providerRecoveryOf returns null for an ordinary failure", () => {
+  // The overwhelmingly common case: a failure with no recovery renders as its
+  // message alone, with no button.
+  assert.equal(providerRecoveryOf(rejection({ message: "exit 255" })), null);
+  assert.equal(providerRecoveryOf(new Error("ssh failed")), null);
+  assert.equal(providerRecoveryOf("a bare string"), null);
+  assert.equal(providerRecoveryOf(null), null);
+  assert.equal(providerRecoveryOf(undefined), null);
+});
+
+test("providerRecoveryOf ignores a malformed or unknown recovery", () => {
+  for (const recovery of [
+    null,
+    "https://login.tailscale.com/a/tok",
+    { action: "run_command", command: "rm -rf /" },
+    { action: "open_url" },
+    { action: "open_url", url: "" },
+    { action: "open_url", url: 42 },
+  ]) {
+    assert.equal(
+      providerRecoveryOf(rejection({ message: "failed", recovery })),
+      null,
+      JSON.stringify(recovery),
+    );
+  }
+});
+
 // ── Teardown ──────────────────────────────────────────────────────────────────
 
 test("teardown — restore Date.now", () => {

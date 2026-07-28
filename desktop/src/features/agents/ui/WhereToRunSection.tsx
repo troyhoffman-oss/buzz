@@ -1,4 +1,5 @@
-import { AlertTriangle, Loader2 } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { AlertTriangle, ExternalLink, Loader2 } from "lucide-react";
 import * as React from "react";
 
 import {
@@ -13,6 +14,7 @@ import {
   probeBackendProvider,
   probeProviderModels,
 } from "@/shared/api/tauri";
+import type { ProviderRecovery } from "@/shared/api/tauri";
 import type { ManagedAgent, RemoteHarness } from "@/shared/api/types";
 import { Button } from "@/shared/ui/button";
 
@@ -25,6 +27,8 @@ import {
 import {
   autoPickRemoteHarness,
   emptyWhereToRunDraft,
+  type HostFailure,
+  hostFailureOf,
   LOCAL_RUN_TARGET_VALUE,
   providerConfigComplete,
   rememberProbedProviderName,
@@ -69,7 +73,9 @@ export function WhereToRunSection({
   const managedAgents = useManagedAgentsQuery().data ?? [];
   const { globalConfig } = useGlobalAgentConfig();
   const [probeError, setProbeError] = React.useState<string | null>(null);
-  const [harnessError, setHarnessError] = React.useState<string | null>(null);
+  const [harnessError, setHarnessError] = React.useState<HostFailure | null>(
+    null,
+  );
   const [isDiscoveringHarnesses, setIsDiscoveringHarnesses] =
     React.useState(false);
   // Friendly provider names, accumulated as probes land. Kept here rather than
@@ -230,9 +236,11 @@ export function WhereToRunSection({
         // push (see docs/remote-agents.md); without one it fails with install
         // guidance. The copy promises the union honestly rather than guessing
         // which case applies from here.
-        setHarnessError(
-          "buzz-acp is not installed on that host. Deploy will install it or explain how to.",
-        );
+        setHarnessError({
+          message:
+            "buzz-acp is not installed on that host. Deploy will install it or explain how to.",
+          recovery: null,
+        });
       }
       // A re-check can change what the auto-picked harness resolves to even
       // when the id is unchanged (a reinstall, a different PATH entry), so the
@@ -240,7 +248,7 @@ export function WhereToRunSection({
       if (firstAvailable) void probeModels(firstAvailable, next);
     } catch (error: unknown) {
       if (hostRequestRef.current !== requestId) return;
-      setHarnessError(error instanceof Error ? error.message : String(error));
+      setHarnessError(hostFailureOf(error));
     } finally {
       // Unconditional: the button is disabled while this flag is set, so no
       // second catalog read can be in flight to own it — and the model probe
@@ -286,15 +294,23 @@ export function WhereToRunSection({
         ...draftRef.current,
         remoteModelProbe: { status: "loaded", models },
       });
+      // A round trip that reached the host proves the auth problem below is
+      // gone, so its "Authenticate in browser" button must not outlive it.
+      // Only that failure is cleared: a catalog complaint (a host with no
+      // buzz-acp) is still true and is not what this call tested.
+      setHarnessError((previous) => (previous?.recovery ? null : previous));
     } catch (error: unknown) {
       if (hostRequestRef.current !== requestId) return;
+      const failure = hostFailureOf(error);
       onDraftChange({
         ...draftRef.current,
-        remoteModelProbe: {
-          status: "failed",
-          error: error instanceof Error ? error.message : String(error),
-        },
+        remoteModelProbe: { status: "failed", error: failure.message },
       });
+      // A model probe that failed on browser auth is the SAME host problem the
+      // catalog read reports, and the Model control has no room for an action.
+      // Surfacing it on the harness picker keeps one "authenticate, then check
+      // the host again" affordance instead of two competing ones.
+      if (failure.recovery) setHarnessError(failure);
     }
   }
 
@@ -470,7 +486,7 @@ function RemoteHarnessPicker({
    */
   addedExclusiveIds: ReadonlySet<string>;
   draft: WhereToRunDraft;
-  error: string | null;
+  error: HostFailure | null;
   isDiscovering: boolean;
   isPending: boolean;
   onDiscover: () => void;
@@ -504,7 +520,12 @@ function RemoteHarnessPicker({
           value={draft.remoteHarnessId ?? ""}
         />
       )}
-      {error ? <p className="text-sm text-warning">{error}</p> : null}
+      {error ? (
+        <div className="space-y-2">
+          <p className="text-sm text-warning">{error.message}</p>
+          <RecoveryAction recovery={error.recovery} />
+        </div>
+      ) : null}
       {/* Always available, in every state: a failed connection, an empty
           catalog and a just-installed harness all need a second attempt, and
           hiding the button after the first one strands the user in the create
@@ -526,5 +547,33 @@ function RemoteHarnessPicker({
             : "Check again"}
       </Button>
     </div>
+  );
+}
+
+/**
+ * The one actionable step a failed host call can offer, or nothing.
+ *
+ * Deliberately offers only "open the page". Nothing here schedules a retry: the
+ * desktop cannot observe a browser it does not own, so waiting for the user to
+ * finish authenticating would be guessing at a delay. "Check the host again" is
+ * already the retry, and it is the same button every other host failure offers.
+ *
+ * The URL is not re-checked here — `ProviderRecovery::from_response` validated
+ * it against the Tailscale login prefix and token charset on the way into the
+ * desktop, before it was ever a value this process held. Adding a second check
+ * here would imply the first one is optional.
+ */
+function RecoveryAction({ recovery }: { recovery: ProviderRecovery | null }) {
+  if (!recovery) return null;
+  return (
+    <Button
+      onClick={() => void openUrl(recovery.url)}
+      size="sm"
+      type="button"
+      variant="outline"
+    >
+      <ExternalLink className="mr-2 h-4 w-4" />
+      Authenticate in browser
+    </Button>
   );
 }
