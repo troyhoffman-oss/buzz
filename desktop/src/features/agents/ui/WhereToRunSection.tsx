@@ -8,7 +8,6 @@ import {
 } from "@/features/agents/hooks";
 import { NO_BACKEND_PROVIDER_HINT } from "@/features/agents/lib/backendProviderLabel";
 import { addedExclusiveHarnessIds } from "@/features/agents/lib/exclusiveRemoteHarness";
-import { REMOTE_TEAM_INSTRUCTIONS_NOTICE } from "@/features/agents/lib/remoteTeamInstructions";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import {
   discoverProviderHarnesses,
@@ -21,6 +20,7 @@ import { Button } from "@/shared/ui/button";
 
 import type { EnvVarsValue } from "./EnvVarsEditor";
 import { PersonaDropdownField } from "./PersonaDropdownField";
+import { RemoteTeamInstructionsHint } from "./RemoteTeamInstructionsNotice";
 import {
   coerceConfigValues,
   ProviderConfigFields,
@@ -427,13 +427,8 @@ export function WhereToRunSection({
           {/* Stated the moment "elsewhere" is the answer, and unconditionally:
               the team is chosen after this section, so waiting for one to be
               picked would surface the limitation only where it is already too
-              late to weigh. See `remoteTeamInstructions`. */}
-          <p
-            className="text-xs text-muted-foreground"
-            data-testid="remote-team-instructions-notice"
-          >
-            {REMOTE_TEAM_INSTRUCTIONS_NOTICE}
-          </p>
+              late to weigh. */}
+          <RemoteTeamInstructionsHint />
           {probeError ? (
             <p className="rounded-2xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
               Could not probe provider: {probeError}

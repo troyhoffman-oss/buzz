@@ -720,7 +720,13 @@ const overrides = new Map([
   // twice — the local/pinned Model branch collapsed into EditAgentModelField
   // (the file that owns both halves), and the post-save "saved while stopped"
   // toast joined the profile-sync warning it already sat beside. Ratcheted.
-  ["src/features/agents/ui/AgentInstanceEditDialog.tsx", 1170],
+  // 1170 -> 1172: the remote team-instructions disclosure. It arrived as a
+  // rendered <p> plus its rationale (+14); both moved out to
+  // RemoteTeamInstructionsNotice.tsx, which owns the create and edit
+  // renderings so the two surfaces cannot drift into two accounts of one
+  // limitation. What is left here is an import and the call site, which is
+  // what a disclosure rendered in this dialog irreducibly costs.
+  ["src/features/agents/ui/AgentInstanceEditDialog.tsx", 1172],
   // AgentDefinitionDialog grew past 1000 with the following load-bearing fixes:
   // isRuntimeAutoSeededRef tracking for edit-mode seeding (Fizz shows models);
   // runtimeSupportsLlmProviderSelection guard on discovery provider (codex fix);

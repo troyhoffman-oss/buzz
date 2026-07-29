@@ -12,10 +12,6 @@ import {
 } from "@/features/agents/hooks";
 import { agentLocationLabel } from "@/features/agents/lib/agentLocationLabel";
 import { providerRecordHarness } from "@/features/agents/lib/pinnedHarness";
-import {
-  losesTeamInstructionsRemotely,
-  REMOTE_TEAM_INSTRUCTIONS_ACTIVE_NOTICE,
-} from "@/features/agents/lib/remoteTeamInstructions";
 import type {
   ManagedAgent,
   RespondToMode,
@@ -40,6 +36,7 @@ import {
   formatRuntimeOptionLabel,
   getDefaultLlmModelLabel,
   getPersonaProviderOptions,
+  getProviderApiKeyEnvVar,
   isMissingRequiredDropdownField,
   NO_RUNTIME_DROPDOWN_VALUE,
   PERSONA_FIELD_CONTROL_CLASS,
@@ -87,7 +84,6 @@ import {
   getBakedModelInheritLabel,
   getBakedProviderInheritLabel,
 } from "./bakedEnvHelpers";
-import { getProviderApiKeyEnvVar } from "./agentConfigOptions";
 import { modelFieldStatus } from "./agentAiConfigurationPolicy";
 import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { AgentAiDefaultsNotice } from "./AgentAiDefaults";
@@ -95,6 +91,7 @@ import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { resolveModelFieldStatusMessage } from "./agentConfigControls";
 import { AdvancedRequiredBadge } from "./AdvancedRequiredBadge";
+import { RemoteTeamInstructionsNotice } from "./RemoteTeamInstructionsNotice";
 import {
   showAgentProfileSyncWarning,
   showAgentSavedWhileStoppedToast,
@@ -983,20 +980,7 @@ export function AgentInstanceEditDialog({
                 selectedRuntimeId === "custom" && !inheritHarness
               }
             />
-            {/* Observable parity loss, not metadata: local spawn hands the
-                harness `BUZZ_ACP_TEAM_INSTRUCTIONS`, and the deploy payload has
-                no team field, so this record is running without its team's
-                standing rules right now. Stated where the record's remoteness
-                is already the subject rather than presenting it as equivalent
-                to a local agent. See `remoteTeamInstructions`. */}
-            {losesTeamInstructionsRemotely(agent) ? (
-              <p
-                className="text-xs text-warning"
-                data-testid="edit-agent-remote-team-instructions-notice"
-              >
-                {REMOTE_TEAM_INSTRUCTIONS_ACTIVE_NOTICE}
-              </p>
-            ) : null}
+            <RemoteTeamInstructionsNotice agent={agent} />
             {/* LLM provider */}
             {llmProviderFieldVisible ? (
               <div className="space-y-1.5">
