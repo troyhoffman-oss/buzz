@@ -5,6 +5,12 @@
 # Usage:
 #   ./scripts/provision-buzz-host.sh     # run ON the host, as the agent user
 #
+# Runs correctly over a non-interactive `ssh host /path/to/provision-buzz-host.sh`
+# as well as in a login shell. A non-interactive SSH command reads no profile, so
+# this script prepends ~/.local/bin to its own PATH exactly as the deploy scripts
+# do — without that, every tool installed there would be reported MISSING on a
+# host that has it.
+#
 # Checks (and where it can, fixes) the host contract that `buzz-backend-ssh`
 # assumes: see docs/remote-agents.md, "Host prerequisites". Safe to re-run —
 # every action is idempotent, and a fully provisioned host is a no-op.
@@ -20,12 +26,29 @@
 #
 # Exit 0 when the mandatory set is green (lingering, ~/.local/bin, systemd
 # --user); 1 otherwise. Everything else is reported as a note, never a failure.
+# The ~/.local/bin row asks whether a login shell is configured to find the
+# directory, not whether this process inherited it — see section 3.
 # =============================================================================
 set -eu
 
 USER_NAME="$(id -un)"
 HOME_DIR="${HOME:-$(cd ~ && pwd)}"
 LOCAL_BIN="${HOME_DIR}/.local/bin"
+
+# The PATH this script was *given*, kept before the line below rewrites it.
+# Section 3 reports on this one: whether ~/.local/bin is on the login PATH is
+# the question, and a check that inspected a PATH the script itself fixed up
+# would answer yes on every host.
+INHERITED_PATH="${PATH:-}"
+
+# Everything else resolves against the same PATH the deploy does. `deploy` and
+# `discover` prepend the install destination to their own scripts for this
+# reason (`install::PATH_PREAMBLE`): a non-interactive `ssh host sh -s` reads no
+# profile, so on stock Debian PATH is `/usr/local/bin:/usr/bin:/bin:/usr/games`
+# and every adapter under ~/.local/bin is invisible. Reporting them MISSING here
+# while the deploy finds them would make this preflight lie in the direction
+# that costs the most: an operator chasing an install that is already there.
+export PATH="${LOCAL_BIN}${PATH:+:$PATH}"
 
 # Summary rows, one per line, `requirement|status|action`. POSIX sh has no
 # arrays, and a newline-delimited string prints back through one `read` loop.
@@ -89,12 +112,22 @@ else
 fi
 
 # ---- 3. ~/.local/bin --------------------------------------------------------
-# Where `buzz-acp` and most harness CLIs install, and what the deploy prepends
-# to the unit's PATH. It has to exist and be on the login PATH so `command -v`
-# resolves the same binaries the unit will.
+# Where `buzz-acp`, the `buzz` CLI and most harness adapters install.
+#
+# What is mandatory is that the directory exists and that a shell on this host
+# is CONFIGURED to find it — not that this particular process inherited it.
+# ~/.profile is read by a login shell and not by the `ssh host sh -s` the deploy
+# uses, so a strict "must be on $PATH right now" rule could not pass over the
+# very transport the deploy runs on: a fully provisioned host would fail its own
+# preflight. It is not load-bearing either, because nothing in the deploy path
+# depends on the login PATH — the deploy composes the unit's PATH itself, and
+# both remote scripts prepend this directory before they resolve anything.
+#
+# So all three arms below are green, and the ACTION column carries the one thing
+# that differs: whether a re-login is still owed.
 mkdir -p "${LOCAL_BIN}"
 
-case ":${PATH}:" in
+case ":${INHERITED_PATH}:" in
   *":${LOCAL_BIN}:"*)
     add_row "local bin on PATH" "OK" "${LOCAL_BIN}" mandatory
     ;;
@@ -103,15 +136,15 @@ case ":${PATH}:" in
     # a file the user also edits by hand.
     if [ -f "${HOME_DIR}/.profile" ] &&
       grep -q '\.local/bin' "${HOME_DIR}/.profile"; then
-      add_row "local bin on PATH" "NOTE" \
-        "already in ~/.profile; re-login to pick it up" mandatory
+      add_row "local bin on PATH" "OK" \
+        "in ~/.profile; a login shell picks it up" mandatory
     else
       # Single quotes deliberately: $HOME and $PATH must reach .profile as
       # literals, to be expanded at each login rather than frozen now.
       # shellcheck disable=SC2016
       printf '\n# Added by provision-buzz-host.sh\nexport PATH="$HOME/.local/bin:$PATH"\n' \
         >>"${HOME_DIR}/.profile"
-      add_row "local bin on PATH" "NOTE" \
+      add_row "local bin on PATH" "OK" \
         "appended to ~/.profile; re-login to pick it up" mandatory
     fi
     ;;
