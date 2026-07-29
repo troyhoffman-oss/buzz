@@ -2411,21 +2411,47 @@ struct ElicitationField {
     options: Vec<ElicitationOption>,
 }
 
+/// Resolve one reply token to a position in `options`: a 1-based index, or an
+/// option value/title compared case-insensitively.
+///
+/// **A token that could mean two different options resolves to neither.** The
+/// card sends an option's *label* back, so an adapter free to choose both ids
+/// and names can make one token name two options — an option literally named
+/// `"2"`, or an `optionId` equal to a different option's name. Resolving such a
+/// token by precedence silently answers with an option the owner did not click,
+/// and for a permission that means a click on "Reject" can approve the tool
+/// call. Refusing is the safe direction on both paths: the permission arm
+/// denies, and the elicitation arm falls through to free text, where the
+/// owner's own words reach the agent verbatim.
+fn select_index(options: &[ElicitationOption], token: &str) -> Option<usize> {
+    let token = token.trim();
+    let by_index = token
+        .parse::<usize>()
+        .ok()
+        .and_then(|index| index.checked_sub(1))
+        .filter(|index| *index < options.len());
+    let mut named = options
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.value.eq_ignore_ascii_case(token) || o.title.eq_ignore_ascii_case(token))
+        .map(|(index, _)| index);
+    let by_name = named.next();
+    if named.next().is_some() {
+        return None; // two options answer to this token
+    }
+    match (by_index, by_name) {
+        (Some(index), None) | (None, Some(index)) => Some(index),
+        (Some(index), Some(other)) if index == other => Some(index),
+        (Some(_), Some(_)) => None, // the digit and the name disagree
+        (None, None) => None,
+    }
+}
+
 impl ElicitationField {
     /// Match one reply token against this field's options: a 1-based index, or
     /// an option value/title compared case-insensitively.
     fn select(&self, token: &str) -> Option<&ElicitationOption> {
-        let token = token.trim();
-        if let Some(option) = token
-            .parse::<usize>()
-            .ok()
-            .and_then(|index| self.options.get(index.checked_sub(1)?))
-        {
-            return Some(option);
-        }
-        self.options
-            .iter()
-            .find(|o| o.value.eq_ignore_ascii_case(token) || o.title.eq_ignore_ascii_case(token))
+        self.options.get(select_index(&self.options, token)?)
     }
 
     /// Whether an answer naming no option still reaches the agent — the single
@@ -2699,8 +2725,18 @@ fn parse_permission_field(params: &serde_json::Value) -> Option<ElicitationField
         .iter()
         .filter_map(|option| {
             let value = option["optionId"].as_str()?.to_owned();
+            // A blank label is refused by the card parser for the *whole*
+            // question, not just its option — so an adapter that omits one name
+            // would cost the owner every button. Fall back to the id, which is
+            // at least selectable.
+            let title = option["name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or(&value)
+                .to_owned();
             Some(ElicitationOption {
-                title: option["name"].as_str().unwrap_or(&value).to_owned(),
+                title,
                 description: None,
                 value,
             })
@@ -2710,17 +2746,40 @@ fn parse_permission_field(params: &serde_json::Value) -> Option<ElicitationField
         return None;
     }
     // Titles are how a click gets back to an `optionId`: the card sends the
-    // label and `select` matches it case-insensitively, first hit wins. Two
-    // options an adapter named the same thing would make the second
-    // unreachable — clicking it would approve the first. Disambiguate rather
-    // than silently mis-resolve. (They also key the card's list client-side.)
+    // label, and `select_index` resolves it — refusing any token that could
+    // mean two options. Refusing denies, which is safe but costs the owner a
+    // button they can see, so make every label unambiguous here rather than
+    // leaving `select_index` to catch it.
+    //
+    // Three ways an adapter free to choose both ids and names collides:
+    // two options sharing a name; a name that reads as another option's
+    // 1-based position (`name: "2"`); and a name equal to another option's
+    // `optionId`. Suffixing the id disambiguates all three — an id is unique
+    // by construction, and no suffixed label parses as a bare number.
+    //
+    // Clashes are decided against the labels as the adapter sent them, not
+    // against labels a previous iteration already rewrote: reading its own
+    // edits back would make the outcome depend on option order, leaving a
+    // collision intact whenever the rewrite happened to break it first.
+    let sent: Vec<String> = options.iter().map(|o| o.title.clone()).collect();
     for index in 0..options.len() {
-        let clashes = options[..index]
+        let label = &sent[index];
+        // A duplicate name only needs one of the pair renamed, so the first
+        // occurrence keeps the adapter's wording and later ones carry the id.
+        let duplicate_name = sent[..index]
             .iter()
-            .any(|earlier| earlier.title.eq_ignore_ascii_case(&options[index].title));
-        if clashes {
-            let value = options[index].value.clone();
-            options[index].title = format!("{} ({value})", options[index].title);
+            .any(|earlier| earlier.eq_ignore_ascii_case(label));
+        let names_another_position = label
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .is_some_and(|n| n < options.len() && n != index);
+        let shadows_an_id = options.iter().enumerate().any(|(other, candidate)| {
+            other != index && candidate.value.eq_ignore_ascii_case(label)
+        });
+        if duplicate_name || names_another_position || shadows_an_id {
+            options[index].title = format!("{label} ({})", options[index].value);
         }
     }
     // The tool call's own title is the question. Adapters that omit it get a
@@ -5410,6 +5469,119 @@ mod tests {
                 .map(|o| o.value.as_str()),
             Some("opt-b1c9"),
             "the second option must resolve to its own id, not the first's"
+        );
+    }
+
+    /// The card sends a *label* back and `select` tries it as a 1-based index
+    /// first, so an option an adapter named `"2"` is answered by resolving the
+    /// digit — reaching whatever sits at that position instead. Clicking a
+    /// reject button must never land on an allow.
+    #[test]
+    fn an_option_named_like_a_number_resolves_to_itself() {
+        let mut params = permission_params();
+        params["options"] = serde_json::json!([
+            {"optionId": "opt-allow", "name": "Allow once", "kind": "allow_once"},
+            {"optionId": "opt-reject", "name": "1", "kind": "reject_once"},
+        ]);
+        let field = parse_permission_field(&params).expect("the request is askable");
+        let reject_label = field.options[1].title.clone();
+        assert_eq!(
+            field.select(&reject_label).map(|o| o.value.as_str()),
+            Some("opt-reject"),
+            "clicking the reject button must not approve the tool call"
+        );
+    }
+
+    /// `select` matches an option's wire `optionId` as well as its label, so an
+    /// adapter whose *ids* read like names — `optionId: "reject"` on the allow
+    /// option — makes a click on the button labelled "Reject" resolve to the
+    /// allow instead.
+    #[test]
+    fn an_option_id_shadowing_another_options_name_cannot_mis_resolve() {
+        let mut params = permission_params();
+        params["options"] = serde_json::json!([
+            {"optionId": "Reject", "name": "Allow once", "kind": "allow_once"},
+            {"optionId": "opt-reject", "name": "Reject", "kind": "reject_once"},
+        ]);
+        let field = parse_permission_field(&params).expect("the request is askable");
+        let reject_label = field.options[1].title.clone();
+        assert_eq!(
+            field.select(&reject_label).map(|o| o.value.as_str()),
+            Some("opt-reject"),
+            "the label of the reject option must reach the reject option"
+        );
+    }
+
+    /// `parse_permission_field` disambiguates the labels it builds, but the
+    /// resolver is the last line: a token that could mean two options must
+    /// answer with neither, whatever produced the option set. Refusing denies
+    /// on the permission path and falls through to free text on the
+    /// elicitation one — both safe; guessing is not.
+    #[test]
+    fn a_token_naming_two_options_resolves_to_neither() {
+        let ambiguous = |options: Vec<(&str, &str)>, token: &str| {
+            let field = ElicitationField {
+                name: "f".to_owned(),
+                ty: "string".to_owned(),
+                custom: None,
+                prompt: "q".to_owned(),
+                options: options
+                    .into_iter()
+                    .map(|(value, title)| ElicitationOption {
+                        value: value.to_owned(),
+                        title: title.to_owned(),
+                        description: None,
+                    })
+                    .collect(),
+            };
+            field.select(token).map(|o| o.value.clone())
+        };
+        assert_eq!(
+            ambiguous(vec![("a", "Allow"), ("b", "1")], "1"),
+            None,
+            "the digit names position 1 and the second option's label"
+        );
+        assert_eq!(
+            ambiguous(vec![("Reject", "Allow"), ("b", "Reject")], "Reject"),
+            None,
+            "the token is one option's id and another's label"
+        );
+        assert_eq!(
+            ambiguous(vec![("a", "Same"), ("b", "same")], "SAME"),
+            None,
+            "two labels answer to it"
+        );
+        // Unambiguous resolution is untouched: index, label, and an option
+        // whose own id and label agree all still resolve.
+        assert_eq!(
+            ambiguous(vec![("a", "Allow"), ("b", "Reject")], "2"),
+            Some("b".to_owned())
+        );
+        assert_eq!(
+            ambiguous(vec![("a", "Allow"), ("b", "Reject")], "reject"),
+            Some("b".to_owned())
+        );
+        assert_eq!(
+            ambiguous(vec![("1", "1"), ("b", "Reject")], "1"),
+            Some("1".to_owned()),
+            "one option answering to a token twice over is still one option"
+        );
+    }
+
+    /// A card whose option carries an empty label is refused wholesale by the
+    /// desktop parser, so the harness must not build one.
+    #[test]
+    fn an_option_with_a_blank_name_still_renders_a_label() {
+        let mut params = permission_params();
+        params["options"] = serde_json::json!([
+            {"optionId": "opt-allow", "name": "", "kind": "allow_once"},
+            {"optionId": "opt-reject", "name": "Reject", "kind": "reject_once"},
+        ]);
+        let field = parse_permission_field(&params).expect("the request is askable");
+        let labels: Vec<&str> = field.options.iter().map(|o| o.title.as_str()).collect();
+        assert!(
+            labels.iter().all(|title| !title.trim().is_empty()),
+            "a blank label makes the whole card unrenderable: {labels:?}"
         );
     }
 
