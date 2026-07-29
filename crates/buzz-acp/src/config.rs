@@ -475,8 +475,12 @@ pub struct CliArgs {
     /// Seconds an `askOwner`-routed permission request waits for the owner
     /// before it is answered `cancelled` (denied). `0` waits until the turn's
     /// own hard deadline. Ignored in every other permission mode.
+    ///
+    /// Capped at [`MAX_TURN_DURATION_CEILING_SECS`]: the window becomes an
+    /// `Instant` inside the read loop, and adding an absurd `Duration` to one
+    /// panics rather than saturating.
     #[arg(
-        long,
+        long = "permission-timeout",
         env = "BUZZ_ACP_PERMISSION_TIMEOUT",
         default_value_t = 600,
         value_name = "SECONDS"
@@ -1008,6 +1012,18 @@ impl Config {
                 raw
             }
         };
+
+        // The permission answer window is added to a `tokio::time::Instant` in
+        // the read loop, and that addition panics on overflow rather than
+        // saturating — inside the turn's own task. Share `max_turn_duration`'s
+        // ceiling: the turn's hard deadline bounds the wait anyway, so a window
+        // beyond it is already expressed by `0`.
+        if args.permission_timeout_secs > MAX_TURN_DURATION_CEILING_SECS {
+            return Err(ConfigError::ConfigFile(format!(
+                "permission_timeout ({}s) exceeds ceiling ({}s / 7 days) — use 0 to wait until the turn's own deadline",
+                args.permission_timeout_secs, MAX_TURN_DURATION_CEILING_SECS
+            )));
+        }
 
         // idle_timeout must be strictly less than max_turn_duration. If idle_timeout
         // >= max_turn_duration, the absolute wall-clock cap would fire before the idle
@@ -2912,6 +2928,52 @@ channels = "ALL"
         // Verify that even at the ceiling, this addition cannot overflow u64.
         const {
             assert!(MAX_TURN_DURATION_CEILING_SECS < u64::MAX - 100);
+        }
+    }
+
+    // --- permission_timeout ceiling gate ---
+
+    /// The answer window becomes `parked_at + Duration`, and adding an absurd
+    /// duration to an `Instant` panics rather than saturating — inside the read
+    /// loop, which would take the turn's agent down with it. Bound it at config
+    /// time like `max_turn_duration`, whose ceiling exists for the same reason.
+    #[test]
+    fn permission_timeout_above_ceiling_is_rejected() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--permission-timeout",
+            &u64::MAX.to_string(),
+        ])
+        .expect("clap should parse args");
+        let result = Config::from_args(args);
+        assert!(
+            result.is_err(),
+            "a window no Instant can represent must not reach the read loop"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exceeds ceiling"),
+            "error should mention 'exceeds ceiling': {msg}"
+        );
+    }
+
+    #[test]
+    fn permission_timeout_at_ceiling_is_accepted() {
+        for secs in [0, 1, MAX_TURN_DURATION_CEILING_SECS] {
+            let args = CliArgs::try_parse_from([
+                "buzz-acp",
+                "--private-key",
+                TEST_PRIVATE_KEY,
+                "--permission-timeout",
+                &secs.to_string(),
+            ])
+            .expect("clap should parse args");
+            assert!(
+                Config::from_args(args).is_ok(),
+                "{secs}s is a usable answer window"
+            );
         }
     }
 
