@@ -119,6 +119,9 @@ impl std::fmt::Display for RespondTo {
 /// - `bypassPermissions` — skip the permission flow entirely.
 /// - `dontAsk` — never prompt; reject anything that would require permission.
 /// - `plan` — planning-only mode (no tool execution).
+/// - `askOwner` — harness-side: ask the channel owner, block the turn on their
+///   answer. The agent is still told `default` (it must ask for the harness to
+///   have anything to route).
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
 pub enum PermissionMode {
     /// Agent default — permission requests per tool call.
@@ -136,6 +139,14 @@ pub enum PermissionMode {
     /// Planning-only mode (no tool execution).
     #[value(alias = "plan")]
     Plan,
+    /// Route every permission request to the channel owner as an ask card and
+    /// block the turn on their answer, failing safe (`cancelled`) on silence.
+    ///
+    /// The only mode whose wire string differs from its name: the agent is
+    /// pinned to `default` because it must *ask* for the harness to have
+    /// anything to route. The routing itself is harness-side.
+    #[value(alias = "askOwner")]
+    AskOwner,
 }
 
 impl PermissionMode {
@@ -143,7 +154,9 @@ impl PermissionMode {
     /// `session/set_config_option`.
     pub fn as_wire_str(&self) -> &'static str {
         match self {
-            Self::Default => "default",
+            // See the variant doc: `askOwner` is harness-side behaviour layered
+            // on the agent's own per-tool-call asking.
+            Self::Default | Self::AskOwner => "default",
             Self::AcceptEdits => "acceptEdits",
             Self::BypassPermissions => "bypassPermissions",
             Self::DontAsk => "dontAsk",
@@ -153,14 +166,29 @@ impl PermissionMode {
 
     /// Returns `true` when the mode is the agent's built-in default and
     /// therefore doesn't need to be explicitly set.
+    ///
+    /// `AskOwner` is deliberately **not** default: an adapter whose own default
+    /// is permissive would never ask, leaving the routing dead code. Pinning it
+    /// to `default` on the wire is what makes the owner card appear at all.
     pub fn is_default(&self) -> bool {
         matches!(self, Self::Default)
+    }
+
+    /// Whether the harness routes `session/request_permission` to the channel
+    /// owner instead of auto-approving it.
+    pub fn routes_to_owner(&self) -> bool {
+        matches!(self, Self::AskOwner)
     }
 }
 
 impl std::fmt::Display for PermissionMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_wire_str())
+        // `askOwner`'s wire string is `default`, so the startup summary would
+        // otherwise misreport the mode the operator actually configured.
+        f.write_str(match self {
+            Self::AskOwner => "askOwner",
+            other => other.as_wire_str(),
+        })
     }
 }
 
@@ -434,7 +462,8 @@ pub struct CliArgs {
     ///
     /// Defaults to `bypassPermissions` which skips the per-tool-call
     /// permission flow. Set to `default` to restore the agent's built-in
-    /// behaviour.
+    /// behaviour, or `askOwner` to route each request to the channel owner as
+    /// an ask card and block the turn on their answer.
     #[arg(
         long,
         env = "BUZZ_ACP_PERMISSION_MODE",
@@ -442,6 +471,17 @@ pub struct CliArgs {
         value_enum
     )]
     pub permission_mode: PermissionMode,
+
+    /// Seconds an `askOwner`-routed permission request waits for the owner
+    /// before it is answered `cancelled` (denied). `0` waits until the turn's
+    /// own hard deadline. Ignored in every other permission mode.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_PERMISSION_TIMEOUT",
+        default_value_t = 600,
+        value_name = "SECONDS"
+    )]
+    pub permission_timeout_secs: u64,
 
     /// Inbound author gate: which authors' events the harness forwards.
     /// Modes: owner-only (default), allowlist, anyone, nobody.
@@ -533,6 +573,10 @@ pub struct Config {
     pub session_title: Option<String>,
     /// Permission mode to apply after session creation. `Default` = skip.
     pub permission_mode: PermissionMode,
+    /// Seconds an owner-routed permission request waits before it is denied.
+    /// `0` = wait until the turn's hard deadline. Only read when
+    /// `permission_mode.routes_to_owner()`.
+    pub permission_timeout_secs: u64,
     /// Inbound author gate mode.
     pub respond_to: RespondTo,
     /// Validated allowlist of pubkey hex strings (used when respond_to == Allowlist).
@@ -1068,6 +1112,7 @@ impl Config {
                 .as_deref()
                 .and_then(sanitize_session_title),
             permission_mode: args.permission_mode,
+            permission_timeout_secs: args.permission_timeout_secs,
             respond_to: args.respond_to,
             respond_to_allowlist,
             allowed_respond_to,
@@ -1098,8 +1143,18 @@ impl Config {
             modes.sort();
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
+        // The permission timeout only governs owner-routed requests, so it is
+        // noise in every other mode.
+        let permission_timeout_detail = if self.permission_mode.routes_to_owner() {
+            match self.permission_timeout_secs {
+                0 => " permission_timeout=(turn deadline)".to_owned(),
+                secs => format!(" permission_timeout={secs}s"),
+            }
+        } else {
+            String::new()
+        };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={}{} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1120,6 +1175,7 @@ impl Config {
             self.memory_enabled,
             self.model.as_deref().unwrap_or("(agent default)"),
             self.permission_mode,
+            permission_timeout_detail,
             respond_to_detail,
             allowed_respond_to_detail,
         )
@@ -1438,6 +1494,7 @@ mod tests {
             model: None,
             session_title: None,
             permission_mode: PermissionMode::BypassPermissions,
+            permission_timeout_secs: 600,
             respond_to: RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
             allowed_respond_to: Vec::new(),
@@ -2194,6 +2251,36 @@ channels = "ALL"
         );
         assert_eq!(PermissionMode::DontAsk.as_wire_str(), "dontAsk");
         assert_eq!(PermissionMode::Plan.as_wire_str(), "plan");
+        assert_eq!(
+            PermissionMode::AskOwner.as_wire_str(),
+            "default",
+            "owner routing pins the agent to asking; the routing itself is harness-side"
+        );
+    }
+
+    #[test]
+    fn test_permission_mode_routes_to_owner() {
+        assert!(PermissionMode::AskOwner.routes_to_owner());
+        for mode in [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::BypassPermissions,
+            PermissionMode::DontAsk,
+            PermissionMode::Plan,
+        ] {
+            assert!(
+                !mode.routes_to_owner(),
+                "{mode} must keep the pre-existing auto-approval path"
+            );
+        }
+    }
+
+    /// `askOwner` must not be treated as the agent's built-in default: an
+    /// adapter whose own default is permissive would never ask, and the
+    /// routing would be dead code.
+    #[test]
+    fn test_ask_owner_is_still_applied_to_the_agent() {
+        assert!(!PermissionMode::AskOwner.is_default());
     }
 
     #[test]
@@ -2212,6 +2299,43 @@ channels = "ALL"
             "bypassPermissions"
         );
         assert_eq!(format!("{}", PermissionMode::Default), "default");
+        assert_eq!(
+            format!("{}", PermissionMode::AskOwner),
+            "askOwner",
+            "the summary must name the configured mode, not its wire string"
+        );
+    }
+
+    #[test]
+    fn test_summary_shows_permission_timeout_only_when_routing() {
+        let mut config = test_config(SubscribeMode::Mentions);
+        config.permission_mode = PermissionMode::AskOwner;
+        config.permission_timeout_secs = 90;
+        let s = config.summary();
+        assert!(
+            s.contains("permission_mode=askOwner permission_timeout=90s"),
+            "routing mode should report its answer window, got: {s}"
+        );
+
+        config.permission_timeout_secs = 0;
+        assert!(
+            config
+                .summary()
+                .contains("permission_timeout=(turn deadline)"),
+            "0 means the turn's own hard deadline bounds the wait"
+        );
+
+        config.permission_mode = PermissionMode::BypassPermissions;
+        assert!(
+            !config.summary().contains("permission_timeout"),
+            "the window governs nothing outside owner routing"
+        );
+    }
+
+    #[test]
+    fn test_default_permission_timeout_is_ten_minutes() {
+        let config = test_config(SubscribeMode::Mentions);
+        assert_eq!(config.permission_timeout_secs, 600);
     }
 
     #[test]
@@ -2253,6 +2377,7 @@ channels = "ALL"
             ("bypass-permissions", PermissionMode::BypassPermissions),
             ("dont-ask", PermissionMode::DontAsk),
             ("plan", PermissionMode::Plan),
+            ("ask-owner", PermissionMode::AskOwner),
         ];
         for (input, expected) in &cases {
             assert_eq!(
@@ -2275,6 +2400,7 @@ channels = "ALL"
             ("bypassPermissions", PermissionMode::BypassPermissions),
             ("dontAsk", PermissionMode::DontAsk),
             ("plan", PermissionMode::Plan),
+            ("askOwner", PermissionMode::AskOwner),
         ];
         for (input, expected) in &cases {
             assert_eq!(
