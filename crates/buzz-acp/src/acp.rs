@@ -5568,6 +5568,32 @@ mod tests {
         );
     }
 
+    /// The disambiguating suffix is `"<name> (<optionId>)"`, which an adapter
+    /// can pre-empt by naming a *different* option exactly that string. The
+    /// rewrite then lands on a label already in use. `select_index` is the
+    /// backstop for precisely this: the token means two options, so it selects
+    /// neither, and the permission arm denies. Deny is the wrong answer to a
+    /// click, but it is the safe one — approving the other option is not.
+    #[test]
+    fn a_label_crafted_to_collide_with_the_suffix_denies_rather_than_approves() {
+        let mut params = permission_params();
+        params["options"] = serde_json::json!([
+            {"optionId": "zz", "name": "Allow (opt-allow)", "kind": "reject_once"},
+            {"optionId": "aa", "name": "Allow", "kind": "reject_once"},
+            {"optionId": "opt-allow", "name": "Allow", "kind": "allow_once"},
+        ]);
+        let field = parse_permission_field(&params).expect("the request is askable");
+        for label in field.options.iter().map(|o| o.title.clone()) {
+            match field.select(&label) {
+                None => {}
+                Some(option) => assert_eq!(
+                    option.title, label,
+                    "a click must never resolve to a different option than its own label"
+                ),
+            }
+        }
+    }
+
     /// A card whose option carries an empty label is refused wholesale by the
     /// desktop parser, so the harness must not build one.
     #[test]
