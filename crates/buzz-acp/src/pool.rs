@@ -724,6 +724,25 @@ impl ElicitationAsk {
         }
     }
 
+    /// Post `content` into the same thread without arming reply routing.
+    ///
+    /// For telling the owner what happened to a question they didn't answer.
+    /// Deliberately not `publish`: there is nothing left to answer, and arming
+    /// on a notice would route the owner's next message to a request the agent
+    /// has already been told was cancelled.
+    pub(crate) async fn notify(&self, content: String) {
+        let mentions: Vec<&str> = self.owner_pubkey.as_deref().into_iter().collect();
+        post_notice(
+            &self.rest,
+            self.channel_id,
+            &self.thread_tags,
+            &content,
+            &mentions,
+            &[],
+        )
+        .await;
+    }
+
     /// Stop routing owner replies to this turn. Idempotent.
     pub(crate) fn disarm(&self) {
         self.state.disarm();
@@ -1447,8 +1466,11 @@ async fn apply_session_config(
     // Apply permission mode if not the agent's built-in default AND the agent
     // advertises the requested mode in its session response. Agents that don't
     // support the mode (e.g., goose crashes on unrecognized set_config_option
-    // values) are safely skipped — the harness auto-approves via
-    // handle_permission_request.
+    // values) are safely skipped — `handle_permission_request` then answers
+    // whatever the agent asks according to the configured routing.
+    //
+    // `askOwner` sends `default` here, which is the point: the agent must ask
+    // per tool call for the harness to have anything to route to the owner.
     if !ctx.permission_mode.is_default()
         && agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
     {
@@ -1698,7 +1720,10 @@ fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) 
         .unwrap_or(false)
 }
 
-/// per-tool auto-approval in `handle_permission_request`.
+/// Tell the agent how to handle per-tool permissions, best-effort.
+///
+/// An agent that doesn't support the mode keeps its own behaviour and
+/// `handle_permission_request` answers whatever it asks.
 ///
 /// **Fatal exception:** if the agent process exits (e.g., goose crashes on
 /// unrecognized methods), returns `Err(AgentExited)` so the caller can respawn.
@@ -5838,6 +5863,7 @@ mod tests {
             &["-c".to_string(), "sleep 10".to_string()],
             &[],
             false,
+            crate::acp::PermissionRouting::Auto,
         )
         .await
         .expect("failed to spawn test agent");
@@ -5897,6 +5923,7 @@ mod tests {
             &["-c".to_string(), "sleep 10".to_string()],
             &[],
             false,
+            crate::acp::PermissionRouting::Auto,
         )
         .await
         .expect("failed to spawn test agent");
@@ -6262,9 +6289,15 @@ mod tests {
     async fn scripted_agent(script: &str) -> OwnedAgent {
         OwnedAgent {
             index: 0,
-            acp: AcpClient::spawn("bash", &["-c".to_string(), script.to_string()], &[], false)
-                .await
-                .expect("spawn scripted agent"),
+            acp: AcpClient::spawn(
+                "bash",
+                &["-c".to_string(), script.to_string()],
+                &[],
+                false,
+                crate::acp::PermissionRouting::Auto,
+            )
+            .await
+            .expect("spawn scripted agent"),
             state: SessionState::default(),
             desired_model: None,
             model_overridden: false,
