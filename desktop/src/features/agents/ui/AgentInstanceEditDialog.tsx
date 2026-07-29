@@ -12,6 +12,10 @@ import {
 } from "@/features/agents/hooks";
 import { agentLocationLabel } from "@/features/agents/lib/agentLocationLabel";
 import { providerRecordHarness } from "@/features/agents/lib/pinnedHarness";
+import {
+  losesTeamInstructionsRemotely,
+  REMOTE_TEAM_INSTRUCTIONS_ACTIVE_NOTICE,
+} from "@/features/agents/lib/remoteTeamInstructions";
 import type {
   ManagedAgent,
   RespondToMode,
@@ -979,6 +983,20 @@ export function AgentInstanceEditDialog({
                 selectedRuntimeId === "custom" && !inheritHarness
               }
             />
+            {/* Observable parity loss, not metadata: local spawn hands the
+                harness `BUZZ_ACP_TEAM_INSTRUCTIONS`, and the deploy payload has
+                no team field, so this record is running without its team's
+                standing rules right now. Stated where the record's remoteness
+                is already the subject rather than presenting it as equivalent
+                to a local agent. See `remoteTeamInstructions`. */}
+            {losesTeamInstructionsRemotely(agent) ? (
+              <p
+                className="text-xs text-warning"
+                data-testid="edit-agent-remote-team-instructions-notice"
+              >
+                {REMOTE_TEAM_INSTRUCTIONS_ACTIVE_NOTICE}
+              </p>
+            ) : null}
             {/* LLM provider */}
             {llmProviderFieldVisible ? (
               <div className="space-y-1.5">
