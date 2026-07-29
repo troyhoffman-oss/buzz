@@ -2288,18 +2288,26 @@ impl AcpClient {
         Ok(())
     }
 
-    /// Drop a parked elicitation the agent has cancelled.
+    /// Drop a parked question the agent has cancelled — either kind: an
+    /// owner-routed permission parks in the same slot.
     ///
     /// `$/cancel_request` is a notification naming a request the peer has
     /// abandoned; per JSON-RPC that request is gone, so we must not respond to
     /// it. Cancellations for anything else are ignored — the read loop's own
     /// deadlines bound every other request we serve.
+    ///
+    /// The owner's card is left standing in the channel; an answer to it now
+    /// finds nothing parked and falls through to normal dispatch, which is
+    /// the same outcome as answering any other expired question.
     fn handle_cancel_request(&mut self, msg: &serde_json::Value) {
         let Some(parked) = self.pending_elicitation.as_ref() else {
             return;
         };
         if msg["params"].get("requestId") == Some(&parked.id) {
-            tracing::info!(target: "buzz_acp::acp::elicitation", "agent cancelled elicitation id={}", parked.id);
+            tracing::info!(
+                target: "buzz_acp::acp::elicitation",
+                "agent cancelled its parked request id={}", parked.id
+            );
             self.take_pending_elicitation();
         }
     }
@@ -2498,7 +2506,11 @@ struct PendingElicitation {
     asking: usize,
     /// Answers gathered so far — becomes the `content` of the accept response.
     answers: serde_json::Map<String, serde_json::Value>,
-    /// When the current question was published, for the answer window.
+    /// When the request was parked, which the answer window runs from. Set
+    /// just before publishing rather than after: the publish is bounded at 5s
+    /// against a window measured in minutes, and charging that to the window
+    /// keeps a slow relay from extending how long a tool call can sit
+    /// undecided.
     parked_at: tokio::time::Instant,
 }
 
