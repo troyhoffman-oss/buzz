@@ -2187,7 +2187,7 @@ impl AcpClient {
     /// call as aborted, and keeps going. Silence denies — that is the whole
     /// point of the window.
     async fn deny_unanswered_permission(&mut self) -> Result<(), AcpError> {
-        let Some(pending) = self.take_pending_elicitation() else {
+        let Some(pending) = self.pending_elicitation.as_ref() else {
             return Ok(());
         };
         tracing::warn!(
@@ -2195,9 +2195,15 @@ impl AcpClient {
             "no owner answer for permission id={} within the answer window — denying it",
             pending.id
         );
-        // Answer the agent first: an owner who never saw the notice still
-        // gets a safe outcome, whereas an agent left blocked gets none.
-        self.write_ndjson(&pending.abandon_response()).await?;
+        // Write before unparking, for the reason documented on
+        // `handle_permission_request`: a failed write must leave the request
+        // answerable by teardown rather than dropping it here and leaving the
+        // agent waiting forever.
+        let response = pending.abandon_response();
+        self.write_ndjson(&response).await?;
+        self.take_pending_elicitation();
+        // Told last, and best-effort: an owner who never sees this still had
+        // the safe outcome applied on their behalf.
         if let Some(ask) = self.elicitation.as_ref() {
             ask.notify("No answer in time — the agent's request was denied.".to_owned())
                 .await;
