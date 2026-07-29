@@ -36,6 +36,7 @@ import {
   formatRuntimeOptionLabel,
   getDefaultLlmModelLabel,
   getPersonaProviderOptions,
+  getProviderApiKeyEnvVar,
   isMissingRequiredDropdownField,
   NO_RUNTIME_DROPDOWN_VALUE,
   PERSONA_FIELD_CONTROL_CLASS,
@@ -83,7 +84,6 @@ import {
   getBakedModelInheritLabel,
   getBakedProviderInheritLabel,
 } from "./bakedEnvHelpers";
-import { getProviderApiKeyEnvVar } from "./agentConfigOptions";
 import { modelFieldStatus } from "./agentAiConfigurationPolicy";
 import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { AgentAiDefaultsNotice } from "./AgentAiDefaults";
@@ -91,6 +91,7 @@ import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { resolveModelFieldStatusMessage } from "./agentConfigControls";
 import { AdvancedRequiredBadge } from "./AdvancedRequiredBadge";
+import { RemoteTeamInstructionsNotice } from "./RemoteTeamInstructionsNotice";
 import {
   showAgentProfileSyncWarning,
   showAgentSavedWhileStoppedToast,
@@ -979,6 +980,7 @@ export function AgentInstanceEditDialog({
                 selectedRuntimeId === "custom" && !inheritHarness
               }
             />
+            <RemoteTeamInstructionsNotice agent={agent} />
             {/* LLM provider */}
             {llmProviderFieldVisible ? (
               <div className="space-y-1.5">

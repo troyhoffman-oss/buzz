@@ -319,6 +319,12 @@ missing. It is a preflight, not an installer.
    otherwise emits a warning and provisions the agent anyway. Not a prerequisite — but a host that
    satisfies it gets noticeably better agents.
 
+   **`git-credential-nostr` is a third tool with a third policy: resolved, never installed.**
+   `deploy` writes the agent's `GIT_CONFIG_*` block only when the host already has the helper, and
+   nothing pushes it, so a remote agent on a host without it cannot push to a Buzz repository —
+   with no deploy-time warning, and no error until the agent tries. That is why the preflight
+   reports it as its own row rather than folding it into the `buzz` CLI check.
+
 4. **At least one harness CLI**, named exactly as `discover_harnesses` probes it. Most harnesses
    require only their ACP adapter: `codex-acp` for Codex, `goose` for Goose, `cursor-agent`, `omp`,
    `grok`, `opencode`, `kimi`, `amp-acp`, `hermes-acp`, `openclaw`, or `buzz-agent`. Claude is the
@@ -391,6 +397,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+NoNewPrivileges=true
 EnvironmentFile=%h/.config/buzz-acp/%i.env
 ExecStart=@BUZZ_ACP_BIN@
 Restart=always
@@ -403,18 +410,38 @@ WantedBy=default.target
 - `StartLimitIntervalSec=0` — a long-running agent must never be rate-limited into staying down. A
   unit held by the start limiter looks exactly like an agent that silently died, and only
   `systemctl reset-failed` clears it.
+- `NoNewPrivileges=true` — the agent runs arbitrary code by design, so the SSH user's own privileges
+  are the intended ceiling. Without this the harness can climb past them through any setuid/setgid
+  binary on the host, or through passwordless `sudo` granted to that user. It is deliberately the
+  whole hardening delta: `ProtectSystem`/`ProtectHome` belong here too, but an agent has no modeled
+  workspace yet (see Known limitations), so until writable paths are something the protocol states
+  those directives would be guessing at which of the user's home an agent legitimately needs.
 - `EnvironmentFile` — holds the minted nsec; systemd reads it as the owning user.
 - `ExecStart` is an absolute path, substituted at install time from the host's resolved `buzz-acp`.
   systemd does not expand environment variables in the program position, and the shell indirection
   that would work around that is not worth adding to a unit whose environment carries a private key.
-  The substitution is shell parameter expansion, not `sed`: `sed -i` is a GNU extension that BSD and
-  macOS hosts reject. Resolution runs *first*; the install only fills an empty `$acp`, so a deploy
-  that installed `buzz-acp` writes the path of the copy it just installed, not a stale one.
+  The substitution is shell parameter expansion, not in-place editing: `sed -i` is a GNU extension
+  that BSD and macOS hosts reject. Resolution runs *first*; the install only fills an empty `$acp`,
+  so a deploy that installed `buzz-acp` writes the path of the copy it just installed, not a stale
+  one. The path is written **double-quoted, per systemd's command-line syntax** — `ExecStart=` splits
+  an unquoted value on whitespace, and `buzz_acp_path` may legitimately name a directory containing
+  some, which would otherwise make systemd run the first word with the rest as arguments. `\` and `"`
+  are escaped on the way in, since systemd unquotes C-style escapes inside double quotes.
 
-The instance name is derived from the agent name: lowercased, non-alphanumerics collapsed to `-`,
-truncated to 32 characters, plus an 8-hex FNV-1a suffix of the original name. The suffix is not
-decoration — the payload carries no stable agent identifier, so without it two agents whose names
-differ only in punctuation would share one unit and one env file.
+The instance name is the agent name made unit-safe — lowercased, non-alphanumerics collapsed to `-`,
+truncated to 32 characters — followed by the first 12 hex characters of the agent's `pubkey`. The
+name is the readable half; **the pubkey fragment is the identity**. A display name is not unique:
+two agents called "Research Bot" on one SSH account keyed on the name alone shared one unit, one env
+file and one `agent_id`, so the second deploy overwrote the first agent's minted nsec and starting
+either record drove whichever identity was written last. `deploy` therefore refuses a payload whose
+`agent.pubkey` is absent or is not a 64-character hex key, rather than falling back to the name.
+
+**A host provisioned before this rule keeps its old units.** The instance name changed, so a
+redeploy provisions a new unit alongside the name-keyed one rather than replacing it, and the old
+unit keeps running under `Restart=always`. There is no `undeploy` op to clean that up, so on a
+pilot host stop and remove the stale pair by hand:
+`systemctl --user disable --now buzz-acp@<old-slug>.service` and delete
+`~/.config/buzz-acp/<old-slug>.env`, which holds an nsec.
 
 ## Env file contract
 
@@ -599,7 +626,20 @@ MagicDNS name typed into it will fail with `Could not resolve hostname`.
   harness whose id matches gets the LLM-provider selector; any other remote id does not, however
   the host's own catalog describes it.
 - `BUZZ_ACP_TEAM_INSTRUCTIONS` is not carried to the host — the deploy payload has no team field, so
-  a team-linked remote agent silently loses its team instructions.
+  a team-linked remote agent starts without its team's standing rules. No longer *silent*: the
+  create flow states it the moment "elsewhere" is the answer, and the edit dialog states it for a
+  record where it is already true (`remoteTeamInstructions.ts` owns both). Carrying the resolved
+  text needs a payload field.
+- **No project workspace is projected onto the host.** A local managed agent runs inside Desktop's
+  `REPOS` workspace; the unit here has no `WorkingDirectory` at all, so a remote agent starts in
+  whatever `systemd --user` gives it and has no Buzz-native project checkout. Buzz Git auth is
+  configured only when `git-credential-nostr` already happens to be on the host — the deploy
+  resolves the helper but never installs it, and writes no `GIT_CONFIG_*` block without it, so a
+  remote agent on a host that lacks it cannot push to a Buzz repository and finds out only when it
+  tries. `provision-buzz-host.sh` reports the helper as its own row for that reason. In practice
+  every long-running remote agent operates in a separately provisioned checkout. Closing this is a
+  protocol addition: a workspace field the desktop states, rather than the provider guessing which
+  project to clone.
 - `MCP_HOOK_SERVERS` is not emitted. `mcp_hooks` is local catalog metadata the provider cannot
   compute, so remote agents have no `_Stop`/`_PostCompact` hook tools.
 - `check` is implemented but has no desktop caller. `discover_harnesses` serves as the de facto
