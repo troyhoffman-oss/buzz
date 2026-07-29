@@ -1573,6 +1573,19 @@ async fn tokio_main() -> Result<()> {
             }
             _ => {} // anyone/nobody don't depend on owner
         }
+        // Owner routing needs an owner to route *to*. Without one the ask card
+        // p-tags nobody and the reply gate — `owner_cache.get() == author` —
+        // can never match, so every permission stalls its whole answer window
+        // and is then denied. That fails safe, which is why it is a warning and
+        // not a hard error, but it fails safe *silently*: the agent looks like
+        // it cannot use a single tool, with nothing in the channel saying why.
+        if config.permission_mode.routes_to_owner() {
+            tracing::warn!(
+                "permission-mode=askOwner but no owner is set — no reply can be \
+                 routed, so every permission request will be denied after its \
+                 answer window. Set BUZZ_AUTH_TAG or --agent-owner."
+            );
+        }
     }
     let owner_cache = OwnerCache::new(startup_owner.clone());
 
