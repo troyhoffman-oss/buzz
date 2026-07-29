@@ -2694,7 +2694,7 @@ fn render_elicitation_field(
 /// agent's own id with nothing hardcoded here. Returns `None` for a request
 /// carrying no usable option — there is no decision to offer.
 fn parse_permission_field(params: &serde_json::Value) -> Option<ElicitationField> {
-    let options: Vec<ElicitationOption> = params["options"]
+    let mut options: Vec<ElicitationOption> = params["options"]
         .as_array()?
         .iter()
         .filter_map(|option| {
@@ -2708,6 +2708,20 @@ fn parse_permission_field(params: &serde_json::Value) -> Option<ElicitationField
         .collect();
     if options.is_empty() {
         return None;
+    }
+    // Titles are how a click gets back to an `optionId`: the card sends the
+    // label and `select` matches it case-insensitively, first hit wins. Two
+    // options an adapter named the same thing would make the second
+    // unreachable — clicking it would approve the first. Disambiguate rather
+    // than silently mis-resolve. (They also key the card's list client-side.)
+    for index in 0..options.len() {
+        let clashes = options[..index]
+            .iter()
+            .any(|earlier| earlier.title.eq_ignore_ascii_case(&options[index].title));
+        if clashes {
+            let value = options[index].value.clone();
+            options[index].title = format!("{} ({value})", options[index].title);
+        }
     }
     // The tool call's own title is the question. Adapters that omit it get a
     // generic prompt rather than an empty one — a card with no question is
@@ -5373,6 +5387,30 @@ mod tests {
         params["toolCall"]["title"] = serde_json::json!("   ");
         let field = parse_permission_field(&params).expect("the request is still askable");
         assert!(!field.prompt.trim().is_empty());
+    }
+
+    /// A click sends the label back, and `select` takes the first title that
+    /// matches — so two options an adapter named the same thing would make the
+    /// second unreachable, and clicking it would approve the first.
+    #[test]
+    fn options_sharing_a_name_stay_separately_selectable() {
+        let mut params = permission_params();
+        params["options"] = serde_json::json!([
+            {"optionId": "opt-a7f3", "name": "Allow", "kind": "allow_once"},
+            {"optionId": "opt-b1c9", "name": "allow", "kind": "allow_always"},
+        ]);
+        let field = parse_permission_field(&params).expect("the request is askable");
+        assert_eq!(
+            field.select("Allow").map(|o| o.value.as_str()),
+            Some("opt-a7f3")
+        );
+        assert_eq!(
+            field
+                .select(&field.options[1].title.clone())
+                .map(|o| o.value.as_str()),
+            Some("opt-b1c9"),
+            "the second option must resolve to its own id, not the first's"
+        );
     }
 
     #[test]
