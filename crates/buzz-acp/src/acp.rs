@@ -153,6 +153,11 @@ pub struct AcpClient {
     /// permits both numeric and string IDs from the agent.
     /// Used by [`cancel_with_cleanup`](AcpClient::cancel_with_cleanup) to send
     /// a `cancelled` outcome before the agent returns from `session/prompt`.
+    ///
+    /// Only the auto-approving path uses this. A request routed to the owner
+    /// parks in [`pending_elicitation`](Self::pending_elicitation) instead, so
+    /// exactly one slot ever holds a given request id and teardown can never
+    /// answer it twice.
     pending_permission_id: Option<serde_json::Value>,
     /// Whether we have already sent a response to the pending permission request.
     /// Guards against double-response if a timeout fires after the allow_once
@@ -204,15 +209,101 @@ pub struct AcpClient {
     /// `read_until_response_with_idle_timeout` so it is dropped at scope exit
     /// alongside the turn it served, exactly like `steer_rx`.
     elicitation_rx: Option<tokio::sync::mpsc::Receiver<crate::pool::ElicitationReply>>,
-    /// The `elicitation/create` request awaiting an owner reply, if any. Lives
-    /// on the client rather than the read loop, like `pending_permission_id`,
-    /// so [`cancel_with_cleanup`](Self::cancel_with_cleanup) can answer it.
+    /// The agent request awaiting an owner reply, if any — an
+    /// `elicitation/create` form, or a `session/request_permission` routed by
+    /// [`permission_routing`](Self::permission_routing). Lives on the client
+    /// rather than the read loop, like `pending_permission_id`, so
+    /// [`cancel_with_cleanup`](Self::cancel_with_cleanup) can answer it.
     pending_elicitation: Option<PendingElicitation>,
+    /// How `session/request_permission` is answered. Set once at spawn from
+    /// the configured `PermissionMode` — the mode is process-global, and
+    /// deciding it per turn would leave `initialize` / `session/new` unrouted.
+    permission_routing: PermissionRouting,
     /// Usage tracker — accumulates cumulative token counts from
     /// `_goose/unstable/session/update` notifications and computes per-turn
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
+}
+
+/// Which of the turn's deadlines fires next, classified before the sleep so
+/// the outcome is immune to scheduler jitter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expiry {
+    /// No ACP wire activity for `idle_timeout`.
+    Idle,
+    /// The turn's absolute wall-clock cap.
+    Hard,
+    /// A routed permission the owner has not answered in time. The only
+    /// non-fatal one: it ends the tool call, not the turn.
+    PermissionUnanswered,
+}
+
+impl Expiry {
+    /// The error a fatal expiry returns from the read loop.
+    fn into_error(
+        self,
+        idle_timeout: std::time::Duration,
+        last_activity_at: tokio::time::Instant,
+    ) -> AcpError {
+        match self {
+            Self::Idle => {
+                tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
+                AcpError::IdleTimeout(idle_timeout)
+            }
+            // `PermissionUnanswered` is handled before this is reached; if it
+            // ever arrives here the turn has outlived its cap regardless.
+            Self::Hard | Self::PermissionUnanswered => {
+                let silence =
+                    tokio::time::Instant::now().saturating_duration_since(last_activity_at);
+                tracing::warn!("hard turn timeout exceeded (silence {silence:?})");
+                AcpError::HardTimeout { silence }
+            }
+        }
+    }
+}
+
+/// How the harness answers an agent's `session/request_permission`.
+///
+/// Process-global: chosen once from the configured
+/// [`PermissionMode`](crate::config::PermissionMode) and passed to
+/// [`AcpClient::spawn`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PermissionRouting {
+    /// Answer with the request's own `allow_once` option, unattended.
+    #[default]
+    Auto,
+    /// Publish the request's options as an ask card the channel owner answers,
+    /// blocking the turn meanwhile.
+    AskOwner {
+        /// How long to wait before answering `cancelled` (denied). `None`
+        /// waits until the turn's own hard deadline.
+        answer_window: Option<std::time::Duration>,
+    },
+}
+
+impl PermissionRouting {
+    /// Build the routing for a configured permission mode. `timeout_secs` is
+    /// only read when the mode routes to the owner; `0` means "no window of
+    /// its own — the turn's hard deadline bounds the wait".
+    pub fn from_mode(mode: crate::config::PermissionMode, timeout_secs: u64) -> Self {
+        if mode.routes_to_owner() {
+            Self::AskOwner {
+                answer_window: (timeout_secs > 0)
+                    .then(|| std::time::Duration::from_secs(timeout_secs)),
+            }
+        } else {
+            Self::Auto
+        }
+    }
+
+    /// The deadline a permission parked at `parked_at` must be denied by.
+    fn deadline(&self, parked_at: tokio::time::Instant) -> Option<tokio::time::Instant> {
+        match self {
+            Self::Auto => None,
+            Self::AskOwner { answer_window } => answer_window.map(|window| parked_at + window),
+        }
+    }
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -424,12 +515,18 @@ impl AcpClient {
     /// trigger the recursive merge + forced `network_access=true` in
     /// `build_codex_config_env`.  Pass `false` for test spawns and non-Codex agents.
     ///
+    /// `permission_routing` decides how `session/request_permission` is
+    /// answered for the life of the process. Pass
+    /// [`PermissionRouting::Auto`] for test spawns and for the short-lived
+    /// clients (auth, model listing) that never run a turn.
+    ///
     /// After spawning, call [`initialize`](Self::initialize) before any other method.
     pub async fn spawn(
         command: &str,
         args: &[String],
         extra_env: &[(String, String)],
         has_generated_codex_config: bool,
+        permission_routing: PermissionRouting,
     ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
@@ -518,6 +615,7 @@ impl AcpClient {
             elicitation: None,
             elicitation_rx: None,
             pending_elicitation: None,
+            permission_routing,
             goose_usage: UsageTracker::default(),
         })
     }
@@ -942,8 +1040,9 @@ impl AcpClient {
         };
         let field = &pending.fields[pending.asking];
         let total = pending.fields.len();
-        let body = render_elicitation_field(field, pending.asking, total);
-        let ask_tag = elicitation_ask_tag(field, pending.asking, total);
+        let free_text = pending.answer.accepts_free_text(field);
+        let body = render_elicitation_field(field, pending.asking, total, free_text);
+        let ask_tag = elicitation_ask_tag(field, pending.asking, total, free_text);
         if ask.publish(body, ask_tag).await {
             return Ok(());
         }
@@ -952,11 +1051,10 @@ impl AcpClient {
         };
         tracing::warn!(
             target: "buzz_acp::acp::elicitation",
-            "publishing the question for elicitation id={} failed — cancelling it",
+            "publishing the question for request id={} failed — abandoning it",
             pending.id
         );
-        self.write_ndjson(&elicitation_response(&pending.id, "cancel", None))
-            .await
+        self.write_ndjson(&pending.abandon_response()).await
     }
 
     /// Clear any installed steer receiver without consuming it.
@@ -1075,14 +1173,20 @@ impl AcpClient {
         }
 
         // Step 1b: same for a question the owner never answered. Without this
-        // the agent stays blocked on its `elicitation/create` and never
-        // acknowledges the cancel.
+        // the agent stays blocked on its request and never acknowledges the
+        // cancel.
+        //
+        // The response shape comes from the parked request itself, not from
+        // this call site: an owner-routed permission parks here too, and
+        // writing an `elicitation/create` response to a
+        // `session/request_permission` id would leave the agent blocked on the
+        // very cleanup meant to unblock it.
         if let Some(pending) = self.take_pending_elicitation() {
-            let response = elicitation_response(&pending.id, "cancel", None);
+            let response = pending.abandon_response();
             self.write_ndjson(&response).await?;
             tracing::debug!(
                 target: "buzz_acp::acp::cancel",
-                "cancelled pending elicitation id={}", pending.id
+                "cancelled pending request id={}", pending.id
             );
         }
 
@@ -1305,12 +1409,13 @@ impl AcpClient {
                     "_goose/unstable/session/update" => {
                         self.handle_goose_usage_update(&msg);
                     }
-                    "session/request_permission" => {
-                        self.handle_permission_request(&msg).await?;
-                    }
                     // Nothing polls a parked question outside the prompt loop —
-                    // `initialize` and `session/new` run here — so the request
-                    // is never answerable and is cancelled immediately.
+                    // `initialize` and `session/new` run here — so a request
+                    // needing a human is never answerable and is cancelled
+                    // immediately.
+                    "session/request_permission" => {
+                        self.handle_permission_request(&msg, false).await?;
+                    }
                     "elicitation/create" => {
                         self.handle_elicitation_request(&msg, false).await?;
                     }
@@ -1408,6 +1513,17 @@ impl AcpClient {
             // agent death is still caught immediately by reader EOF.
             let elicitation_parked = self.pending_elicitation.is_some();
 
+            // ...with one exception. Suspending the idle clock for a parked
+            // *permission* would let "the owner is asleep" mean "the tool call
+            // eventually runs", two hours later, holding an agent slot the
+            // whole time. A permission gets its own bounded window instead,
+            // and denies when it elapses.
+            let permission_deadline = self
+                .pending_elicitation
+                .as_ref()
+                .filter(|pending| pending.answer == ParkedAnswer::Permission)
+                .and_then(|pending| self.permission_routing.deadline(pending.parked_at));
+
             // With no question parked, nothing in the reply channel can be an
             // answer: it is a reply the main loop sent for a question that was
             // cancelled (by the agent, or by a failed publish) before the read
@@ -1423,12 +1539,15 @@ impl AcpClient {
 
             // Determine which deadline fires first BEFORE sleeping — this is
             // the classification we'll use on timeout, immune to scheduler jitter.
-            let idle_fires_first = idle_deadline < hard_deadline && !elicitation_parked;
-            let next_deadline = if idle_fires_first {
-                idle_deadline
+            let mut expiry = if idle_deadline < hard_deadline && !elicitation_parked {
+                (Expiry::Idle, idle_deadline)
             } else {
-                hard_deadline
+                (Expiry::Hard, hard_deadline)
             };
+            if let Some(deadline) = permission_deadline.filter(|d| *d < expiry.1) {
+                expiry = (Expiry::PermissionUnanswered, deadline);
+            }
+            let (expiry_kind, next_deadline) = expiry;
 
             // Pre-select deadline check — required by Max's review. Under
             // `biased`, a continuously-ready reader arm wins every poll and
@@ -1438,6 +1557,13 @@ impl AcpClient {
             // exists). Check the classified deadline here so a steady-
             // stream agent is still bounded.
             if Instant::now() >= next_deadline {
+                // An unanswered permission ends the tool call, not the turn:
+                // the agent is told `cancelled` and carries on without it.
+                if expiry_kind == Expiry::PermissionUnanswered {
+                    self.deny_unanswered_permission().await?;
+                    idle_deadline = Instant::now() + idle_timeout;
+                    continue;
+                }
                 if let Some((_, ack_tx)) = pending_steer.take() {
                     // Prompt is timing out — release the withheld event via
                     // PromptCompletedNeutral (no fallback signal: there is
@@ -1445,14 +1571,7 @@ impl AcpClient {
                     // normal dispatch handles redelivery).
                     let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
                 }
-                if idle_fires_first {
-                    tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
-                    return Err(AcpError::IdleTimeout(idle_timeout));
-                } else {
-                    let silence = Instant::now().saturating_duration_since(last_activity_at);
-                    tracing::warn!("hard turn timeout exceeded (silence {silence:?})");
-                    return Err(AcpError::HardTimeout { silence });
-                }
+                return Err(expiry_kind.into_error(idle_timeout, last_activity_at));
             }
 
             // LinesCodec::new_with_max_length enforces MAX_LINE_SIZE at the
@@ -1555,17 +1674,15 @@ impl AcpClient {
                     // would catch this anyway, but firing the deadline arm
                     // here makes the wakeup immediate (no extra reader poll
                     // round-trip when stdout is idle).
+                    if expiry_kind == Expiry::PermissionUnanswered {
+                        self.deny_unanswered_permission().await?;
+                        idle_deadline = Instant::now() + idle_timeout;
+                        continue;
+                    }
                     if let Some((_, ack_tx)) = pending_steer.take() {
                         let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
                     }
-                    if idle_fires_first {
-                        tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
-                        return Err(AcpError::IdleTimeout(idle_timeout));
-                    } else {
-                        let silence = Instant::now().saturating_duration_since(last_activity_at);
-                        tracing::warn!("hard turn timeout exceeded (silence {silence:?})");
-                        return Err(AcpError::HardTimeout { silence });
-                    }
+                    return Err(expiry_kind.into_error(idle_timeout, last_activity_at));
                 }
             };
 
@@ -1700,7 +1817,8 @@ impl AcpClient {
                                 self.handle_goose_usage_update(&msg);
                             }
                             "session/request_permission" => {
-                                self.handle_permission_request(&msg).await?;
+                                self.handle_permission_request(&msg, elicitation_rx.is_some())
+                                    .await?;
                             }
                             "elicitation/create" => {
                                 self.handle_elicitation_request(&msg, elicitation_rx.is_some())
@@ -1885,21 +2003,37 @@ impl AcpClient {
         }
     }
 
-    /// Auto-approve a `session/request_permission` request from the agent.
+    /// Answer a `session/request_permission` request from the agent.
     ///
-    /// Finds the option with `kind == "allow_once"` and responds with its `optionId`.
-    /// If no `allow_once` option exists, falls back to `reject_once`.
+    /// Under [`PermissionRouting::Auto`] the request is auto-approved here.
+    /// Under [`PermissionRouting::AskOwner`] it is handed to
+    /// [`ask_owner_for_permission`](Self::ask_owner_for_permission), which
+    /// parks it on the owner's ask card and lets the read loop answer once the
+    /// owner decides.
+    ///
+    /// `answerable` is false on the `initialize` / `session/new` path, where
+    /// nothing polls a parked question. A routed request there is cancelled
+    /// rather than auto-allowed: a tool call attempted before a session exists
+    /// is not something to approve unattended.
     ///
     /// **Critical:** Never hardcode `optionId` — always find it dynamically by `kind`.
     ///
     /// The request `id` is stored as `serde_json::Value` to support both numeric
     /// and string IDs per JSON-RPC 2.0.
-    async fn handle_permission_request(&mut self, msg: &serde_json::Value) -> Result<(), AcpError> {
+    async fn handle_permission_request(
+        &mut self,
+        msg: &serde_json::Value,
+        answerable: bool,
+    ) -> Result<(), AcpError> {
         // Extract id as a Value — JSON-RPC 2.0 allows both numeric and string IDs.
         let id = msg
             .get("id")
             .cloned()
             .ok_or_else(|| AcpError::Protocol("permission request missing id".into()))?;
+
+        if self.permission_routing != PermissionRouting::Auto {
+            return self.ask_owner_for_permission(id, msg, answerable).await;
+        }
 
         // Store pending permission id so cancel_with_cleanup can respond to it.
         self.pending_permission_id = Some(id.clone());
@@ -2008,16 +2142,88 @@ impl AcpClient {
             "asking owner {} question(s) for elicitation id={id}",
             fields.len()
         );
+        self.park(id, ParkedAnswer::Elicitation, fields).await
+    }
+
+    /// Ask the channel owner to decide a `session/request_permission`.
+    ///
+    /// The request's own options become a single-select question published as
+    /// an ask card, and the turn blocks on the agent's own semantics until the
+    /// owner picks one. Every path that cannot reach the owner — no ask
+    /// surface (the `initialize` / `session/new` loop), a question already
+    /// parked, unparseable options, a publish the relay rejected — answers
+    /// `cancelled`, which the agent surfaces as an aborted tool call.
+    ///
+    /// Cancelling is the point: the alternative for an unreachable owner is
+    /// the unattended approval this mode exists to remove.
+    async fn ask_owner_for_permission(
+        &mut self,
+        id: serde_json::Value,
+        msg: &serde_json::Value,
+        answerable: bool,
+    ) -> Result<(), AcpError> {
+        let field = parse_permission_field(&msg["params"]).filter(|_| {
+            answerable && self.elicitation.is_some() && self.pending_elicitation.is_none()
+        });
+        let Some(field) = field else {
+            tracing::warn!(
+                target: "buzz_acp::acp::permission",
+                "no owner to route permission id={id} to — cancelling rather than approving it"
+            );
+            return self.write_ndjson(&permission_response_cancelled(&id)).await;
+        };
+        tracing::info!(
+            target: "buzz_acp::acp::permission",
+            "routing permission id={id} to the owner ({} options)",
+            field.options.len()
+        );
+        self.park(id, ParkedAnswer::Permission, vec![field]).await
+    }
+
+    /// Deny a routed permission the owner did not answer in time, and tell
+    /// them so in the thread.
+    ///
+    /// The turn survives: the agent is answered `cancelled`, treats the tool
+    /// call as aborted, and keeps going. Silence denies — that is the whole
+    /// point of the window.
+    async fn deny_unanswered_permission(&mut self) -> Result<(), AcpError> {
+        let Some(pending) = self.take_pending_elicitation() else {
+            return Ok(());
+        };
+        tracing::warn!(
+            target: "buzz_acp::acp::permission",
+            "no owner answer for permission id={} within the answer window — denying it",
+            pending.id
+        );
+        // Answer the agent first: an owner who never saw the notice still
+        // gets a safe outcome, whereas an agent left blocked gets none.
+        self.write_ndjson(&pending.abandon_response()).await?;
+        if let Some(ask) = self.elicitation.as_ref() {
+            ask.notify("No answer in time — the agent's request was denied.".to_owned())
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Park `fields` as the turn's outstanding question and publish the first.
+    async fn park(
+        &mut self,
+        id: serde_json::Value,
+        answer: ParkedAnswer,
+        fields: Vec<ElicitationField>,
+    ) -> Result<(), AcpError> {
         self.pending_elicitation = Some(PendingElicitation {
             id,
+            answer,
             fields,
             asking: 0,
             answers: serde_json::Map::new(),
+            parked_at: tokio::time::Instant::now(),
         });
         self.ask_parked_elicitation().await
     }
 
-    /// Fold an owner reply into the parked elicitation, answering the agent
+    /// Fold an owner reply into the parked question, answering the agent
     /// once every field has been asked.
     async fn apply_elicitation_reply(
         &mut self,
@@ -2026,6 +2232,26 @@ impl AcpClient {
         let Some(pending) = self.pending_elicitation.as_mut() else {
             return Ok(());
         };
+        if pending.answer == ParkedAnswer::Permission {
+            // One field, one decision, no accumulation: the reply either names
+            // one of the agent's own options or it is not a decision at all.
+            let response = match &reply {
+                crate::pool::ElicitationReply::Answer(text) => pending.fields[0]
+                    .select(text)
+                    .map(|option| permission_response_selected(&pending.id, &option.value.clone())),
+                crate::pool::ElicitationReply::Skip => None,
+            };
+            let response = response.unwrap_or_else(|| {
+                tracing::info!(
+                    target: "buzz_acp::acp::permission",
+                    "owner did not approve permission id={} — cancelling it", pending.id
+                );
+                pending.abandon_response()
+            });
+            self.write_ndjson(&response).await?;
+            self.take_pending_elicitation();
+            return Ok(());
+        }
         let response = match reply {
             crate::pool::ElicitationReply::Skip => {
                 tracing::info!(
@@ -2222,16 +2448,67 @@ impl ElicitationField {
     }
 }
 
-/// An `elicitation/create` request parked awaiting owner replies.
+/// Which request a parked question answers, and therefore what response shape
+/// the owner's reply is written back as.
+///
+/// Both an `elicitation/create` form field and a `session/request_permission`
+/// are "one single-select over named options", so they share the park slot,
+/// the reply channel, the read-loop arm, and the cancel path. Only the
+/// response shape differs — writing the wrong one to the right request id
+/// hangs the agent, so it is a discriminator rather than a convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkedAnswer {
+    /// `elicitation/create` — `{action, content}`.
+    Elicitation,
+    /// `session/request_permission` — `{outcome: {outcome, optionId}}`.
+    Permission,
+}
+
+impl ParkedAnswer {
+    /// Whether a reply naming no option still reaches the agent.
+    ///
+    /// Never for a permission: the response requires an `optionId`, so free
+    /// text has nothing to become. An owner who types something unmatched has
+    /// not approved anything, and silence-shaped input must deny.
+    fn accepts_free_text(&self, field: &ElicitationField) -> bool {
+        match self {
+            Self::Elicitation => field.accepts_free_text(),
+            Self::Permission => false,
+        }
+    }
+}
+
+/// An agent request parked awaiting owner replies — an `elicitation/create`
+/// form, or a `session/request_permission` under
+/// [`PermissionRouting::AskOwner`].
 struct PendingElicitation {
     /// Stored as a `serde_json::Value` because JSON-RPC 2.0 permits both
     /// numeric and string IDs from the agent.
     id: serde_json::Value,
+    /// What the owner's reply is written back as. See [`ParkedAnswer`].
+    answer: ParkedAnswer,
     fields: Vec<ElicitationField>,
     /// Index into `fields` of the question currently published.
     asking: usize,
     /// Answers gathered so far — becomes the `content` of the accept response.
     answers: serde_json::Map<String, serde_json::Value>,
+    /// When the current question was published, for the answer window.
+    parked_at: tokio::time::Instant,
+}
+
+impl PendingElicitation {
+    /// The response for a question that will never be answered — publish
+    /// failed, the turn is being torn down, or the answer window elapsed.
+    ///
+    /// `cancelled` rather than a rejection: it is the outcome for a request
+    /// that was not decided, and the owner decided nothing. Fabricating
+    /// `reject_once` would report a denial they never issued.
+    fn abandon_response(&self) -> serde_json::Value {
+        match self.answer {
+            ParkedAnswer::Elicitation => elicitation_response(&self.id, "cancel", None),
+            ParkedAnswer::Permission => permission_response_cancelled(&self.id),
+        }
+    }
 }
 
 /// Flatten an elicitation form into the questions to ask, in schema key order
@@ -2316,10 +2593,15 @@ fn elicitation_options(schema: &serde_json::Value) -> Vec<ElicitationOption> {
 /// `label` is what a card sends back — `ElicitationField::select` resolves an
 /// option title case-insensitively, so a click needs no harness change.
 /// Returns `None` when the payload would exceed [`ASK_TAG_MAX_BYTES`].
+///
+/// `free_text` is passed in rather than read off the field because it depends
+/// on what the answer is written back as, not on the schema alone — see
+/// [`ParkedAnswer::accepts_free_text`].
 fn elicitation_ask_tag(
     field: &ElicitationField,
     index: usize,
     total: usize,
+    free_text: bool,
 ) -> Option<Vec<String>> {
     let payload = serde_json::json!({
         "v": 1,
@@ -2339,7 +2621,8 @@ fn elicitation_ask_tag(
         // Whether the answer path accepts words that name no option — see
         // `ElicitationField::accepts_free_text`, which is deliberately wider
         // than the schema: a bare single-select has always taken free text.
-        "allowFreeText": field.accepts_free_text(),
+        // A routed permission is the one shape that takes none.
+        "allowFreeText": free_text,
         "index": index,
         "total": total,
     });
@@ -2348,7 +2631,16 @@ fn elicitation_ask_tag(
 }
 
 /// Render one question as the channel message body the owner answers.
-fn render_elicitation_field(field: &ElicitationField, index: usize, total: usize) -> String {
+///
+/// This is the fallback contract for clients that ignore the `ask` tag, so the
+/// instruction line must describe what the answer path will actually accept —
+/// `free_text` decides whether "your own answer" is one of the options.
+fn render_elicitation_field(
+    field: &ElicitationField,
+    index: usize,
+    total: usize,
+    free_text: bool,
+) -> String {
     use std::fmt::Write;
 
     let mut body = String::new();
@@ -2362,14 +2654,61 @@ fn render_elicitation_field(field: &ElicitationField, index: usize, total: usize
             let _ = write!(body, " — {description}");
         }
     }
-    body.push_str(if field.options.is_empty() {
-        "\n\nReply with your answer, or `!skip`."
+    let own_answer = if free_text { ", your own answer" } else { "" };
+    let _ = if field.options.is_empty() {
+        write!(body, "\n\nReply with your answer, or `!skip`.")
     } else if field.ty == "array" {
-        "\n\nReply with the numbers (comma-separated), your own answer, or `!skip`."
+        write!(
+            body,
+            "\n\nReply with the numbers (comma-separated){own_answer}, or `!skip`."
+        )
     } else {
-        "\n\nReply with the number, your own answer, or `!skip`."
-    });
+        write!(body, "\n\nReply with the number{own_answer}, or `!skip`.")
+    };
     body
+}
+
+/// Turn a `session/request_permission` into the single-select question the
+/// owner answers.
+///
+/// `optionId` becomes the option's wire value and `name` its label, so a card
+/// click resolves through `ElicitationField::select` straight back to the
+/// agent's own id with nothing hardcoded here. Returns `None` for a request
+/// carrying no usable option — there is no decision to offer.
+fn parse_permission_field(params: &serde_json::Value) -> Option<ElicitationField> {
+    let options: Vec<ElicitationOption> = params["options"]
+        .as_array()?
+        .iter()
+        .filter_map(|option| {
+            let value = option["optionId"].as_str()?.to_owned();
+            Some(ElicitationOption {
+                title: option["name"].as_str().unwrap_or(&value).to_owned(),
+                description: None,
+                value,
+            })
+        })
+        .collect();
+    if options.is_empty() {
+        return None;
+    }
+    // The tool call's own title is the question. Adapters that omit it get a
+    // generic prompt rather than an empty one — a card with no question is
+    // rejected client-side, and an unanswerable card is an unattended
+    // approval by another name.
+    let title = params["toolCall"]["title"]
+        .as_str()
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
+    Some(ElicitationField {
+        name: "permission".to_owned(),
+        ty: "string".to_owned(),
+        custom: None,
+        prompt: match title {
+            Some(title) => format!("Agent wants to run: {title}"),
+            None => "Agent is requesting permission to run a tool.".to_owned(),
+        },
+        options,
+    })
 }
 
 /// Fold the owner's plain-text `reply` into `answers` under `field`'s key, or
@@ -3342,7 +3681,11 @@ mod tests {
     }
 
     async fn spawn_script(script: &str) -> AcpClient {
-        AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+        spawn_routed_script(script, PermissionRouting::Auto).await
+    }
+
+    async fn spawn_routed_script(script: &str, routing: PermissionRouting) -> AcpClient {
+        AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false, routing)
             .await
             .expect("failed to spawn test script")
     }
@@ -3893,7 +4236,7 @@ mod tests {
     /// which is fine — these tests don't read from the agent, they just
     /// feed JSON into the parser.
     async fn spawn_inert_client() -> AcpClient {
-        AcpClient::spawn("cat", &[], &[], false)
+        AcpClient::spawn("cat", &[], &[], false, PermissionRouting::Auto)
             .await
             .expect("spawn cat as inert client")
     }
@@ -4426,7 +4769,7 @@ mod tests {
     #[test]
     fn elicitation_question_renders_an_actionable_fallback() {
         let fields = ask_fields();
-        let body = render_elicitation_field(&fields[0], 0, 1);
+        let body = render_elicitation_field(&fields[0], 0, 1, true);
         assert!(
             !body.contains("<!--"),
             "no HTML comment may ride the body — a marker-blind client renders it literally: {body}"
@@ -4442,7 +4785,7 @@ mod tests {
             !body.contains("Question"),
             "a single-question form carries no numbering header: {body}"
         );
-        let second_of_three = render_elicitation_field(&fields[0], 1, 3);
+        let second_of_three = render_elicitation_field(&fields[0], 1, 3, true);
         assert!(
             second_of_three.contains("Question 2 of 3"),
             "multi-question forms number the question the owner is on: {second_of_three}"
@@ -4452,7 +4795,8 @@ mod tests {
     #[test]
     fn elicitation_ask_tag_carries_the_card_structure() {
         let fields = ask_fields();
-        let tag = elicitation_ask_tag(&fields[0], 1, 3).expect("a small form fits the tag");
+        let tag = elicitation_ask_tag(&fields[0], 1, 3, fields[0].accepts_free_text())
+            .expect("a small form fits the tag");
         assert_eq!(tag[0], "ask");
         let payload: serde_json::Value =
             serde_json::from_str(&tag[1]).expect("the tag value is JSON");
@@ -4489,7 +4833,8 @@ mod tests {
             "requestedSchema": {"type": "object", "properties": properties},
         });
         let fields = parse_elicitation_fields(&params).expect("form must parse");
-        let tag = elicitation_ask_tag(&fields[0], 0, 1).expect("a small form fits the tag");
+        let tag = elicitation_ask_tag(&fields[0], 0, 1, fields[0].accepts_free_text())
+            .expect("a small form fits the tag");
         serde_json::from_str(&tag[1]).expect("the tag value is JSON")
     }
 
@@ -4619,7 +4964,7 @@ mod tests {
         });
         let fields = parse_elicitation_fields(&params).expect("form must parse");
         assert!(
-            elicitation_ask_tag(&fields[0], 0, 1).is_none(),
+            elicitation_ask_tag(&fields[0], 0, 1, fields[0].accepts_free_text()).is_none(),
             "an oversized question publishes body-only rather than a huge tag"
         );
     }

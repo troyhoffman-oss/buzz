@@ -841,6 +841,12 @@ pub fn propagate_legacy_env_vars() {
 }
 
 impl Config {
+    /// How agent processes spawned from this config answer
+    /// `session/request_permission`.
+    pub fn permission_routing(&self) -> crate::acp::PermissionRouting {
+        crate::acp::PermissionRouting::from_mode(self.permission_mode, self.permission_timeout_secs)
+    }
+
     pub fn from_cli() -> Result<Self, ConfigError> {
         // Legacy env-var propagation is intentionally NOT done here.
         // Call `propagate_legacy_env_vars()` before the tokio runtime starts
