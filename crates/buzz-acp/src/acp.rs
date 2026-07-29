@@ -5765,6 +5765,66 @@ mod tests {
         assert!(client.pending_elicitation.is_none());
     }
 
+    /// Every routed question is armed under the event id the relay assigned
+    /// it, and the main loop only routes a reply whose thread parent equals
+    /// that id. This is what keeps an answer from crossing questions — a stale
+    /// answer to a resolved ask, and, with two agents in one channel, an
+    /// answer to the *other* agent's card. Neither can approve this tool call:
+    /// identity is not what disambiguates them, the question id is.
+    #[tokio::test]
+    async fn a_reply_is_armed_only_under_this_questions_own_event_id() {
+        let mut client = spawn_routed_script("sleep 10", ask_owner(600)).await;
+        let (_reply_tx, reply_rx) = tokio::sync::mpsc::channel(1);
+        let (ask, state, _relay) = test_ask().await;
+        client.install_elicitation(ask, reply_rx);
+
+        assert_eq!(
+            state.question_event_id(),
+            None,
+            "with nothing asked, no message in the channel can be an answer"
+        );
+        client
+            .handle_permission_request(&permission_request(), true)
+            .await
+            .expect("the request parks");
+        let armed = state
+            .question_event_id()
+            .expect("the published question arms the reply gate");
+
+        // Resolving the question disarms it, so an answer arriving late — or
+        // one addressed to another agent's still-open card — matches nothing
+        // and falls through to normal dispatch as an ordinary message.
+        client
+            .deny_unanswered_permission()
+            .await
+            .expect("the window elapses");
+        assert_eq!(
+            state.question_event_id(),
+            None,
+            "a resolved question must stop accepting answers"
+        );
+
+        // A different question arms a different id, so an answer still
+        // carrying the first one's parent cannot be mistaken for an answer to
+        // this one. (Two *textually identical* asks published in the same
+        // second do share an id — a nostr id is derived from content plus a
+        // one-second timestamp — but that is a property of the ask machinery
+        // as a whole, and resolving a permission takes either an owner or a
+        // window measured in seconds, so it is not reachable here.)
+        let mut other = permission_request();
+        other["id"] = serde_json::json!(8);
+        other["params"]["toolCall"]["title"] = serde_json::json!("rm -rf /etc");
+        client
+            .handle_permission_request(&other, true)
+            .await
+            .expect("a second request parks once the first is resolved");
+        assert_ne!(
+            state.question_event_id().as_deref(),
+            Some(armed.as_str()),
+            "a different question is answerable only under its own event id"
+        );
+    }
+
     /// One question at a time. A second permission arriving while one is
     /// parked cannot be published, so it is denied rather than queued behind
     /// a decision that may never come.
@@ -5799,6 +5859,53 @@ mod tests {
                 .map(|pending| pending.id.clone()),
             Some(serde_json::json!(7)),
             "the owner's outstanding decision must not be displaced"
+        );
+    }
+
+    /// `!cancel` must not queue behind the owner's decision. The control
+    /// signal reaches `cancel_with_cleanup` on a channel separate from the
+    /// blocked read loop, so teardown answers the parked permission itself
+    /// rather than waiting for an answer window that may never elapse —
+    /// `answer_window: None` is exactly the "waits until the turn's hard
+    /// deadline" configuration an owner-issued cancel has to cut through.
+    #[tokio::test]
+    async fn cancel_does_not_wait_for_a_permission_answer_window() {
+        let script = "read -r answer; \
+                      case \"$answer\" in *'\"outcome\"'*) ;; *) sleep 30 ;; esac; \
+                      read -r _cancel; \
+                      echo '{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{\"stopReason\":\"cancelled\"}}'";
+        let mut client = spawn_routed_script(
+            script,
+            PermissionRouting::AskOwner {
+                answer_window: None,
+            },
+        )
+        .await;
+        let (_reply_tx, reply_rx) = tokio::sync::mpsc::channel(1);
+        let (ask, state, _relay) = test_ask().await;
+        client.install_elicitation(ask, reply_rx);
+        client
+            .handle_permission_request(&permission_request(), true)
+            .await
+            .expect("the request parks with no window of its own");
+        client.last_prompt_id = Some(999);
+
+        let started = std::time::Instant::now();
+        let stop = client
+            .cancel_with_cleanup_grace("s", std::time::Duration::from_secs(5))
+            .await
+            .expect("cancel must unblock the agent without an owner answer");
+        assert_eq!(stop, StopReason::Cancelled);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "cancel waited on the answer window: {:?}",
+            started.elapsed()
+        );
+        assert!(client.pending_elicitation.is_none());
+        assert_eq!(
+            state.question_event_id(),
+            None,
+            "the cancelled question must stop routing owner replies"
         );
     }
 
