@@ -34,14 +34,21 @@ const desktopRoot = path.resolve(
   "../../../..",
 );
 
+// The two tables live in two files: `KNOWN_ACP_RUNTIMES` stayed in
+// discovery.rs, `PRESET_HARNESSES` moved into the discovery/ module's
+// presets.rs. Read each from its own source rather than assuming one file.
 const discoveryRs = readFileSync(
   path.join(desktopRoot, "src-tauri/src/managed_agents/discovery.rs"),
   "utf8",
 );
+const presetsRs = readFileSync(
+  path.join(desktopRoot, "src-tauri/src/managed_agents/discovery/presets.rs"),
+  "utf8",
+);
 
 /** Every `id` + `label` pair inside one Rust table literal. */
-function parseCatalog(constName, structName) {
-  const block = discoveryRs.match(
+function parseCatalog(source, constName, structName) {
+  const block = source.match(
     new RegExp(
       `const ${constName}: &\\[${structName}\\] = &\\[([\\s\\S]*?)\\n\\];`,
     ),
@@ -53,8 +60,8 @@ function parseCatalog(constName, structName) {
 }
 
 const rustHarnesses = [
-  ...parseCatalog("KNOWN_ACP_RUNTIMES", "KnownAcpRuntime"),
-  ...parseCatalog("PRESET_HARNESSES", "PresetHarness"),
+  ...parseCatalog(discoveryRs, "KNOWN_ACP_RUNTIMES", "KnownAcpRuntime"),
+  ...parseCatalog(presetsRs, "PRESET_HARNESSES", "PresetHarness"),
 ];
 
 test("the Rust catalog parse found both tables", () => {

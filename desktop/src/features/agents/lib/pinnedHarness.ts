@@ -37,6 +37,7 @@ export const HARNESS_LABELS: Record<string, string> = {
   claude: "Claude Code",
   codex: "Codex",
   cursor: "Cursor",
+  devin: "Devin",
   goose: "Goose",
   grok: "Grok Build",
   hermes: "Hermes Agent",

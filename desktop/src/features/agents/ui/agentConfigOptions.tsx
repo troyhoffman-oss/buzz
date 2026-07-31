@@ -42,6 +42,7 @@ const KNOWN_LLM_PROVIDER_IDS = [
   "databricks_v2",
   "openai",
   "openai-compat",
+  "openrouter",
 ] as const;
 
 type PersonaLlmProviderId = (typeof KNOWN_LLM_PROVIDER_IDS)[number];
@@ -113,6 +114,10 @@ const PROVIDER_CREDENTIAL_CONFIG: Partial<
   "databricks-v2": {
     requiredEnvKeys: ["DATABRICKS_HOST"],
   },
+  openrouter: {
+    requiredEnvKeys: ["OPENROUTER_API_KEY"],
+    secretEnvVar: "OPENROUTER_API_KEY",
+  },
 };
 
 const DEFAULT_MODEL_OPTION: PersonaModelOption = {
@@ -124,6 +129,7 @@ export const PERSONA_LLM_PROVIDER_OPTIONS: readonly PersonaModelOption[] = [
   { id: "anthropic", label: "Anthropic" },
   { id: "openai", label: "OpenAI" },
   { id: "openai-compat", label: "OpenAI-compatible" },
+  { id: "openrouter", label: "OpenRouter" },
   { id: "relay-mesh", label: "Buzz shared compute" },
   { id: "databricks", label: "Databricks" },
   { id: "databricks_v2", label: "Databricks v2" },
@@ -283,7 +289,8 @@ export function providerRequiresExplicitModel(
   return (
     trimmedProvider === "anthropic" ||
     trimmedProvider === "openai" ||
-    trimmedProvider === "openai-compat"
+    trimmedProvider === "openai-compat" ||
+    trimmedProvider === "openrouter"
   );
 }
 
@@ -492,6 +499,60 @@ export function formatRuntimeOptionLabel(runtime: AcpRuntimeCatalogEntry) {
             ? " (not installed)"
             : "";
   return `${runtime.label}${suffix}`;
+}
+
+export function buildPersonaRuntimeDropdownOptions({
+  defaultRuntimeId,
+  isCreateMode,
+  runtime,
+  runtimes,
+  runtimesLoading,
+}: {
+  defaultRuntimeId?: string;
+  isCreateMode: boolean;
+  runtime: string;
+  runtimes: AcpRuntimeCatalogEntry[];
+  runtimesLoading: boolean;
+}): {
+  blankRuntimeOptionLabel: string;
+  runtimeDropdownOptions: PersonaDropdownOption[];
+} {
+  const blankRuntimeOptionLabel = runtimesLoading
+    ? "Loading harnesses..."
+    : isCreateMode
+      ? "Choose a harness"
+      : "No preference (use app default)";
+  const runtimeDropdownOptions: PersonaDropdownOption[] = [
+    ...(!isCreateMode
+      ? [
+          {
+            label: blankRuntimeOptionLabel,
+            value: NO_RUNTIME_DROPDOWN_VALUE,
+          },
+        ]
+      : []),
+    ...sortPersonaRuntimes(runtimes).map((candidate) => ({
+      disabled:
+        isCreateMode &&
+        defaultRuntimeId !== undefined &&
+        candidate.availability !== "available",
+      label: `${formatRuntimeOptionLabel(candidate)}${
+        isCreateMode && candidate.id === defaultRuntimeId ? " (default)" : ""
+      }`,
+      value: candidate.id,
+    })),
+  ];
+  const currentRuntime = runtime.trim();
+  if (
+    currentRuntime.length > 0 &&
+    !runtimeDropdownOptions.some((option) => option.value === currentRuntime)
+  ) {
+    runtimeDropdownOptions.push({
+      label: `${currentRuntime} (current)`,
+      value: currentRuntime,
+    });
+  }
+  return { blankRuntimeOptionLabel, runtimeDropdownOptions };
 }
 
 function runtimeAvailabilitySortRank(

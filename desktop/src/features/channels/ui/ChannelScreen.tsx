@@ -48,6 +48,7 @@ import {
   channelWindowThreadSummaries,
   type ChannelWindowThreadSummary,
 } from "@/features/messages/lib/channelWindowStore";
+import { DeleteMessageConfirmDialog } from "@/features/messages/ui/DeleteMessageConfirmDialog";
 import { getThreadReference } from "@/features/messages/lib/threading";
 import { imetaMediaFromTags } from "@/features/messages/lib/imetaMediaMarkdown";
 import {
@@ -484,6 +485,9 @@ export function ChannelScreen({
       timelineMessages.find((message) => message.id === editTargetId) ?? null,
     [editTargetId, timelineMessages],
   );
+  // Event id awaiting the empty-edit "Delete message?" confirmation (non-null
+  // while the dialog is open); see handleEditSave.
+  const [emptyDeleteId, setEmptyDeleteId] = React.useState<string | null>(null);
   const {
     handleCancelEdit,
     handleCancelThreadReply,
@@ -507,6 +511,7 @@ export function ChannelScreen({
     markRevealedRepliesRead,
     openThreadHeadId: effectiveOpenThreadHeadId,
     onOptimisticOpenThreadHeadIdChange: setOptimisticOpenThreadHeadId,
+    onRequestEmptyEditDelete: setEmptyDeleteId,
     sendMessageMutation,
     setExpandedThreadReplyIds,
     setEditTargetId,
@@ -692,6 +697,7 @@ export function ChannelScreen({
       channelManagementOpen,
   );
   const displayedThreadHeadMessage = threadPanelData.threadHead;
+  const displayedThreadAllMessages = threadPanelData.messages;
   const displayedThreadMessages = threadPanelData.visibleReplies;
   const displayedThreadReplyTargetMessage = threadPanelData.replyTargetMessage;
   const displayedThreadFirstUnreadReplyId = displayedThreadHeadMessage
@@ -801,6 +807,19 @@ export function ChannelScreen({
           onOpenChange={welcomeAgentCreate.setIsOpen}
           open={welcomeAgentCreate.isOpen}
           sendError={welcomeAgentCreate.error}
+        />
+        <DeleteMessageConfirmDialog
+          onConfirm={() => {
+            if (emptyDeleteId) {
+              setEditTargetId(null);
+              void handleDelete({ id: emptyDeleteId });
+            }
+            setEmptyDeleteId(null);
+          }}
+          onOpenChange={(open) => {
+            if (!open) setEmptyDeleteId(null);
+          }}
+          open={emptyDeleteId !== null}
         />
         <div
           className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
@@ -949,6 +968,7 @@ export function ChannelScreen({
                     firstUnreadMessageId={firstUnreadMessageId}
                     unreadCount={unreadCount}
                     targetMessageId={mainTimelineTargetMessageId}
+                    threadAllMessages={displayedThreadAllMessages}
                     threadHeadMessage={displayedThreadHeadMessage}
                     threadMessages={displayedThreadMessages}
                     threadMessagesPending={threadRepliesQuery.isPending}

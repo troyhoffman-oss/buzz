@@ -97,6 +97,12 @@ import {
   showAgentSavedWhileStoppedToast,
 } from "./agentProfileSyncWarning";
 import { useInstanceModelDefinitionWrite } from "./instanceModelDefinitionWrite";
+import { AddCustomHarnessDialog } from "./AddCustomHarnessDialog";
+import {
+  ADD_CUSTOM_HARNESS_OPTION,
+  runtimeDropdownAction,
+  usePendingHarnessSelection,
+} from "./addCustomHarness";
 
 const ADVANCED_FIELDS_MOTION_TRANSITION = {
   duration: 0.18,
@@ -187,6 +193,7 @@ export function AgentInstanceEditDialog({
   const [avatarUrl, setAvatarUrl] = React.useState(agent.avatarUrl ?? "");
   const [isAvatarUploadPending, setIsAvatarUploadPending] =
     React.useState(false);
+  const [isAddHarnessOpen, setIsAddHarnessOpen] = React.useState(false);
   const shouldReduceMotion = useReducedMotion();
 
   // Runtime selector: defaults to "custom" until the dialog opens and the
@@ -221,6 +228,7 @@ export function AgentInstanceEditDialog({
       setAvatarUrl(agent.avatarUrl ?? "");
       setShowAdvancedFields(false);
       setIsAvatarUploadPending(false);
+      setIsAddHarnessOpen(false);
       runtimeTouched.current = false;
       setSelectedRuntimeId(
         resolveDialogRuntimeId(
@@ -279,6 +287,7 @@ export function AgentInstanceEditDialog({
         value: selectedRuntimeId,
       });
     }
+    options.push(ADD_CUSTOM_HARNESS_OPTION);
     return options;
   }, [sortedRuntimes, selectedRuntimeId]);
 
@@ -518,9 +527,15 @@ export function AgentInstanceEditDialog({
     // reach it is already pinned to `buzz-agent` (relay-mesh is offered to no
     // other pin). Running the body would overwrite that pin with THIS
     // computer's buzz-agent path and default args, and deploy them to the host.
+    // Checked before the dropdown action so a pinned record cannot even open
+    // the add-harness dialog it could never apply the result of.
     if (pinnedRuntimeId !== null) return;
-    const nextRuntimeId =
-      nextValue === NO_RUNTIME_DROPDOWN_VALUE ? "" : nextValue;
+    const action = runtimeDropdownAction(nextValue);
+    if (action.kind === "add-custom-harness") {
+      setIsAddHarnessOpen(true);
+      return;
+    }
+    const nextRuntimeId = action.runtimeId;
     const previousRuntimeId = selectedRuntimeId;
     const nextRuntime = runtimes.find((r) => r.id === nextRuntimeId);
 
@@ -566,6 +581,16 @@ export function AgentInstanceEditDialog({
       }),
     );
   }
+
+  // Routed through the normal change handler so a harness registered inline
+  // pins its command and resets model/provider like a hand-picked one. Scoped
+  // to `open` so a pending id can't outlive the dialog that started the
+  // registration.
+  const selectSavedHarness = usePendingHarnessSelection(
+    runtimes,
+    handleRuntimeDropdownChange,
+    open,
+  );
 
   function handleProviderDropdownChange(nextValue: string) {
     const nextProvider =
@@ -955,7 +980,7 @@ export function AgentInstanceEditDialog({
               </div>
             </div>
 
-            {/* Who can talk to this agent */}
+            {/* Who can send instructions */}
             <CreateAgentRespondToField
               allowlist={respondToAllowlist}
               disabled={updateMutation.isPending}
@@ -981,6 +1006,14 @@ export function AgentInstanceEditDialog({
               }
             />
             <RemoteTeamInstructionsNotice agent={agent} />
+            {/* Modal mount, not layout: the harness dropdown's
+                "Add custom harness..." option opens it from wherever the
+                field renders — including inside EditAgentHarnessFields. */}
+            <AddCustomHarnessDialog
+              onOpenChange={setIsAddHarnessOpen}
+              onSaved={selectSavedHarness}
+              open={isAddHarnessOpen}
+            />
             {/* LLM provider */}
             {llmProviderFieldVisible ? (
               <div className="space-y-1.5">

@@ -8,7 +8,6 @@ import type {
   UpdatePersonaInput,
 } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
-import { Button } from "@/shared/ui/button";
 import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
 import { Dialog } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
@@ -89,6 +88,13 @@ import { buildRuntimeModelProviderPayload } from "./agentDefinitionSubmitPayload
 import { useCreateRuntimeSeed } from "./useCreateRuntimeSeed";
 import { useRemoteAwareModelDiscovery } from "./useRemoteAwareModelDiscovery";
 import type { RemoteModelDiscoveryView } from "./whereToRunIntent";
+import { AgentDefinitionDialogFooter } from "./AgentDefinitionDialogFooter";
+import { AddCustomHarnessDialog } from "./AddCustomHarnessDialog";
+import {
+  ADD_CUSTOM_HARNESS_OPTION,
+  runtimeDropdownAction,
+  usePendingHarnessSelection,
+} from "./addCustomHarness";
 
 type AgentDefinitionDialogProps = {
   open: boolean;
@@ -103,7 +109,10 @@ type AgentDefinitionDialogProps = {
   onOpenChange: (open: boolean) => void;
   onSubmit: (
     input: CreatePersonaInput | UpdatePersonaInput,
+    options: AgentDefinitionSubmitOptions,
   ) => Promise<unknown>;
+  /** Publishes saved changes when the edited agent is shared in the catalog. */
+  publishCatalogUpdatesOnSave?: boolean;
   /**
    * Rendered below the form fields in create mode only ("Where to run"). A
    * render prop because the section's host model probe must carry this
@@ -146,6 +155,10 @@ type AgentDefinitionDialogProps = {
   editsProviderRecord?: boolean;
 };
 
+export type AgentDefinitionSubmitOptions = {
+  publishCatalogUpdates: boolean;
+};
+
 const ADVANCED_FIELDS_MOTION_TRANSITION = {
   duration: 0.18,
   ease: [0.23, 1, 0.32, 1],
@@ -163,6 +176,7 @@ export function AgentDefinitionDialog({
   runtimesLoading = false,
   onOpenChange,
   onSubmit,
+  publishCatalogUpdatesOnSave = false,
   createRunSection,
   createSubmitBlocked = false,
   createRunsRemotely = false,
@@ -211,6 +225,8 @@ export function AgentDefinitionDialog({
   const [showAdvancedFields, setShowAdvancedFields] = React.useState(false);
   const [isAvatarUploadPending, setIsAvatarUploadPending] =
     React.useState(false);
+  const [hasUserChanges, setHasUserChanges] = React.useState(false);
+  const [isAddHarnessOpen, setIsAddHarnessOpen] = React.useState(false);
   const {
     globalConfig,
     inheritedDefaults: {
@@ -265,6 +281,7 @@ export function AgentDefinitionDialog({
     // Advanced always starts collapsed and only changes from its toggle.
     setShowAdvancedFields(false);
     setIsAvatarUploadPending(false);
+    setHasUserChanges(false);
     isRuntimeAutoSeededRef.current = false;
     hasSeededForOpenRef.current = false;
   }, [initialValues, open]);
@@ -313,6 +330,8 @@ export function AgentDefinitionDialog({
       behaviorSeedRef.current = emptyPersonaBehaviorDraft;
       setShowAdvancedFields(false);
       setIsAvatarUploadPending(false);
+      setHasUserChanges(false);
+      setIsAddHarnessOpen(false);
       // isRuntimeAutoSeededRef and hasSeededForOpenRef are NOT reset here — the
       // [initialValues, open] effect resets both when the dialog re-opens.
     }
@@ -365,14 +384,19 @@ export function AgentDefinitionDialog({
     };
 
     if ("id" in initialValues) {
-      await onSubmit({
-        id: initialValues.id,
-        ...baseInput,
-      });
+      await onSubmit(
+        {
+          id: initialValues.id,
+          ...baseInput,
+        },
+        {
+          publishCatalogUpdates: publishCatalogUpdatesOnSave && hasUserChanges,
+        },
+      );
       return;
     }
 
-    await onSubmit(baseInput);
+    await onSubmit(baseInput, { publishCatalogUpdates: false });
   }
 
   function handleSubmitForm(event: React.FormEvent<HTMLFormElement>) {
@@ -415,6 +439,7 @@ export function AgentDefinitionDialog({
     ? undefined
     : localRuntimeFileConfig;
   function handleAiConfigurationModeChange(nextMode: AgentAiConfigurationMode) {
+    setHasUserChanges(true);
     setAiConfigurationMode(nextMode);
     setIsCustomProviderEditing(false);
     setIsCustomModelEditing(false);
@@ -599,6 +624,10 @@ export function AgentDefinitionDialog({
     runtimes,
     runtimesLoading,
   });
+  // Upstream's inline "Add custom harness..." entry is appended after the
+  // gate-aware options so it is never subject to the availability disabling
+  // the gate applies to real harnesses.
+  runtimeDropdownOptions.push(ADD_CUSTOM_HARNESS_OPTION);
   // The host's pick wins outright for a remote create: `runtime` still holds
   // whatever the local seeding effects resolved, and naming that harness in
   // the summary would describe a machine this agent will never run on.
@@ -688,8 +717,13 @@ export function AgentDefinitionDialog({
   }
 
   function handleRuntimeDropdownChange(nextValue: string) {
-    const nextRuntime =
-      nextValue === NO_RUNTIME_DROPDOWN_VALUE ? "" : nextValue;
+    const action = runtimeDropdownAction(nextValue);
+    if (action.kind === "add-custom-harness") {
+      setIsAddHarnessOpen(true);
+      return;
+    }
+    setHasUserChanges(true);
+    const nextRuntime = action.runtimeId;
     // The user made an explicit choice — no longer auto-seeded.
     isRuntimeAutoSeededRef.current = false;
     setRuntime(nextRuntime);
@@ -705,7 +739,17 @@ export function AgentDefinitionDialog({
     );
   }
 
+  // Routed through the normal change handler so a harness registered inline
+  // resets model/provider exactly as a hand-picked one would. Scoped to `open`
+  // so a pending id can't outlive the dialog that started the registration.
+  const selectSavedHarness = usePendingHarnessSelection(
+    runtimes,
+    handleRuntimeDropdownChange,
+    open,
+  );
+
   function handleProviderDropdownChange(nextValue: string) {
+    setHasUserChanges(true);
     const nextProvider =
       nextValue === AUTO_PROVIDER_DROPDOWN_VALUE ? "" : nextValue;
     if (nextProvider === "relay-mesh" && runtime !== "buzz-agent") {
@@ -723,6 +767,7 @@ export function AgentDefinitionDialog({
   }
 
   function handleModelDropdownChange(nextValue: string) {
+    setHasUserChanges(true);
     applySelection(
       selectionOnModelDropdownChange(selection, {
         nextValue,
@@ -749,42 +794,38 @@ export function AgentDefinitionDialog({
         headerClassName="pb-2"
         title={title}
         footer={
-          <div className="flex w-full items-center justify-end gap-2">
-            <Button
-              disabled={isPending || isAvatarUploadPending}
-              onClick={() => handleOpenChange(false)}
-              type="button"
-              variant="outline"
-            >
-              Cancel
-            </Button>
-            <Button
-              data-testid="persona-dialog-submit"
-              disabled={!canSubmit}
-              form="persona-dialog-form"
-              type="submit"
-            >
-              {isPending
-                ? "Saving..."
-                : isAvatarUploadPending
-                  ? "Uploading..."
-                  : submitLabel}
-            </Button>
-          </div>
+          <AgentDefinitionDialogFooter
+            canSubmit={canSubmit}
+            isAvatarUploadPending={isAvatarUploadPending}
+            isPending={isPending}
+            onCancel={() => handleOpenChange(false)}
+            publishesCatalogUpdates={
+              publishCatalogUpdatesOnSave && hasUserChanges
+            }
+            submitBlockReason={null}
+            submitLabel={submitLabel}
+          />
         }
       >
         <form
           className="grid gap-5 lg:grid-cols-[220px_minmax(0,1fr)]"
           id="persona-dialog-form"
+          onChangeCapture={() => setHasUserChanges(true)}
           onSubmit={handleSubmitForm}
         >
           <AgentCreationPreview
             avatarUrl={previewAvatarUrl}
             disabled={isPending || isAvatarUploadPending}
             label={previewLabel}
-            onClearAvatar={() => setAvatarUrl("")}
+            onClearAvatar={() => {
+              setHasUserChanges(true);
+              setAvatarUrl("");
+            }}
             onUploadPendingChange={setIsAvatarUploadPending}
-            onSelectAvatar={setAvatarUrl}
+            onSelectAvatar={(nextAvatarUrl) => {
+              setHasUserChanges(true);
+              setAvatarUrl(nextAvatarUrl);
+            }}
           />
 
           <div className="space-y-5">
@@ -987,6 +1028,14 @@ export function AgentDefinitionDialog({
               returnFocusRef={aiDefaultsTriggerRef}
             />
 
+            {/* The create-mode "Where to run" section renders above, next to
+                the harness field it gates — see `createRunSection?.(...)`. */}
+            <AddCustomHarnessDialog
+              onOpenChange={setIsAddHarnessOpen}
+              onSaved={selectSavedHarness}
+              open={isAddHarnessOpen}
+            />
+
             <div className="space-y-3">
               <button
                 aria-expanded={showAdvancedFields}
@@ -1035,7 +1084,10 @@ export function AgentDefinitionDialog({
                       model={model}
                       modelTuningRuntimeId={runtime}
                       namePoolText={namePoolText}
-                      onBehaviorDraftChange={setBehaviorDraft}
+                      onBehaviorDraftChange={(nextBehaviorDraft) => {
+                        setHasUserChanges(true);
+                        setBehaviorDraft(nextBehaviorDraft);
+                      }}
                       onEnvVarsChange={setEnvVars}
                       onNamePoolTextChange={setNamePoolText}
                       provider={effectiveProvider}
