@@ -1,5 +1,9 @@
 use super::*;
 use crate::managed_agents::AgentDefinition;
+// Test-only deploy symbols are imported here rather than re-exported through
+// `agents.rs`: that file is over the size ratchet, so it may not grow, and
+// nothing outside these tests needs them.
+use super::deploy::{ensure_remote_provider_supported, EffectiveDeployConfig};
 
 fn bare_agent_record(
     persona_id: Option<&str>,
