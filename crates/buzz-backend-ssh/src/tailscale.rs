@@ -73,6 +73,17 @@ pub struct Tailnet {
     devices: Vec<Device>,
 }
 
+/// How long the CLI probe may take before this decides there is no tailnet.
+///
+/// Load-bearing rather than defensive. `detect` runs inside `info`, and the
+/// desktop gives `info` a **10-second** budget on a gate it runs *before* the
+/// deploy request — so an unresponsive `tailscaled` does not merely cost the
+/// schema its device picker, it makes the whole provider undeployable and
+/// reports the failure as "provider timed out", which names the wrong
+/// component. Three seconds is far longer than a healthy `status --json` needs
+/// and far shorter than the budget it must not consume.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl Tailnet {
     /// Run `tailscale status --json` and parse it. Never fails.
     pub fn detect() -> Self {
@@ -80,15 +91,81 @@ impl Tailnet {
             return Self::default();
         };
         let mut command = Command::new(binary);
-        command.arg("status").arg("--json");
+        command
+            .arg("status")
+            .arg("--json")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
         crate::ssh::configure_no_window(&mut command);
         // We never branch on the exit code: a logged-out daemon exits 0 with
         // `BackendState: "NeedsLogin"` and `Peer: null`, while a missing daemon
         // socket exits 1. `parse` handles both by looking at the document.
-        match command.output() {
-            Ok(output) => Self::parse(&String::from_utf8_lossy(&output.stdout)),
-            Err(_) => Self::default(),
+        match Self::probe(command) {
+            Some(stdout) => Self::parse(&stdout),
+            None => Self::default(),
         }
+    }
+
+    /// Run the probe to completion or to [`PROBE_TIMEOUT`], whichever comes
+    /// first. `None` for every failure — a spawn error, a timeout, or a child
+    /// that could not be waited on — because a tailnet that cannot be described
+    /// is indistinguishable from one that does not exist, and this whole module
+    /// degrades to "no devices" rather than to an error.
+    ///
+    /// Polls `try_wait` to a deadline instead of `output()`, which blocks until
+    /// the pipes reach EOF with no way to give up.
+    ///
+    /// Two things make the deadline real, and both are needed:
+    ///
+    /// * **stdout is drained concurrently**, on its own thread, rather than
+    ///   read after the wait. Reading afterwards would reintroduce the deadlock
+    ///   `output()` exists to avoid — a tailnet large enough for
+    ///   `status --json` to exceed the pipe buffer leaves the child blocked in
+    ///   `write`, so it never exits, so the loop below kills a process that was
+    ///   answering correctly and reports "no tailnet" on exactly the largest
+    ///   tailnets.
+    /// * **the reader is never joined**, only received from with its own
+    ///   budget. Killing the child does *not* reliably close the pipe: a
+    ///   wrapper process that spawned a grandchild leaves the write end open in
+    ///   that grandchild, and a `join` would then wait out the grandchild's
+    ///   whole lifetime — restoring the unbounded wait this function exists to
+    ///   remove. The detached thread ends on its own when the pipe finally
+    ///   closes.
+    fn probe(mut command: Command) -> Option<String> {
+        let mut child = command.spawn().ok()?;
+        let stdout = child.stdout.take();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            if let Some(mut stdout) = stdout {
+                let _ = std::io::Read::read_to_end(&mut stdout, &mut buffer);
+            }
+            let _ = tx.send(buffer);
+        });
+
+        let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+        let exited = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) if std::time::Instant::now() >= deadline => break false,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Err(_) => break false,
+            }
+        };
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+            // A timed-out probe's partial output is not a document, so there is
+            // nothing to wait for it to finish producing.
+            return None;
+        }
+        // The child is gone; the drain is whatever it already wrote plus the
+        // instant it takes the reader to see EOF. Bounded anyway, because
+        // "the child exited" and "every writer closed the pipe" are not the
+        // same event.
+        let buffer = rx.recv_timeout(std::time::Duration::from_secs(1)).ok()?;
+        Some(String::from_utf8_lossy(&buffer).into_owned())
     }
 
     /// Pure half of [`Tailnet::detect`], over the raw `--json` document.
@@ -469,5 +546,79 @@ mod tests {
             assert!(joined.contains("/usr/bin/tailscale"));
             assert!(joined.contains("/Applications/Tailscale.app"));
         }
+    }
+
+    #[cfg(unix)]
+    fn shell(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        command
+    }
+
+    /// `detect` runs inside `info`, which the desktop time-boxes at 10 seconds
+    /// *and* gates deploy on. A hung `tailscaled` must therefore cost the
+    /// schema its device picker and nothing else — if it burned the budget, the
+    /// provider would be undeployable and the desktop would blame the wrong
+    /// component.
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_probe_gives_up_well_inside_the_desktops_info_budget() {
+        let started = std::time::Instant::now();
+        assert!(
+            Tailnet::probe(shell("sleep 30")).is_none(),
+            "a probe past its deadline must be abandoned, not awaited"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= PROBE_TIMEOUT && elapsed < std::time::Duration::from_secs(8),
+            "gave up after {elapsed:?}"
+        );
+    }
+
+    /// The deadlock the concurrent drain exists to prevent. A tailnet whose
+    /// `status --json` exceeds the pipe buffer leaves the child blocked in
+    /// `write`; reading only after the wait would time out and report no
+    /// tailnet at all — the failure mode would appear exactly on the largest,
+    /// most-configured tailnets and never in a small test one.
+    #[cfg(unix)]
+    #[test]
+    fn output_larger_than_a_pipe_buffer_is_still_collected() {
+        // 512 KiB — comfortably past the 64 KiB a Linux pipe buffers.
+        let stdout = Tailnet::probe(shell("printf 'x%.0s' $(seq 1 524288)"))
+            .expect("a child that outruns the pipe buffer must still be read");
+        assert_eq!(stdout.len(), 524_288, "output was truncated or dropped");
+    }
+
+    /// A probe that produced nothing usable degrades to "no devices" rather
+    /// than to an error, which is this module's whole contract.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_probe_is_indistinguishable_from_no_tailnet() {
+        assert!(Tailnet::probe(shell("exit 1")).is_some_and(|out| out.is_empty()));
+        assert!(Tailnet::parse("").schema_options().is_empty());
+    }
+
+    /// The reason the reader thread is never joined. `sh -c` execs a
+    /// grandchild that inherits the write end of the pipe, so killing the
+    /// shell leaves the pipe open and a `join` would block until the
+    /// grandchild finished — reinstating exactly the unbounded wait the
+    /// deadline exists to remove. Written with a wrapper process on purpose:
+    /// the real `tailscale` CLI is one on macOS, where the binary in
+    /// `/usr/bin` hands off to the app bundle.
+    #[cfg(unix)]
+    #[test]
+    fn a_grandchild_holding_the_pipe_cannot_extend_the_deadline() {
+        let started = std::time::Instant::now();
+        assert!(Tailnet::probe(shell("sleep 30 & wait")).is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "a grandchild kept the probe alive for {:?}",
+            started.elapsed()
+        );
     }
 }
