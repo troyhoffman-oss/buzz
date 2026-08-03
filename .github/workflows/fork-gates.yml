@@ -1,0 +1,178 @@
+name: Fork Gates
+
+# Runs the core CI gates on fork lane branches.
+#
+# Why this file exists: upstream `ci.yml` triggers only on `push` to
+# `main`/`release` and on `pull_request`, so it never fires for a fork branch
+# push. A push-triggered workflow is read from the *pushed ref*, so this file
+# takes effect the moment the branch lands on the fork — no default-branch
+# registration required (unlike `workflow_dispatch`, which does need it).
+#
+# `ci.yml` exposes no `workflow_call` trigger, so the jobs below are copied from
+# it rather than reused. They keep ci.yml's toolchain conventions verbatim:
+# hermit supplies the pinned Rust/node/pnpm/just, mold links, and every action
+# stays SHA-pinned to the same revision ci.yml uses. When ci.yml's versions move,
+# move them here too.
+#
+# Scope is deliberately the core gate set — Rust lint/tests plus the desktop
+# JS + Tauri Rust job. Omitted on purpose: the macOS desktop build (llama.cpp
+# Metal, ~45 min), mobile, the Playwright e2e shards, and the Postgres/Redis
+# integration suites, all of which need infrastructure or hardware this gate is
+# not trying to cover.
+#
+# `ci.yml`'s `changes` path-filter job is intentionally not copied: these
+# branches are merge lanes that touch everything, and a lane must be gated
+# unconditionally rather than by changed paths.
+on:
+  push:
+    branches: ["upmerge-*", "remote-first", "lane/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: fork-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  rust-lint:
+    name: Rust Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: fork-gates-rust-lint
+      - name: Format check
+        run: just fmt-check
+      - name: Desktop Tauri format check
+        run: just desktop-tauri-fmt-check
+      - name: Clippy
+        run: just clippy
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: fork-gates-unit-tests
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2.79.15
+        with:
+          tool: cargo-nextest@0.9.136
+      - name: Unit tests
+        run: just test-unit
+
+  desktop-core:
+    name: Desktop Core
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: desktop/src-tauri
+          shared-key: fork-gates-desktop-core
+      - name: Install Tauri dependencies (Linux)
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30
+          sudo apt-get install -y --no-install-recommends \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            -o DPkg::Lock::Timeout=120 \
+            build-essential \
+            curl \
+            file \
+            libasound2-dev \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            wget
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - name: Restore pnpm store cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: pnpm-${{ runner.os }}-
+      - name: Install desktop dependencies
+        run: just desktop-install-ci
+      - name: Desktop lint and format
+        run: just desktop-check
+      - name: Desktop unit tests
+        run: just desktop-test
+      - name: Desktop build
+        run: just desktop-build
+      - name: Desktop Tauri clippy
+        run: just desktop-tauri-clippy
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      - name: Desktop Tauri check
+        run: just desktop-tauri-check
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      - name: Desktop Tauri tests
+        run: just desktop-tauri-test
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      - name: Desktop Tauri compiled-flag verification
+        run: just desktop-tauri-test-compiled-flags
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      - name: Save pnpm store cache
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+
+  dead-token-guard:
+    name: Dead Token Reference Guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Check for dead API token references in client code
+        run: |
+          # Fail if dead API token patterns reappear in desktop, mobile, docs, or config.
+          # Relay crates are excluded — they still use token auth internally.
+          PATTERNS='TokenScope|MintTokenResponse|hasApiToken|spr_tok_'
+          PATHS='desktop/src/ desktop/tests/ mobile/test/ mobile/lib/ .env.example'
+          EXCLUDES='--exclude-dir=node_modules --exclude-dir=.dart_tool'
+          if grep -rn $EXCLUDES -E "$PATTERNS" $PATHS 2>/dev/null; then
+            echo "::error::Dead API token references found in client code. See above."
+            exit 1
+          fi
+          echo "No dead token references found."
