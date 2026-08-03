@@ -10,6 +10,14 @@ name: Linux Canary
 #   - mold linker added (rui314/setup-mold) to reduce link time, matching
 #     the Linux Rust CI jobs in ci.yml.
 #   - pnpm store restore/save pattern mirrors ci.yml:149-196.
+#
+# Fork note: this workflow is workflow_dispatch-only, so it can never fire
+# accidentally — a human or `gh workflow run` must ask for it explicitly. The
+# `github.repository == 'block/buzz'` job gate and the `Require main` ref check
+# were therefore redundant guards that only served to make the job silently skip
+# on forks, so they are omitted here. No secrets are referenced; the build is
+# unsigned by design (fix-appimage.sh skips re-signing when the signing env vars
+# are absent, and createUpdaterArtifacts is false).
 on:
   workflow_dispatch:
 
@@ -19,7 +27,6 @@ permissions:
 jobs:
   build:
     name: Build Linux canary
-    if: github.repository == 'block/buzz'
     runs-on: ubuntu-latest
     container: ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
     timeout-minutes: 60
@@ -33,15 +40,6 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Require main
-        env:
-          SOURCE_REF: ${{ github.ref }}
-        run: |
-          if [[ "$SOURCE_REF" != "refs/heads/main" ]]; then
-            echo "::error::Canary builds must run from main; got $SOURCE_REF"
-            exit 1
-          fi
-
       - name: Install system dependencies
         env:
           DEBIAN_FRONTEND: noninteractive

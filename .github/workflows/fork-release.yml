@@ -1,0 +1,127 @@
+name: Fork Release
+
+# Builds a standalone `buzz-acp` harness binary for x86_64-unknown-linux-gnu on
+# a GitHub-hosted runner and publishes it to a fork release. This exists so the
+# fork never has to compile the harness on its own hardware.
+#
+# Deliberately NOT gated on `github.repository` — every canary/release workflow
+# in this repo carries an `if: github.repository == 'block/buzz'` guard that
+# silently skips the job on a fork. This file is fork-owned and must run there.
+#
+# `buzz-acp` pulls in no mesh-llm, no iroh, and rustls rather than OpenSSL, so a
+# bare ubuntu-latest runner plus hermit is sufficient — no apt preamble needed.
+#
+# Triggers:
+#   - workflow_dispatch → build, upload artifact, publish release (opt out with
+#     `publish: false` for an artifact-only canary)
+#   - tag `harness-v*`  → same, always published
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a fork release (otherwise artifact only)"
+        type: boolean
+        default: true
+  push:
+    tags: ["harness-v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  harness:
+    name: Build buzz-acp (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      # Needed by the publish step to create the release and upload assets.
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # Rust (1.95.0 via rust-toolchain.toml), just, node, pnpm, cmake all come
+      # from hermit — do not add dtolnay/rust-toolchain, it would shadow the pin.
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+
+      # shared-key scoped to this workflow so release-profile artifacts do not
+      # collide with ci.yml's debug-profile cache keys.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: fork-release-harness
+
+      - name: Build buzz-acp
+        run: cargo build --release -p buzz-acp
+
+      - name: Package
+        id: pkg
+        run: |
+          set -euo pipefail
+          CRATE_VERSION=$(cargo metadata --no-deps --format-version=1 \
+            | jq -r '.packages[] | select(.name=="buzz-acp") | .version')
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          if [[ "$GITHUB_REF" == refs/tags/harness-v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="harness-$(date -u +%Y%m%d)-${SHORT_SHA}"
+          fi
+
+          NAME="buzz-acp-${CRATE_VERSION}+git.${SHORT_SHA}-x86_64-unknown-linux-gnu"
+          mkdir -p dist
+          cp target/release/buzz-acp "dist/${NAME}"
+          chmod +x "dist/${NAME}"
+          ( cd dist && sha256sum "${NAME}" > "${NAME}.sha256" )
+
+          {
+            echo "tag=$TAG"
+            echo "name=$NAME"
+            echo "version=$CRATE_VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+          file "dist/${NAME}"
+          cat "dist/${NAME}.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: buzz-acp-x86_64-unknown-linux-gnu
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish fork release
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.pkg.outputs.tag }}
+          VERSION: ${{ steps.pkg.outputs.version }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          NOTES="Fork build of \`buzz-acp\` v${VERSION} for x86_64-unknown-linux-gnu, from \`${SHA}\`."
+
+          # The tag is new on every dispatch, so create it if absent; a re-run on
+          # the same day and sha reuses it and clobbers the assets.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --target "$SHA" \
+              --prerelease \
+              --title "buzz-acp harness ($TAG)" \
+              --notes "$NOTES"
+          else
+            gh release edit "$TAG" --prerelease --notes "$NOTES"
+          fi
+          gh release upload "$TAG" dist/* --clobber
+
+          echo "Published $TAG"
+          gh release view "$TAG" --json tagName,assets \
+            --jq '{tag: .tagName, assets: [.assets[].name]}'
