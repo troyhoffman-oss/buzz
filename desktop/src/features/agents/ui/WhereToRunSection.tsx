@@ -26,6 +26,7 @@ import {
   ProviderConfigFields,
 } from "./ProviderConfigFields";
 import {
+  applyProbeResult,
   autoPickRemoteHarness,
   emptyWhereToRunDraft,
   type HostFailure,
@@ -92,10 +93,12 @@ export function WhereToRunSection({
     [backendProviders, draft.runOn],
   );
 
-  // The probe effect writes back into the draft it reads. Reading it through a
-  // ref instead of the dependency array is what keeps that from being a
-  // self-retriggering loop (probe → onDraftChange → new draft identity →
-  // probe): the provider selection is the only thing that should re-probe.
+  // The harness and model callbacks below write back into the draft they read,
+  // and they run long after the render that created them (an SSH round trip
+  // later). Reading it through a ref is what keeps their continuations writing
+  // onto the CURRENT draft rather than the one captured when the user pressed
+  // the button. The probe effect does not use this — it goes through
+  // `applyProbe`, an Effect Event, for the same latest-state guarantee.
   const draftRef = React.useRef(draft);
   draftRef.current = draft;
   // Read at call time for the same reason the harness catalog is: an env edit
@@ -121,44 +124,54 @@ export function WhereToRunSection({
   // so the stale continuation drops its answer instead of writing it back.
   const hostRequestRef = React.useRef(0);
 
+  // Latest-state seam for probe resolution: an Effect Event always sees the
+  // draft as it is *now*. Without this, the probe promise closes over the
+  // draft from probe start, and anything typed while the probe was in flight
+  // gets thrown away when it resolves (a second, subtler Typewriter Eraser).
+  // `applyProbeResult` seeds schema defaults UNDERNEATH what the user has
+  // typed, so a re-probe cannot wipe an address mid-edit.
+  const applyProbe = React.useEffectEvent(
+    (result: Awaited<ReturnType<typeof probeBackendProvider>>) => {
+      onDraftChange(applyProbeResult(draft, result));
+    },
+  );
+
+  // Cache the provider's friendly name under the id that was selected when the
+  // probe RESOLVED. Read through an Effect Event for the same reason the draft
+  // is: the effect is keyed on the binary path, so the id is not in its
+  // dependency list and a closure would pin the one from probe start.
+  const rememberProbeName = React.useEffectEvent(
+    (result: Awaited<ReturnType<typeof probeBackendProvider>>) => {
+      const providerId = selectedBackendProvider?.id;
+      if (!providerId) return;
+      setProbedProviderNames((previous) =>
+        rememberProbedProviderName(previous, providerId, result),
+      );
+    },
+  );
+
+  // Probe once per provider *selection*, keyed on the provider's stable
+  // path — never on the draft. Depending on the draft made every keystroke
+  // refire the probe, and each resolution reset providerConfig to schema
+  // defaults, which erased what the user was typing (the Typewriter Eraser)
+  // and spawned the provider binary in a loop for as long as the dialog was
+  // open. Keying on the path (not the provider object) also keeps a
+  // providers-query refresh from reprobing an unchanged selection.
+  const selectedBinaryPath = isProviderMode
+    ? (selectedBackendProvider?.binaryPath ?? null)
+    : null;
   React.useEffect(() => {
-    if (!isProviderMode || !selectedBackendProvider) {
+    if (!selectedBinaryPath) {
       setProbeError(null);
       return;
     }
     let cancelled = false;
     setProbeError(null);
-    void probeBackendProvider(selectedBackendProvider.binaryPath)
+    void probeBackendProvider(selectedBinaryPath)
       .then((result) => {
         if (cancelled) return;
-        setProbedProviderNames((previous) =>
-          rememberProbedProviderName(
-            previous,
-            selectedBackendProvider.id,
-            result,
-          ),
-        );
-        const defaults: Record<string, string> = {};
-        const properties =
-          (result.config_schema as Record<string, unknown> | undefined)
-            ?.properties ?? {};
-        for (const [key, property] of Object.entries(properties) as [
-          string,
-          Record<string, unknown>,
-        ][]) {
-          if (property.default != null)
-            defaults[key] = String(property.default);
-        }
-        onDraftChange({
-          ...draftRef.current,
-          probedProvider: result,
-          // Schema defaults are seeded UNDERNEATH what the user has typed.
-          // The probe is a round-trip to the provider binary and re-runs
-          // whenever it resolves anew, so overwriting here would wipe an
-          // address mid-edit. A provider switch empties the draft, so on the
-          // first probe of a provider this is exactly `defaults`.
-          providerConfig: { ...defaults, ...draftRef.current.providerConfig },
-        });
+        rememberProbeName(result);
+        applyProbe(result);
       })
       .catch((error: unknown) => {
         if (!cancelled) {
@@ -168,7 +181,7 @@ export function WhereToRunSection({
     return () => {
       cancelled = true;
     };
-  }, [isProviderMode, onDraftChange, selectedBackendProvider]);
+  }, [selectedBinaryPath]);
 
   /**
    * Abandon every in-flight host request. Their answers describe a

@@ -112,6 +112,12 @@ run_unit_tests() {
   # shell-injection canary executes.
   run_test_step "buzz-backend-ssh tests" \
     cargo test -p buzz-backend-ssh -- --nocapture
+
+  # Kubernetes backend provider: pure decision layers driven by a fake
+  # substrate, no cluster. Mirrors the nextest path in `just test-unit` —
+  # the two lists must stay in step or the fallback silently covers less.
+  run_test_step "buzz-backend-kubernetes tests" \
+    cargo test -p buzz-backend-kubernetes -- --nocapture
 }
 
 # ---- DB / integration tests (infra required) --------------------------------

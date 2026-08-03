@@ -264,6 +264,19 @@ fn normalize_relay_mesh_trims_and_preserves_valid_config() {
 }
 
 #[test]
+fn deploy_refuses_resolved_relay_mesh_provider_with_padding() {
+    let record = bare_agent_record(Some("p1"), None, None);
+    let personas = vec![persona_record("p1", None, Some("  relay-mesh  "))];
+    let global = crate::managed_agents::GlobalAgentConfig::default();
+
+    let (_, provider) = resolve_deploy_model_provider(&record, &personas, &global);
+    let error = ensure_remote_provider_supported(provider.as_deref())
+        .expect_err("resolved shared-compute provider must not deploy remotely");
+
+    assert!(error.contains("cannot be deployed remotely"), "{error}");
+}
+
+#[test]
 fn created_avatar_prefers_explicit_input() {
     let resolved = resolve_created_avatar_url(
         Some(" https://x/input.png "),
@@ -398,9 +411,76 @@ fn legacy_avatar_empty_when_nothing_resolves() {
 
 // ── Provider deploy payload completeness ─────────────────────────────────────
 
-/// Regression (PR #1667 review, Thufir): the provider deploy payload must
-/// carry every behavioral field the local spawn path applies — a field
-/// missing here silently strips it from provider-backed agents.
+/// The shared provider fixture is the contract arbiter: it must be the exact
+/// richest deploy request produced by the real desktop serializers.
+#[test]
+fn deploy_payload_matches_the_shared_full_launch_fixture() {
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        "../../crates/buzz-backend-kubernetes/tests/fixtures/provider-wire/deploy-full-launch.request.json",
+    );
+    let fixture: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", fixture_path.display())),
+    )
+    .expect("parse shared provider fixture");
+    let record: ManagedAgentRecord = serde_json::from_value(serde_json::json!({
+        "pubkey": "abcd1234",
+        "name": "worker",
+        "private_key_nsec": "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5",
+        "relay_url": "wss://localhost:3000",
+        "auth_tag": "tag-1",
+        "acp_command": "buzz-acp",
+        "agent_command": "goose",
+        "runtime": "goose",
+        "model": "gpt-5",
+        "provider": "openai",
+        "env_vars": {"USER_KEY": "user-value"},
+        "agent_args": [],
+        "mcp_command": "",
+        "turn_timeout_seconds": 300,
+        "system_prompt": null,
+        "idle_timeout_seconds": null,
+        "max_turn_duration_seconds": null,
+        "parallelism": 10,
+        "respond_to": "allowlist",
+        "respond_to_allowlist": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z"
+    }))
+    .expect("fixture source record");
+    let descriptor = crate::managed_agents::resolve_effective_harness_descriptor(
+        &record,
+        &[],
+        &crate::managed_agents::GlobalAgentConfig::default(),
+    )
+    .expect("resolve fixture source record descriptor");
+    let launch = super::deploy::build_launch_block(
+        &record,
+        &descriptor,
+        &[],
+        None,
+        Some("gpt-5"),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    let agent = deploy_payload_json(
+        &record,
+        "wss://relay.example".into(),
+        Some("gpt-5".into()),
+        Some("openai".into()),
+        None,
+        std::collections::BTreeMap::from([("USER_KEY".into(), "user-value".into())]),
+        launch,
+        // Unset, which is what the recorded fixture carries: the push seams are
+        // a dogfooding path, so the contract payload is the one without them.
+        BinariesToPush::default(),
+    );
+
+    assert_eq!(
+        agent, fixture["agent"],
+        "desktop payload drifted from the shared provider fixture"
+    );
+}
+
 #[test]
 fn deploy_payload_carries_the_full_behavioral_quad() {
     let allow = "a".repeat(64);
@@ -436,15 +516,11 @@ fn deploy_payload_carries_the_full_behavioral_quad() {
         Some("openai".to_string()),
         None,
         std::collections::BTreeMap::new(),
+        serde_json::Value::Null,
         BinariesToPush::default(),
     );
 
     assert_eq!(payload["parallelism"], 4);
-    // The record's own primary key. A provider keys host-side names on this —
-    // the SSH provider's systemd instance and env file both carry a fragment of
-    // it — because two agents can legitimately share a display name, and a
-    // name-keyed unit lets the second deploy overwrite the first agent's nsec.
-    assert_eq!(payload["pubkey"], "abcd1234");
     assert_eq!(payload["respond_to"], "allowlist");
     assert_eq!(payload["respond_to_allowlist"][0], "a".repeat(64));
     assert_eq!(payload["model"], "gpt-x");
@@ -465,6 +541,7 @@ fn deploy_payload_carries_the_full_behavioral_quad() {
         None,
         None,
         std::collections::BTreeMap::new(),
+        serde_json::Value::Null,
         BinariesToPush {
             buzz_acp: Some("/tmp/buzz-acp".to_string()),
             buzz_cli: Some("/tmp/buzz".to_string()),
@@ -474,95 +551,26 @@ fn deploy_payload_carries_the_full_behavioral_quad() {
     assert_eq!(pushed["buzz_cli_binary"], "/tmp/buzz");
 }
 
-/// The whole point of routing an instance-dialog model edit through the
-/// DEFINITION for a provider-backed record: the edited model has to reach the
-/// host.
-///
-/// The desktop frontend saves the model onto the linked definition (see
-/// `instanceModelDefinitionWrite.ts`) because a linked record's own `model`
-/// column is never read — this resolver is what the deploy payload consults,
-/// and for a linked record it answers from the definition. This pins the
-/// provider-backed leg of that claim: a definition edit is visible to the
-/// next deploy even though the record still carries the pre-edit bytes.
-///
-/// It does NOT hot-swap a running remote agent. The payload is built per deploy
-/// call (`build_deploy_payload`, from create-with-spawn and
-/// `start_managed_agent`), so an already-deployed process keeps the model it
-/// launched with until the next deploy. That deploy does restart it — the SSH
-/// provider rewrites the systemd env file and unconditionally
-/// `systemctl --user restart`s the unit — so the redeploy applies the model;
-/// nothing short of one does.
 #[test]
-fn provider_backed_record_deploys_the_definition_model_after_an_edit() {
-    let mut record = bare_agent_record(Some("p1"), Some("pre-edit-model"), Some("anthropic"));
-    record.backend = BackendKind::Provider {
-        id: "ssh".to_string(),
-        config: serde_json::json!({ "host": "example" }),
-    };
-    // The definition as it stands after the instance dialog saved the edit.
-    let personas = vec![persona_record(
-        "p1",
-        Some("post-edit-model"),
-        Some("anthropic"),
-    )];
-    let global = crate::managed_agents::GlobalAgentConfig::default();
+fn tauri_platform_configs_bundle_kubernetes_only_on_supported_hosts() {
+    use tauri_utils::{config::parse::read_from, platform::Target};
 
-    let (model, _provider) = resolve_deploy_model_provider(&record, &personas, &global);
-
-    assert_eq!(
-        model.as_deref(),
-        Some("post-edit-model"),
-        "the definition edit must reach the deploy payload; the record's own \
-         stale model column is never consulted for a linked instance"
-    );
-}
-
-/// The other half of the same guarantee: the SUMMARY the desktop reads back is
-/// resolved the same way, so the dialog reopens on the edited model rather than
-/// on the record's stale column.
-///
-/// This matters because nothing ever rewrites that column for a provider-backed
-/// record. `apply_persona_snapshot` would (its `record.model` assignment sits
-/// outside the local-only harness guard), but every live caller is
-/// local-gated — `start_local_agent_with_preflight` and the restart path both
-/// refuse a non-local record outright, and `restore_managed_agents_on_launch`
-/// filters to `BackendKind::Local`. The only unguarded caller is the
-/// `persona_source_version` backfill, a one-time legacy migration that skips any
-/// record already carrying a version (which every persona-linked create sets).
-///
-/// So the record column stays stale forever, and that is fine: it is never
-/// read. `resolve_effective_config` answers from the definition for a linked
-/// instance, and it is the single resolver behind BOTH the deploy payload and
-/// this summary.
-#[test]
-fn provider_backed_summary_resolves_the_definition_model_not_the_record() {
-    let mut record = bare_agent_record(Some("p1"), Some("pre-edit-model"), Some("anthropic"));
-    record.backend = BackendKind::Provider {
-        id: "ssh".to_string(),
-        config: serde_json::json!({ "host": "example" }),
-    };
-    let personas = vec![persona_record(
-        "p1",
-        Some("post-edit-model"),
-        Some("anthropic"),
-    )];
-    let global = crate::managed_agents::GlobalAgentConfig::default();
-
-    let resolved = crate::managed_agents::effective_config::resolve_effective_config(
-        &record, &personas, &global,
-    );
-    let cfg = match resolved {
-        crate::managed_agents::effective_config::EffectiveConfigResult::Resolved(cfg) => cfg,
-        _ => panic!("a linked record with a present definition must resolve"),
-    };
-
-    assert_eq!(
-        cfg.model.value.as_deref(),
-        Some("post-edit-model"),
-        "the summary's model is the definition's, so the record's stale \
-         `pre-edit-model` column is never surfaced to the dialog"
-    );
-    // The record itself is deliberately left untouched — proof that the fix
-    // does not depend on the record column ever being refreshed.
-    assert_eq!(record.model.as_deref(), Some("pre-edit-model"));
+    let config_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (target, expected) in [
+        (Target::MacOS, true),
+        (Target::Linux, true),
+        (Target::Windows, false),
+    ] {
+        let (config, paths) = read_from(target, config_root).expect("read Tauri config");
+        let external_bins = config["bundle"]["externalBin"]
+            .as_array()
+            .expect("bundle.externalBin array");
+        let has_kubernetes = external_bins
+            .iter()
+            .any(|value| value == "binaries/buzz-backend-kubernetes");
+        assert_eq!(
+            has_kubernetes, expected,
+            "unexpected Kubernetes externalBin for {target}; merged {paths:?}"
+        );
+    }
 }

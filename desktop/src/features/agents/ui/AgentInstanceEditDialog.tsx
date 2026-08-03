@@ -30,6 +30,7 @@ import {
   EditAgentModelField,
 } from "./EditAgentHarnessFields";
 import {
+  ADVANCED_FIELDS_MOTION_TRANSITION,
   AUTO_PROVIDER_DROPDOWN_VALUE,
   hiddenProviderIdsForBuild,
   CUSTOM_PROVIDER_DROPDOWN_VALUE,
@@ -37,6 +38,7 @@ import {
   getDefaultLlmModelLabel,
   getPersonaProviderOptions,
   getProviderApiKeyEnvVar,
+  getProviderApiKeyLabel,
   isMissingRequiredDropdownField,
   NO_RUNTIME_DROPDOWN_VALUE,
   PERSONA_FIELD_CONTROL_CLASS,
@@ -74,6 +76,7 @@ import { AgentCreationPreview } from "./AgentCreationPreview";
 import type { EnvVarsValue } from "./EnvVarsEditor";
 import { useRequiredCredentialState } from "./useRequiredCredentialState";
 import { CreateAgentRespondToField } from "./RespondToField";
+import { RunOnSummarySection } from "./RunOnSummarySection";
 import { PersonaDropdownField } from "./PersonaDropdownField";
 import {
   MODEL_DISCOVERY_LOADING_VALUE,
@@ -103,11 +106,6 @@ import {
   runtimeDropdownAction,
   usePendingHarnessSelection,
 } from "./addCustomHarness";
-
-const ADVANCED_FIELDS_MOTION_TRANSITION = {
-  duration: 0.18,
-  ease: [0.23, 1, 0.32, 1],
-} as const;
 
 export function AgentInstanceEditDialog({
   agent,
@@ -990,6 +988,8 @@ export function AgentInstanceEditDialog({
               variant="persona"
             />
 
+            <RunOnSummarySection backend={agent.backend} />
+
             {/* Harness — the local catalog's dropdown, or this record's own pin */}
             <EditAgentHarnessFields
               agentCommand={agentCommand}
@@ -1079,14 +1079,11 @@ export function AgentInstanceEditDialog({
             {llmProviderFieldVisible && topLevelSecretEnvVar ? (
               <PersonaProviderApiKeyField
                 disabled={updateMutation.isPending}
+                envVarName={topLevelSecretEnvVar}
                 isInherited={apiKeyIsInherited}
                 inheritedLabel={apiKeyInheritedLabel}
                 isRequired={apiKeyIsRequired}
-                label={
-                  effectiveProvider === "anthropic"
-                    ? "Anthropic API Key"
-                    : "OpenAI API Key"
-                }
+                label={getProviderApiKeyLabel(effectiveProvider) ?? "API Key"}
                 onValueChange={(next) => {
                   setEnvVars((prev) => ({
                     ...prev,

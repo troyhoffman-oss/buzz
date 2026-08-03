@@ -1,8 +1,12 @@
 //! Provider deploy: payload construction and the deploy call itself, split
-//! from `agents.rs` (file-size guard). `build_deploy_payload` gathers live
-//! state; `deploy_payload_json` is the pure serialization half so payload
-//! completeness stays testable; `deploy_to_provider` resolves the binary,
-//! invokes it, and persists the outcome onto the record.
+//! from `agents.rs` (file-size guard). The launch block is derived from the
+//! same effective descriptor and policy helpers as local spawn so remote
+//! execution does not reimplement them. `deploy_payload_json` is the pure
+//! serialization half so payload completeness stays testable, and
+//! `deploy_to_provider` resolves the binary, invokes it, and persists the
+//! outcome onto the record.
+
+use std::collections::BTreeMap;
 
 use tauri::AppHandle;
 
@@ -19,17 +23,6 @@ use crate::{
 };
 
 /// Resolve the deploy-specific structured model/provider for a managed agent.
-///
-/// Delegates to the single effective-config resolver which enforces
-/// definition-authoritative semantics for linked instances:
-///   - **Linked:** definition → global. Stale record bytes are never consulted.
-///   - **Definition-less:** instance → global.
-///   - **Orphaned:** returns `(None, None)` — spawn is blocked elsewhere.
-///
-/// Both local spawn and deploy now use the same resolver, so they can never
-/// disagree on what model/provider an agent runs with.
-///
-/// Exported `pub(crate)` for unit testing.
 #[cfg(test)]
 pub(crate) fn resolve_deploy_model_provider(
     record: &ManagedAgentRecord,
@@ -42,58 +35,116 @@ pub(crate) fn resolve_deploy_model_provider(
     .unwrap_or((None, None))
 }
 
+/// Serialize the portable launch contract shared with provider-backed agents.
+///
+/// `descriptor.env` is the authoritative six-layer environment. Policy values
+/// are deliberately separate because providers apply them below that layered
+/// environment, preserving the local spawn's power-user override semantics.
+pub(super) fn build_launch_block(
+    record: &ManagedAgentRecord,
+    descriptor: &crate::managed_agents::readiness::EffectiveHarnessDescriptor,
+    teams: &[crate::managed_agents::TeamRecord],
+    effective_prompt: Option<&str>,
+    effective_model: Option<&str>,
+    owner_pubkey: &str,
+) -> serde_json::Value {
+    use crate::managed_agents::{known_acp_runtime, resolve_session_title, SESSION_TITLE_ENV_VAR};
+
+    let runtime = known_acp_runtime(&descriptor.command);
+    let mut policy_env = BTreeMap::new();
+
+    if let Some(runtime) = runtime {
+        policy_env.extend(
+            runtime
+                .default_env
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+        );
+        if runtime.mcp_hooks {
+            policy_env.insert("MCP_HOOK_SERVERS".into(), "*".into());
+        }
+    }
+    policy_env.insert("BUZZ_ACP_RELAY_OBSERVER".into(), "true".into());
+    policy_env.insert("BUZZ_ACP_LAZY_POOL".into(), "true".into());
+    policy_env.insert("BUZZ_ACP_AGENTS".into(), record.parallelism.to_string());
+
+    if let Some(value) = effective_prompt {
+        policy_env.insert("BUZZ_ACP_SYSTEM_PROMPT".into(), value.to_string());
+    }
+    if let Some(value) = effective_model {
+        policy_env.insert("BUZZ_ACP_MODEL".into(), value.to_string());
+    }
+    if let Some(value) = record.idle_timeout_seconds {
+        policy_env.insert("BUZZ_ACP_IDLE_TIMEOUT".into(), value.to_string());
+    }
+    if let Some(value) = record.max_turn_duration_seconds {
+        policy_env.insert("BUZZ_ACP_MAX_TURN_DURATION".into(), value.to_string());
+    }
+    if let Some(value) = resolve_session_title(record.display_name.as_deref(), &record.name) {
+        policy_env.insert(SESSION_TITLE_ENV_VAR.into(), value);
+    }
+    if let Some(value) =
+        crate::managed_agents::spawn_hash::effective_team_instructions(record, teams)
+    {
+        policy_env.insert("BUZZ_ACP_TEAM_INSTRUCTIONS".into(), value);
+    }
+
+    serde_json::json!({
+        "command": descriptor.command,
+        "args": descriptor.args,
+        "env": descriptor.env,
+        "policy_env": policy_env,
+        "owner_pubkey": owner_pubkey,
+    })
+}
+
+pub(super) fn ensure_remote_provider_supported(provider: Option<&str>) -> Result<(), String> {
+    if provider.map(str::trim) == Some(crate::managed_agents::RELAY_MESH_PROVIDER_ID) {
+        return Err(
+            "shared-compute agents cannot be deployed remotely because the mesh endpoint is local to the desktop"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Build the standard agent JSON payload for provider deploy calls.
-///
-/// Like local spawn, provider deploy re-reads live persona env vars and
-/// structured model/provider so remote agents receive current credentials
-/// and the same authoritative values that local spawn derives from
-/// `runtime_metadata_env_vars`. The only field still pinned is
-/// `agent_command`/`agent_args` — those were captured at create time.
-/// The only read-time resolution is `relay_url`: a blank pin resolves to
-/// the active workspace relay here, matching the create-path contract.
-///
-/// Fails closed when the private key is unavailable (keyring outage leaves
-/// it empty after hydration): without this guard a provider deploy would
-/// serialize `"private_key_nsec": ""` and launch the agent with no
-/// identity — the same hazard the local spawn path refuses via
-/// `spawn_key_refusal`.
 pub(super) fn build_deploy_payload(
     app: &AppHandle,
     state: &AppState,
     record: &ManagedAgentRecord,
 ) -> Result<serde_json::Value, String> {
-    // Fails closed when the private key is unavailable — same guard as local
-    // spawn. Without this, a keyring outage would serialize `"private_key_nsec": ""`
-    // and launch the agent with no identity.
     if let Some(err) = crate::managed_agents::spawn_key_refusal(record) {
         return Err(err);
     }
 
-    // Merge global + persona + agent env_vars for provider deploy — the same
-    // live-persona-under-overrides semantics as local spawn. Global env vars
-    // are the lowest user-settable layer: global < persona < agent (last-wins
-    // on key collision). Without this, provider-backed agents wouldn't receive
-    // credentials saved on the persona or the agent itself.
-    let global_config = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
-    let global_env = global_config.env_vars.clone();
-    let persona_env =
-        crate::managed_agents::resolve_persona_env(app, record.persona_id.as_deref())?;
-    // Merge: global < persona (persona wins over global).
-    let global_persona_merged = crate::managed_agents::merged_user_env(&global_env, &persona_env);
-    // Merge: global+persona < agent (agent wins over everything).
-    let merged_env =
-        crate::managed_agents::merged_user_env(&global_persona_merged, &record.env_vars);
-
+    let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
     let personas = load_personas(app).unwrap_or_default();
-    let cfg = crate::managed_agents::effective_config::resolve_effective_config(
-        record,
-        &personas,
-        &global_config,
+    let teams = crate::managed_agents::load_teams(app).unwrap_or_default();
+    let persona_env =
+        crate::managed_agents::live_persona_env(&personas, record.persona_id.as_deref());
+    let global_persona_env = crate::managed_agents::merged_user_env(&global.env_vars, &persona_env);
+    let merged_user_env =
+        crate::managed_agents::merged_user_env(&global_persona_env, &record.env_vars);
+    let effective = crate::managed_agents::effective_config::resolve_effective_config(
+        record, &personas, &global,
     )
     .require_resolved()?;
-    let effective_model = cfg.model.value;
-    let effective_provider = cfg.provider.value;
-    let effective_prompt = cfg.system_prompt.value;
+
+    ensure_remote_provider_supported(effective.provider.value.as_deref())?;
+
+    let descriptor =
+        crate::managed_agents::resolve_effective_harness_descriptor(record, &personas, &global)
+            .map_err(|error| crate::managed_agents::user_facing_harness_error(&error))?;
+    let owner_pubkey = super::workspace_owner_hex(state)?;
+    let launch = build_launch_block(
+        record,
+        &descriptor,
+        &teams,
+        effective.system_prompt.value.as_deref(),
+        effective.model.value.as_deref(),
+        &owner_pubkey,
+    );
 
     Ok(deploy_payload_json(
         record,
@@ -101,10 +152,11 @@ pub(super) fn build_deploy_payload(
             &record.relay_url,
             &relay_ws_url_with_override(state),
         ),
-        effective_model,
-        effective_provider,
-        effective_prompt,
-        merged_env,
+        effective.model.value,
+        effective.provider.value,
+        effective.system_prompt.value,
+        merged_user_env,
+        launch,
         BinariesToPush::from_env(),
     ))
 }
@@ -146,32 +198,20 @@ impl BinariesToPush {
     }
 }
 
-/// Pure serialization half of [`build_deploy_payload`] — every field the
-/// provider harness receives is deliberately listed here, so payload
-/// completeness is testable without an `AppHandle`.
-///
-/// The push seams arrive as a parameter rather than being read from the
-/// environment here: reading them inside would make this function's output a
-/// property of the developer's shell (the seams are env vars a dogfooding
-/// developer sets), which no test could pin down.
+/// Pure serialization half of [`build_deploy_payload`]. Legacy top-level fields
+/// remain for display/bookkeeping; providers execute the resolved `launch` block.
 pub(super) fn deploy_payload_json(
     record: &ManagedAgentRecord,
     relay_url: String,
     effective_model: Option<String>,
     effective_provider: Option<String>,
     effective_prompt: Option<String>,
-    merged_env: std::collections::BTreeMap<String, String>,
+    merged_env: BTreeMap<String, String>,
+    launch: serde_json::Value,
     binaries_to_push: BinariesToPush,
 ) -> serde_json::Value {
     serde_json::json!({
         "name": &record.name,
-        // The record's own primary key, and the only stable identifier a
-        // provider can key host-side names on. The SSH provider derives its
-        // systemd instance, env-file path and returned `backend_agent_id` from
-        // a fragment of it: two agents can legitimately share a display name on
-        // one host, and a name-keyed unit gave the second deploy the first
-        // agent's env file — overwriting its minted nsec.
-        "pubkey": &record.pubkey,
         "relay_url": relay_url,
         "private_key_nsec": &record.private_key_nsec,
         "auth_tag": &record.auth_tag,
@@ -187,6 +227,7 @@ pub(super) fn deploy_payload_json(
         "respond_to": record.respond_to,
         "respond_to_allowlist": &record.respond_to_allowlist,
         "env_vars": merged_env,
+        "launch": launch,
         // A path on THIS machine to a Linux `buzz-acp` the provider may install
         // on the host when the host has none. Serialized as `null` when unset —
         // a provider reading it with `as_str()` sees `None`, exactly as it does
@@ -211,6 +252,19 @@ fn binary_to_push(var: &str) -> Option<String> {
         .filter(|path| !path.is_empty())
 }
 
+/// Deploy an agent to a provider backend. Resolves the binary, calls deploy via
+/// spawn_blocking, and persists the result (backend_agent_id or last_error).
+///
+/// Idempotency: calling deploy on an already-deployed agent sends the same payload
+/// again. Providers are expected to handle this as an update-in-place or no-op —
+/// the protocol does not include an explicit `undeploy` operation (deferred to v2).
+///
+/// Returns Ok(()) or a [`ProviderFailure`]; either way the record is updated
+/// and saved first. The failure type is what keeps a recovery — a deploy onto a
+/// tailnet wanting browser re-auth carries one — alive for callers that can
+/// render it; each caller drops it explicitly where it cannot. The record's
+/// `last_error` stays a plain string regardless: it is a post-mortem read long
+/// after the fact, and an auth URL is a one-shot token that is stale by then.
 /// Deploy an agent to a provider backend. Resolves the binary, calls deploy via
 /// spawn_blocking, and persists the result (backend_agent_id or last_error).
 ///
@@ -281,4 +335,79 @@ pub(super) async fn deploy_to_provider(
     }
     save_managed_agents(app, &records)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::managed_agents::{readiness::EffectiveHarnessDescriptor, RespondTo, TeamRecord};
+
+    fn record() -> ManagedAgentRecord {
+        serde_json::from_value(serde_json::json!({
+            "pubkey": "abcd1234",
+            "name": "agent-handle",
+            "display_name": "Agent\u{0000} Name",
+            "private_key_nsec": "nsec1fake",
+            "relay_url": "wss://relay.example",
+            "acp_command": "buzz-acp",
+            "agent_command": "goose",
+            "agent_args": [],
+            "mcp_command": "",
+            "turn_timeout_seconds": 320,
+            "idle_timeout_seconds": 17,
+            "max_turn_duration_seconds": 23,
+            "parallelism": 4,
+            "respond_to": RespondTo::OwnerOnly,
+            "respond_to_allowlist": [],
+            "team_id": "team-1",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn launch_block_preserves_descriptor_and_spawn_policy() {
+        let record = record();
+        let descriptor = EffectiveHarnessDescriptor {
+            command: "goose".into(),
+            args: vec!["acp".into()],
+            env: BTreeMap::from([
+                ("GOOSE_MODE".into(), "custom".into()),
+                ("SECRET_FROM_PERSONA".into(), "secret".into()),
+            ]),
+        };
+        let teams: Vec<TeamRecord> = serde_json::from_value(serde_json::json!([{
+            "id": "team-1", "name": "Team", "instructions": "Coordinate", "persona_ids": [], "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        }])).unwrap();
+
+        let launch = build_launch_block(
+            &record,
+            &descriptor,
+            &teams,
+            Some("prompt"),
+            Some("model"),
+            "owner-hex",
+        );
+
+        assert_eq!(launch["command"], "goose");
+        assert_eq!(launch["args"], serde_json::json!(["acp"]));
+        assert_eq!(launch["env"]["GOOSE_MODE"], "custom");
+        // policy_env is applied first, so this default remains separate from
+        // the descriptor value that wins in launch.env.
+        assert_eq!(launch["policy_env"]["GOOSE_MODE"], "auto");
+        assert_eq!(launch["policy_env"]["BUZZ_ACP_LAZY_POOL"], "true");
+        assert_eq!(launch["policy_env"]["BUZZ_ACP_RELAY_OBSERVER"], "true");
+        assert_eq!(
+            launch["policy_env"]["BUZZ_ACP_TEAM_INSTRUCTIONS"],
+            "Coordinate"
+        );
+        assert_eq!(launch["policy_env"]["BUZZ_ACP_SESSION_TITLE"], "Agent Name");
+        assert_eq!(launch["policy_env"]["BUZZ_ACP_SYSTEM_PROMPT"], "prompt");
+        assert_eq!(launch["policy_env"]["BUZZ_ACP_MODEL"], "model");
+        assert_eq!(launch["policy_env"]["BUZZ_ACP_IDLE_TIMEOUT"], "17");
+        assert_eq!(launch["policy_env"]["BUZZ_ACP_MAX_TURN_DURATION"], "23");
+        assert_eq!(launch["policy_env"]["BUZZ_ACP_AGENTS"], "4");
+        assert_eq!(launch["owner_pubkey"], "owner-hex");
+    }
 }
