@@ -1,0 +1,287 @@
+name: Provider Release
+
+# Publishes the two standalone artifacts of the "stock plugin" route:
+#
+#   1. `buzz-backend-ssh` — the fork's SSH backend provider, built for every
+#      desktop platform. A user drops it in `~/.local/bin` and STOCK Buzz
+#      desktop 0.5.4 discovers it as provider id `ssh` (see
+#      `discover_provider_candidates`); no forked desktop build is required.
+#   2. `buzz-acp` — the harness that provider deploys onto a VPS, built from
+#      UPSTREAM `block/buzz` at tag `desktop-v0.5.4`. Genuinely stock code:
+#      the job below checks out `block/buzz` itself rather than this branch, so
+#      the shipped harness carries none of the fork's lanes.
+#
+# Both land in a single release per tag, because the pair is one deliverable —
+# the provider is useless without a harness to push, and pinning them together
+# is what tells a user which harness a given provider release deploys.
+#
+# Deliberately NOT gated on `github.repository`: every upstream release workflow
+# carries an `if: github.repository == 'block/buzz'` guard that silently skips on
+# a fork. This file is fork-owned and must run there.
+#
+# `buzz-backend-ssh` depends only on serde/serde_json/zeroize/base64/sha2/bech32/
+# secp256k1 — no OpenSSL, no cmake, no mesh-llm — so every runner below is a bare
+# stock image plus the repo's pinned toolchain. Windows is included because
+# `ci.yml`'s `windows-rust` job already compiles and tests this crate on MSVC, so
+# the target is known-good rather than speculative.
+#
+# Trigger: tag `provider-v*` (push-triggered, so the workflow is read from the
+# pushed ref — no default-branch registration needed, unlike workflow_dispatch).
+on:
+  push:
+    tags: ["provider-v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: provider-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # The harness shipped by this workflow is built from this upstream tag, not
+  # from the fork branch. Bump all three together. The sha is pinned as well as
+  # the tag so a moved upstream tag fails the build rather than quietly shipping
+  # a mislabelled "stock" binary.
+  STOCK_HARNESS_TAG: desktop-v0.5.4
+  STOCK_HARNESS_VERSION: "0.5.4"
+  STOCK_HARNESS_SHA: 651f6372754e60e3f936b3397040eb0f1e44c9f3
+
+jobs:
+  provider-linux:
+    name: buzz-backend-ssh (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # Rust 1.95.0 comes from rust-toolchain.toml via hermit — do not add
+      # dtolnay/rust-toolchain here, it would shadow the pin.
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: provider-release-${{ env.TARGET }}
+
+      - name: Build
+        run: cargo build --release --target "$TARGET" -p buzz-backend-ssh
+
+      - name: Package
+        run: .github/scripts/package-provider.sh "$TARGET"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: buzz-backend-ssh-${{ env.TARGET }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  provider-macos:
+    name: buzz-backend-ssh (${{ matrix.target }})
+    runs-on: macos-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      # macos-latest is arm64, so the Intel target is a cross-compile. Same
+      # convention as release.yml's `release-macos-x64` job.
+      - name: Add Rust target
+        run: rustup target add "$TARGET"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: provider-release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target "$TARGET" -p buzz-backend-ssh
+
+      - name: Package
+        run: .github/scripts/package-provider.sh "$TARGET"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: buzz-backend-ssh-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  provider-windows:
+    name: buzz-backend-ssh (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # No hermit here: it does not provide MSVC. The runner's preinstalled
+      # rustup honors rust-toolchain.toml on demand and its host triple already
+      # is x86_64-pc-windows-msvc. Mirrors ci.yml's `windows-rust` job.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: provider-release-x86_64-pc-windows-msvc
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --target "$TARGET" -p buzz-backend-ssh
+
+      - name: Package
+        shell: bash
+        run: .github/scripts/package-provider.sh "$TARGET"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: buzz-backend-ssh-${{ env.TARGET }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  stock-harness:
+    name: buzz-acp stock (upstream desktop-v0.5.4, x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # The ONLY checkout in this job is upstream's tree at the release tag.
+      # Nothing from this fork's branch is compiled in, which is the entire
+      # point: the harness a user's VPS runs must be stock 0.5.4.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: block/buzz
+          ref: ${{ env.STOCK_HARNESS_TAG }}
+          persist-credentials: false
+
+      - name: Verify upstream provenance
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          echo "Building buzz-acp from block/buzz@${STOCK_HARNESS_TAG} ($SHA)"
+          if [[ "$SHA" != "$STOCK_HARNESS_SHA" ]]; then
+            echo "::error::upstream ${STOCK_HARNESS_TAG} resolved to $SHA, expected $STOCK_HARNESS_SHA"
+            exit 1
+          fi
+
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: provider-release-stock-harness
+
+      - name: Build buzz-acp
+        run: cargo build --release --target x86_64-unknown-linux-gnu -p buzz-acp
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          NAME="buzz-acp-stock-${STOCK_HARNESS_VERSION}-x86_64-linux"
+          mkdir -p dist
+          cp "target/x86_64-unknown-linux-gnu/release/buzz-acp" "dist/${NAME}"
+          chmod +x "dist/${NAME}"
+          ( cd dist && sha256sum "${NAME}" > "${NAME}.sha256" )
+          file "dist/${NAME}"
+          cat "dist/${NAME}.sha256"
+          echo "provenance: block/buzz@${STOCK_HARNESS_TAG} ${STOCK_HARNESS_SHA}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: buzz-acp-stock-${{ env.STOCK_HARNESS_VERSION }}-x86_64-linux
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [provider-linux, provider-macos, provider-windows, stock-harness]
+    permissions:
+      contents: write
+    steps:
+      # No checkout: `gh` resolves the repo from GH_REPO, and nothing here reads
+      # the tree.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: staging
+
+      - name: Collect assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # download-artifact fans each artifact out into its own directory; the
+          # filenames inside are already unique per target, so flatten.
+          find staging -type f -exec cp {} dist/ \;
+          ls -l dist
+          # Every binary must arrive with its checksum, and the checksums must
+          # still verify after the round trip through artifact storage.
+          ( cd dist && for f in *.sha256; do sha256sum -c "$f"; done )
+          # 4 provider targets + 1 stock harness. Guards against a silently
+          # dropped artifact producing a partial release.
+          COUNT=$(find dist -type f ! -name '*.sha256' | wc -l)
+          if [[ "$COUNT" -ne 5 ]]; then
+            echo "::error::expected 5 binaries, found $COUNT"
+            exit 1
+          fi
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Standalone plugin artifacts for **stock** Buzz Desktop ${STOCK_HARNESS_VERSION}."
+            echo
+            echo "### \`buzz-backend-ssh\` — SSH backend provider"
+            echo
+            echo "Built from this fork at \`${SHA}\`. Install to \`~/.local/bin/buzz-backend-ssh\`"
+            echo "(chmod +x); stock desktop discovers it as provider id \`ssh\` with no forked"
+            echo "desktop build required."
+            echo
+            echo "### \`buzz-acp\` — harness deployed to the VPS"
+            echo
+            echo "Built from **upstream** \`block/buzz\` at tag \`${STOCK_HARNESS_TAG}\`"
+            echo "(\`${STOCK_HARNESS_SHA}\`) — stock code, none of the fork's lanes"
+            echo "compiled in. This is what the provider pushes to a host."
+            echo
+            echo "### Checksums"
+            echo
+            echo '```'
+            ( cd dist && cat ./*.sha256 )
+            echo '```'
+          } > notes.md
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --target "$SHA" \
+              --prerelease \
+              --title "Buzz SSH provider + stock harness ($TAG)" \
+              --notes-file notes.md
+          else
+            gh release edit "$TAG" --prerelease --notes-file notes.md
+          fi
+          gh release upload "$TAG" dist/* --clobber
+
+          gh release view "$TAG" --json tagName,url,assets \
+            --jq '{tag: .tagName, url: .url, assets: [.assets[].name]}'
