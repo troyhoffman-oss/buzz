@@ -8,7 +8,7 @@ export type ProfileEditAgentTarget = "instance" | "definition";
  * Route the profile panel's Edit action to the editor that can actually show
  * this agent's configuration.
  *
- * Rule 19 (`features/agents/AGENTS.md`): a provider record answers from itself.
+ * Rule 20 (`features/agents/AGENTS.md`): a provider record answers from itself.
  * Its harness, command and model describe the HOST, and the definition
  * projection drops all three by design (`ManagedAgentRecord::to_definition_view`
  * has no slot for `backend` or `agent_command`), so the definition dialog opens
@@ -26,4 +26,27 @@ export function profileEditAgentTarget({
 }): ProfileEditAgentTarget {
   if (managedAgent && providerRecordHarness(managedAgent)) return "instance";
   return resolvedPersona ? "definition" : "instance";
+}
+
+/**
+ * Whether the definition dialog this panel opens is editing a provider-backed
+ * record, which must not have a local harness seeded into it.
+ *
+ * Edit-only, and the shape is what says so: this one dialog is driven by three
+ * handlers, and Duplicate seeds a CREATE (no `id`) from the same
+ * provider-backed profile an Edit would. Without the `id` check the guard shed
+ * the create's harness while `useCreateRuntimeSeed`'s create-only effect
+ * re-seeded it, and the two fought until React gave up.
+ */
+export function profileDialogEditsProviderRecord({
+  initialValues,
+  managedAgent,
+}: {
+  initialValues: object | null | undefined;
+  managedAgent: ManagedAgent | undefined;
+}): boolean {
+  if (initialValues == null || !("id" in initialValues)) return false;
+  return (
+    managedAgent !== undefined && providerRecordHarness(managedAgent) !== null
+  );
 }

@@ -90,6 +90,7 @@ export const MessageRow = React.memo(
     onMarkRead,
     onToggleReaction,
     onReply,
+    onOpenThread,
     onEntranceComplete,
     playEntrance = false,
     onUnfollowThread,
@@ -137,6 +138,7 @@ export const MessageRow = React.memo(
       remove: boolean,
     ) => Promise<void>;
     onReply?: (message: TimelineMessage) => void;
+    onOpenThread?: (message: TimelineMessage) => void;
     onUnfollowThread?: (message: TimelineMessage) => void;
     onEntranceComplete?: (messageId: string) => void;
     playEntrance?: boolean;
@@ -337,7 +339,7 @@ export const MessageRow = React.memo(
             <HuddleAttachment
               channelId={channelId}
               message={message}
-              onOpenThread={onReply}
+              onOpenThread={onOpenThread}
             />
           );
         default:

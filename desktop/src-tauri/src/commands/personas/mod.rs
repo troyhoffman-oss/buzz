@@ -54,11 +54,6 @@ pub async fn list_personas(app: AppHandle) -> Result<Vec<AgentDefinition>, Strin
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
 }
 
-// `inbound_tests` and `name_propagation_tests` are declared by `inbound.rs`
-// and `update.rs` respectively (upstream moved them into those submodules);
-// `delete_cascade_tests` is declared by `delete.rs`, which owns
-// `delete_persona` and its cascade helpers on this branch.
-#[path = "delete.rs"]
 mod delete;
 pub use delete::delete_persona;
 
@@ -116,11 +111,14 @@ pub async fn set_persona_active(
 }
 
 pub(crate) const PNG_MAGIC: [u8; 4] = [0x89, 0x50, 0x4E, 0x47];
+mod card;
 mod snapshot;
-pub use snapshot::encode_agent_snapshot_for_send;
-pub use snapshot::export_agent_snapshot;
+pub use card::*;
+#[cfg(test)]
+pub(crate) use snapshot::import::decode_snapshot_from_bytes;
 pub(crate) use snapshot::import::{
-    decode_snapshot_from_bytes, resolve_snapshot_import_behavior, MAX_SNAPSHOT_JSON_BYTES,
+    parse_snapshot_payload_from_bytes, resolve_snapshot_import_behavior, MAX_SNAPSHOT_JSON_BYTES,
     MAX_SNAPSHOT_PNG_BYTES,
 };
 pub use snapshot::{confirm_agent_snapshot_import, preview_agent_snapshot_import};
+pub use snapshot::{encode_agent_snapshot_for_send, export_agent_snapshot};

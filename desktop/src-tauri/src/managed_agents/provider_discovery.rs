@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+/// The filename prefix that makes an executable a provider.
 const PROVIDER_PREFIX: &str = "buzz-backend-";
 
 /// Executable extensions a provider binary may carry on Windows.
@@ -103,6 +104,11 @@ fn provider_exec_naming() -> ExecNaming {
 /// Derive a provider id from a directory entry's file name, or `None` when the
 /// entry is not a usable provider.
 ///
+/// The one owner of "what id is this file?", so discovery and deduplication
+/// cannot disagree — a host carrying both `buzz-backend-ssh` and
+/// `buzz-backend-ssh.exe` must offer one `ssh`, not two entries the desktop
+/// then treats as different providers.
+///
 /// Under [`ExecNaming::NoExtension`] the name after the prefix is the id
 /// verbatim. Under [`ExecNaming::Extensions`] the name MUST end in an allowed
 /// extension and that extension is stripped: `buzz-backend-ssh.exe` yields
@@ -137,18 +143,27 @@ fn provider_id_is_valid(id: &str) -> bool {
 /// Enumerate PATH for buzz-backend-* executables. Returns (id, path) pairs.
 /// Only includes files that are executable. Does NOT execute any binaries.
 ///
-/// On macOS, GUI apps inherit a minimal PATH from launchd (`/usr/bin:/bin:/usr/sbin:/sbin`)
-/// which excludes both the app bundle's `Contents/MacOS/` dir and `~/.local/bin`.
-/// We augment the search with those directories so bundled and user-installed providers
-/// are always discovered regardless of how the desktop was launched.
-///
 /// On Windows the executable extension is stripped from the id and constrained
 /// to `SAFE_EXEC_EXTENSIONS` — see [`provider_id_from_file_name`].
 pub fn discover_provider_candidates() -> Vec<(String, PathBuf)> {
-    let naming = provider_exec_naming();
-    let mut seen = std::collections::HashSet::new();
-    let mut results = Vec::new();
+    candidates_in(search_path())
+}
 
+/// The directories discovery scans, in precedence order.
+///
+/// On macOS, GUI apps inherit a minimal PATH from launchd
+/// (`/usr/bin:/bin:/usr/sbin:/sbin`) which excludes both the app bundle's
+/// `Contents/MacOS/` dir and `~/.local/bin`. We augment the search with those
+/// directories so bundled and user-installed providers are always discovered
+/// regardless of how the desktop was launched.
+///
+/// Separated from the scan so tests can supply their own. What a test of the
+/// naming and resolution rules must not depend on is whether the machine
+/// running it happens to have a real provider installed: asserting that
+/// `resolve_provider_binary("ssh")` fails passes on CI and fails on any
+/// developer box with `~/.local/bin/buzz-backend-ssh` — which is exactly the
+/// install this feature tells users to perform.
+fn search_path() -> Vec<PathBuf> {
     let path_var = std::env::var_os("PATH").unwrap_or_default();
     let mut dirs: Vec<PathBuf> = std::env::split_paths(&path_var).collect();
 
@@ -171,6 +186,15 @@ pub fn discover_provider_candidates() -> Vec<(String, PathBuf)> {
             dirs.push(local_bin);
         }
     }
+
+    dirs
+}
+
+/// Scan `dirs` in precedence order and return each provider id once.
+fn candidates_in(dirs: Vec<PathBuf>) -> Vec<(String, PathBuf)> {
+    let naming = provider_exec_naming();
+    let mut seen = std::collections::HashSet::new();
+    let mut results = Vec::new();
 
     for dir in dirs {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -243,6 +267,15 @@ fn provider_candidates_in_dir(
 /// `resolve_command(format!("buzz-backend-{id}"))` to prevent a compromised
 /// frontend/IPC caller from steering execution to an arbitrary binary.
 pub fn resolve_provider_binary(provider_id: &str) -> Result<PathBuf, String> {
+    resolve_provider_binary_in(provider_id, search_path())
+}
+
+/// [`resolve_provider_binary`] against an explicit search path.
+///
+/// Production always passes [`search_path`]. Tests pass a temp dir, so the
+/// naming rules can be asserted against a known-empty (or deliberately
+/// populated) directory rather than against whatever the host has installed.
+fn resolve_provider_binary_in(provider_id: &str, dirs: Vec<PathBuf>) -> Result<PathBuf, String> {
     // Reject IDs that could be path components or shell metacharacters.
     if !provider_id_is_valid(provider_id) {
         return Err(format!(
@@ -250,7 +283,7 @@ pub fn resolve_provider_binary(provider_id: &str) -> Result<PathBuf, String> {
         ));
     }
 
-    let candidates = discover_provider_candidates();
+    let candidates = candidates_in(dirs);
     let found = candidates
         .into_iter()
         .find(|(id, _)| id == provider_id)
@@ -319,6 +352,14 @@ mod tests {
         ExecNaming::Extensions(allowed_exec_extensions_from(None))
     }
 
+    /// An empty search path: no provider resolves, regardless of what the
+    /// machine running the test has installed.
+    fn empty_search_path() -> (tempfile::TempDir, Vec<PathBuf>) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = vec![dir.path().to_path_buf()];
+        (dir, path)
+    }
+
     #[test]
     fn provider_id_strips_windows_executable_extension() {
         // The W1 bug: `buzz-backend-ssh.exe` yielded id "ssh.exe", which
@@ -348,7 +389,9 @@ mod tests {
     #[test]
     fn provider_id_rejects_shell_script_extensions_on_windows() {
         // `.cmd`/`.bat` route through cmd.exe, which would add shell quoting
-        // in front of a stdin channel that carries an nsec. Security boundary.
+        // in front of a stdin channel that carries an nsec. Security boundary:
+        // such a file yields no id at all, so it is never discovered and never
+        // resolved for execution.
         for name in [
             "buzz-backend-ssh.cmd",
             "buzz-backend-ssh.bat",
@@ -439,12 +482,16 @@ mod tests {
 
     /// The whole discovery path against a real directory: `PATHEXT` ranking,
     /// id validation, executability and dedupe are unit-tested in isolation
-    /// above, but only running `discover_provider_candidates` proves they
-    /// compose — that a real `read_dir` entry survives all four and comes back
-    /// as a usable (id, path) pair.
+    /// above, but only running the scan proves they compose — that a real
+    /// `read_dir` entry survives all four and comes back as a usable
+    /// `(id, path)` pair.
+    ///
+    /// Driven through the explicit-search-path seam rather than by mutating
+    /// `PATH`: the claim is about the scanning rules, and a test that edits a
+    /// process-global while sibling tests run is both flaky and unnecessary.
     #[cfg(unix)]
     #[test]
-    fn discover_provider_candidates_finds_an_executable_on_path() {
+    fn discovery_finds_an_executable_in_the_search_path() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -462,15 +509,8 @@ mod tests {
         write("some-other-tool", 0o755);
         write("buzz-backend-ZZZUPPER", 0o755);
 
-        // Prepended, so every other entry the process already had stays
-        // visible and a concurrent test still resolves what it expects.
-        let original_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{original_path}", dir.path().display()));
-        let found = discover_provider_candidates();
-        // The discovered pair is one `resolve_provider_binary` accepts — the
-        // catalog never advertises a provider that cannot then be executed.
-        let resolved = resolve_provider_binary("zzztest");
-        std::env::set_var("PATH", &original_path);
+        let path = vec![dir.path().to_path_buf()];
+        let found = candidates_in(path.clone());
 
         let ids: Vec<&str> = found.iter().map(|(id, _)| id.as_str()).collect();
         assert!(ids.contains(&"zzztest"), "{ids:?}");
@@ -480,7 +520,28 @@ mod tests {
             found.iter().find(|(id, _)| id == "zzztest").map(|(_, p)| p),
             Some(&provider)
         );
-        assert_eq!(resolved.ok(), provider.canonicalize().ok());
+        // The discovered pair is one `resolve_provider_binary` accepts — the
+        // catalog never advertises a provider that cannot then be executed.
+        assert_eq!(
+            resolve_provider_binary_in("zzztest", path).ok(),
+            provider.canonicalize().ok()
+        );
+
+        // The same id against an empty path does not resolve. Without this, a
+        // bug that made `candidates_in` return nothing would leave every other
+        // assertion here passing.
+        let (_empty_temp, empty) = empty_search_path();
+        assert!(resolve_provider_binary_in("zzztest", empty).is_err());
+    }
+
+    /// A non-executable file with a provider's name is not a provider — the
+    /// executability check is part of discovery, not an afterthought.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_file_is_not_a_candidate() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("buzz-backend-inert"), b"not executable").expect("write");
+        assert!(candidates_in(vec![dir.path().to_path_buf()]).is_empty());
     }
 
     #[test]
@@ -552,31 +613,59 @@ mod tests {
 
     #[test]
     fn resolve_provider_binary_rejects_invalid_ids() {
-        // Path traversal
-        assert!(resolve_provider_binary("../evil").is_err());
-        // Empty
-        assert!(resolve_provider_binary("").is_err());
-        // Uppercase
-        assert!(resolve_provider_binary("MyProvider").is_err());
-        // Spaces
-        assert!(resolve_provider_binary("my provider").is_err());
-        // Shell metacharacters
-        assert!(resolve_provider_binary("foo;rm -rf /").is_err());
-        // Valid format but not on PATH — should fail with "not found"
-        assert!(resolve_provider_binary("nonexistent-test-id-12345").is_err());
+        let (_temp, path) = empty_search_path();
+        for id in [
+            "../evil",       // path traversal
+            "",              // empty
+            "MyProvider",    // uppercase
+            "my provider",   // spaces
+            "foo;rm -rf /",  // shell metacharacters
+            "-leading-dash", // does not start with [a-z0-9]
+        ] {
+            let error = resolve_provider_binary_in(id, path.clone()).unwrap_err();
+            assert!(error.contains("invalid provider ID"), "{id:?}: {error}");
+        }
+        // Valid format, nothing in the search path — a different error, and the
+        // distinction is what tells a user "typo" from "not installed".
+        let error = resolve_provider_binary_in("nonexistent-test-id-12345", path).unwrap_err();
+        assert!(error.contains("not found"), "{error}");
     }
 
     #[test]
     fn resolve_provider_binary_accepts_valid_id_format() {
-        // Valid ID format should pass validation. If the binary happens to
-        // exist on PATH, Ok is returned; otherwise Err contains "not found"
-        // (not "invalid provider ID"). Either outcome proves validation passed.
-        match resolve_provider_binary("zzz-nonexistent-test-provider") {
-            Ok(_) => {} // unlikely but fine — binary exists
-            Err(e) => assert!(
-                e.contains("not found"),
-                "expected 'not found' error, got: {e}"
-            ),
+        // A well-formed id gets past validation and fails on availability
+        // instead. Against an empty search path that outcome is exact rather
+        // than "either result proves it".
+        let (_temp, path) = empty_search_path();
+        let error = resolve_provider_binary_in("zzz-nonexistent-test-provider", path).unwrap_err();
+        assert!(
+            error.contains("not found") && !error.contains("invalid provider ID"),
+            "expected 'not found' error, got: {error}"
+        );
+    }
+
+    /// Discovery reads the real search path in production, so the wiring must
+    /// stay connected. Asserts only what is true on every machine: the call
+    /// works and every id it yields is one the resolver would accept, under the
+    /// naming rule this platform actually uses.
+    #[test]
+    fn discovery_uses_the_real_search_path_and_yields_only_valid_ids() {
+        assert!(!search_path().is_empty(), "PATH produced no directories");
+        let naming = provider_exec_naming();
+        for (id, path) in discover_provider_candidates() {
+            assert!(
+                provider_id_is_valid(&id),
+                "{path:?} was discovered under an id the resolver would reject: {id}"
+            );
+            assert_eq!(
+                provider_id_from_file_name(
+                    &path.file_name().unwrap_or_default().to_string_lossy(),
+                    &naming
+                )
+                .as_deref(),
+                Some(id.as_str()),
+                "{path:?} was discovered under an id its filename does not name"
+            );
         }
     }
 }

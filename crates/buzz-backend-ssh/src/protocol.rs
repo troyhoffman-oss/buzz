@@ -138,6 +138,16 @@ pub struct SshConfig {
     pub user: Option<String>,
     pub port: Option<u16>,
     pub identity_file: Option<String>,
+    /// A `UserKnownHostsFile` for this connection, when the deploying user's
+    /// host keys do not live at `~/.ssh/known_hosts`.
+    ///
+    /// Optional, and absent it changes nothing: `ssh` reads its own default,
+    /// so the argv is byte-identical to what it has always been. Named
+    /// `ssh_known_hosts_file` for the same reason `identity_file` is not
+    /// `ssh_key_path` — the desktop's `validate_provider_config` word-splits
+    /// the key and drops anything containing `key`, so `ssh_host_key_file`
+    /// would vanish silently on the way in.
+    pub known_hosts_file: Option<String>,
     pub buzz_acp_path: Option<String>,
 }
 
@@ -183,6 +193,7 @@ impl SshConfig {
             user: string("ssh_user"),
             port,
             identity_file: string("ssh_identity_file"),
+            known_hosts_file: string("ssh_known_hosts_file"),
             buzz_acp_path: string("buzz_acp_path"),
         })
     }
@@ -202,6 +213,17 @@ impl SshConfig {
             .map_or(self.host.as_str(), |(_, host)| host)
     }
 }
+
+/// The provider-protocol wire-contract version this binary speaks.
+///
+/// Distinct from `CARGO_PKG_VERSION`, which is the provider's *software*
+/// version and says nothing about compatibility. The spec
+/// (`docs/remote-agents.md` §Info) fixes this document at `1` and requires an
+/// **integer** — the desktop's pre-secret negotiation gate (§Discovery) invokes
+/// `info` on a staged copy of this binary and rejects an absent or unsupported
+/// `protocol_version` *before* a request carrying `private_key_nsec` is sent.
+/// Absence is an error, not a presumed `1`, so this field is not optional.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The `info` response, including the Tailscale-decorated config schema.
 ///
@@ -223,6 +245,7 @@ pub fn info_response() -> serde_json::Value {
         "ok": true,
         "name": "SSH",
         "version": env!("CARGO_PKG_VERSION"),
+        "protocol_version": PROTOCOL_VERSION,
         "description": "Run agents on a remote host over SSH, supervised by systemd --user.",
         "config_schema": {
             "type": "object",
@@ -235,6 +258,11 @@ pub fn info_response() -> serde_json::Value {
                     "type": "string",
                     "title": "SSH identity file (optional)",
                     "description": "Defaults to your ~/.ssh/config and agent",
+                },
+                "ssh_known_hosts_file": {
+                    "type": "string",
+                    "title": "SSH known hosts file (optional)",
+                    "description": "Defaults to your ~/.ssh/known_hosts",
                 },
                 "buzz_acp_path": {
                     "type": "string",
@@ -290,14 +318,34 @@ mod tests {
         let info = info_response();
         let properties = info["config_schema"]["properties"].as_object().unwrap();
         assert!(properties.contains_key("ssh_identity_file"));
+        assert!(properties.contains_key("ssh_known_hosts_file"));
         for key in properties.keys() {
             assert!(
                 !desktop_rejects_key(key),
                 "config key {key:?} would be rejected by validate_provider_config"
             );
         }
-        // The name this field must never have.
+        // The names these fields must never have: both would be word-split into
+        // a forbidden `key` and dropped by the desktop with no error anywhere.
         assert!(desktop_rejects_key("ssh_key_path"));
+        assert!(desktop_rejects_key("ssh_host_key_file"));
+    }
+
+    /// The desktop's pre-secret gate rejects an absent or non-integer
+    /// `protocol_version` before the nsec is sent (spec §Discovery), so a
+    /// regression here does not degrade — it makes the provider undeployable.
+    #[test]
+    fn info_declares_an_integer_protocol_version() {
+        let info = info_response();
+        let declared = &info["protocol_version"];
+        assert!(
+            declared.is_u64(),
+            "protocol_version must be an integer, got {declared}"
+        );
+        assert_eq!(declared.as_u64(), Some(u64::from(PROTOCOL_VERSION)));
+        assert_eq!(PROTOCOL_VERSION, 1, "this document specifies 1");
+        // The wire-contract version is not the software version.
+        assert_ne!(declared, &info["version"]);
     }
 
     #[test]

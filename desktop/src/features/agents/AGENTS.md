@@ -106,7 +106,15 @@ with a TypeScript lookup table or an id comparison in a component.
    Edit. In Edit,
    selecting Custom command keeps its required command field beside the harness
    picker rather than hiding it in Advanced.
-10. **A remote create's models come from the host, never from this computer.**
+10. **Catalog visibility is community-scoped relay state, never a global
+    definition field.** `AgentDefinition.shared` is only the active
+    relay+owner projection returned to the UI. Durable heads and pending
+    publications live in the scoped retention database, and explicit share
+    toggles await relay acceptance before the UI claims that an agent was
+    published or removed. A queued update must stay visibly queued, and the
+    catalog itself must render only relay-confirmed publications — never an
+    optimistic local persona.
+11. **A remote create's models come from the host, never from this computer.**
     When "Where to run" targets a backend provider and a harness is picked from
     the host's catalog, `WhereToRunSection` calls `probeProviderModels`
     (`probe_provider_models`, guarded by `resolve_discovered_provider`) and
@@ -123,7 +131,7 @@ with a TypeScript lookup table or an id comparison in a component.
     picked harness resets the model for the same reason changing the local
     runtime does. Do not add a remote-specific rendering path in
     `PersonaModelField`: keep the substitution at the discovery seam.
-11. **Every host round-trip carries a request id.** `WhereToRunSection` opens
+12. **Every host round-trip carries a request id.** `WhereToRunSection` opens
     real SSH connections (`discoverProviderHarnesses`, `probeProviderModels`).
     Both claim `hostRequestRef` at their start and re-check it after every
     await; anything that moves the draft off the host they were made for
@@ -133,7 +141,7 @@ with a TypeScript lookup table or an id comparison in a component.
     probe at the NEW host under the OLD host's harness command. A new
     host-touching call gets the same treatment — do not add one that only
     guards its own continuation.
-12. **"Where does this agent run?" is the create flow's first question, and
+13. **"Where does this agent run?" is the create flow's first question, and
     it scopes every field below it.** `createRunSection` renders above name,
     persona, and harness in `AgentDefinitionDialog` because the harness comes
     from the chosen machine's catalog and the models come from that harness —
@@ -152,7 +160,7 @@ with a TypeScript lookup table or an id comparison in a component.
     local `goose/config.yaml` satisfy a remote requirement trades a loud
     create-time block for a silent deploy-time failure.
     Edit mode is untouched — `createRunSection` is create-only.
-13. **A provider decorates a config property with `oneOf`; the desktop renders
+14. **A provider decorates a config property with `oneOf`; the desktop renders
     it generically.** `providerConfigChoices` reads
     `oneOf: [{ const, title }]` off any config-schema property and
     `ProviderConfigFields` renders a select over it plus an "Other…" escape
@@ -164,7 +172,7 @@ with a TypeScript lookup table or an id comparison in a component.
     list (carried over, or a peer that has left the tailnet) stays in free text
     rather than reading as "nothing selected" — that is
     `usesProviderConfigFreeText`, and it is pure so it can be tested.
-14. **Remote liveness is relay presence; `"deployed"` is a control-plane fact,
+15. **Remote liveness is relay presence; `"deployed"` is a control-plane fact,
     not a liveness one.** `build_managed_agent_summary` reports `"deployed"`
     whenever `backend_agent_id` is set, and that id is written exactly once —
     on a successful deploy (`commands/agents.rs`) — with no clearer anywhere,
@@ -184,7 +192,7 @@ with a TypeScript lookup table or an id comparison in a component.
     could run the agent and its UI copy ("Needs setup on this device") names
     the wrong machine. See the doc comment on `status_for_with`
     (`runtime_commands.rs`).
-15. **The pinned harness must be an `available` catalog entry.**
+16. **The pinned harness must be an `available` catalog entry.**
     `selectedRemoteHarness` filters on `available`, so an id that a re-check
     turned unavailable stops being the pin rather than deploying a command the
     host says is not installed. Likewise the create-time args of a provider
@@ -192,7 +200,7 @@ with a TypeScript lookup table or an id comparison in a component.
     would compare a REMOTE command against LOCAL runtime identity, and a host
     binary sharing a basename with a local runtime would have its explicit
     args silently rewritten.
-16. **An `exclusive` catalog entry may back at most one agent.** The provider
+17. **An `exclusive` catalog entry may back at most one agent.** The provider
     marks entries that name a persistent IDENTITY on the host (its own memory,
     sessions, credentials) rather than an ephemeral runner — today only the
     per-Hermes-profile entries. Deploying `claude` N times to one host is the
@@ -209,14 +217,14 @@ with a TypeScript lookup table or an id comparison in a component.
     is exact after trimming/dropping-blanks/sorting, so a host reached by two
     names under-matches (the guard does not fire) rather than falsely blocking
     a create; the real fix is a host-identity answer from the provider.
-17. **A location label names the PROVIDER, never the host.** `agentRunsOnLabel`
+18. **A location label names the PROVIDER, never the host.** `agentRunsOnLabel`
     is the one owner of "where does this agent run" for every surface that
     lists agents (`AgentIdentityCard`, `MembersSidebarMemberCard`, the user
     profile panel's "Runs on" row). It answers `null` for a local agent — "on
     this computer" is the assumption a reader already holds, so painting it
     costs a metadata line to say nothing — and for a provider-backed one it
     returns `backendProviderLabel(backend.id)`. It does NOT read
-    `backend.config`. That is the same refusal rule 16 makes: a blessed
+    `backend.config`. That is the same refusal rule 17 makes: a blessed
     `ssh_host` key means the desktop grows a host vocabulary per provider, and
     a provider id is constrained to `^[a-z0-9][a-z0-9_-]*$` by
     `provider_id_is_valid` while a host is not, so naming the provider is also
@@ -225,7 +233,7 @@ with a TypeScript lookup table or an id comparison in a component.
     must not spawn one subprocess per provider to decorate a string. A new
     agent-listing surface calls the same helper and extends an existing
     metadata slot rather than adding a badge.
-18. **Settings → Remote servers reports what is installed; the create flow owns
+19. **Settings → Remote servers reports what is installed; the create flow owns
     deployment.** `RemoteServersCard` is read-only by design and has no host
     list. A provider is a binary on `PATH`, so "adding" one is an install, not
     a form; and the host is a per-agent decision the create dialog pins onto
@@ -235,7 +243,7 @@ with a TypeScript lookup table or an id comparison in a component.
     consequences that must not drift: this gallery is the ONLY surface that
     pays for an `info` probe per discovered binary
     (`useBackendProviderProbesQuery`; the create dialog and the onboarding
-    notice render ids, per rule 17); `"ready"` means "this binary answers the
+    notice render ids, per rule 18); `"ready"` means "this binary answers the
     provider protocol", never "the server is reachable", because `info` opens
     no connection; and every settled probe must land in the probe map, since an
     absent entry is indistinguishable from one still in flight and a dropped
@@ -243,7 +251,7 @@ with a TypeScript lookup table or an id comparison in a component.
     no-provider sentence is `NO_BACKEND_PROVIDER_HINT`, stated once and
     rendered by all three surfaces — a user meets it in up to three places, and
     three spellings of one fact read as three different facts.
-19. **A provider record answers from itself, never from the local catalog.**
+20. **A provider record answers from itself, never from the local catalog.**
     A provider-backed record's `agentCommand`/`agentArgs` name a binary on the
     HOST, which this computer's runtime catalog has never seen — so every local
     lookup either misses (`hermes …` → generic icon, raw command as a name) or
@@ -260,7 +268,7 @@ with a TypeScript lookup table or an id comparison in a component.
       widespread CLI convention. Nothing here knows what Hermes or SSH is; do
       not teach it. The profile is part of the identity: two profiles of one
       harness are two agents with their own memory and credentials, and must
-      not read as one name (same fact rule 16 guards on).
+      not read as one name (same fact rule 17 guards on).
     - **Normalization has one owner.** `normalizePinnedCommand` trims the
       command and drops blank args, matching `create_time_agent_args`, and
       BOTH the displayed `pin.command` and `exclusiveRemoteHarness`'s equality
@@ -298,9 +306,9 @@ with a TypeScript lookup table or an id comparison in a component.
     THIS machine, so a working `hermes --profile marshall acp` would be
     replaced by a binary that does not exist on the host, from a dialog that
     never said it would touch the harness.
-20. **A host failure the user can fix carries a typed recovery, and the URL is
+21. **A host failure the user can fix carries a typed recovery, and the URL is
     validated on entry.** A provider may answer a failed op with
-    `recovery: {action: "open_url", url}` (see `docs/remote-agents.md`); today
+    `recovery: {action: "open_url", url}` (see `docs/remote-agents-ssh.md`); today
     the only case is a tailnet ACL demanding browser re-auth. It reaches the UI
     as `ProviderFailure {message, recovery}` — there is deliberately no
     `From<ProviderFailure> for String`, which is the type-level guard against a
@@ -327,14 +335,6 @@ with a TypeScript lookup table or an id comparison in a component.
       to the message at one named site. Do not turn that into a blanket `impl
       From<ProviderFailure> for String` — the explicitness is the point. Give
       the surface an action before widening it.
-21. **Catalog visibility is community-scoped relay state, never a global
-    definition field.** `AgentDefinition.shared` is only the active
-    relay+owner projection returned to the UI. Durable heads and pending
-    publications live in the scoped retention database, and explicit share
-    toggles await relay acceptance before the UI claims that an agent was
-    published or removed. A queued update must stay visibly queued, and the
-    catalog itself must render only relay-confirmed publications — never an
-    optimistic local persona.
 22. **Shared agent access names the consequence where it is selected.** The
    shared respond-to field shows a persistent warning whenever `anyone` **or**
    `allowlist` is selected — both hand the host's access to someone other than
@@ -385,14 +385,14 @@ with a TypeScript lookup table or an id comparison in a component.
   that follows it), and `remoteModelDiscoveryView`
   (idle/loading/failed/loaded/empty-catalog). Covers the PROJECTION of the
   host's probe, not the substitution that consumes it. Also `remoteHarnessOptions`
-  / `autoPickRemoteHarness`: rule 16's disabled "(added)" row and the auto-pick
+  / `autoPickRemoteHarness`: rule 17's disabled "(added)" row and the auto-pick
   that must never arm a create the picker itself refuses.
-- `lib/exclusiveRemoteHarness.test.mjs` — rule 16's matcher. Same host + same
+- `lib/exclusiveRemoteHarness.test.mjs` — rule 17's matcher. Same host + same
   pinned identity is taken; a different host, user, provider, profile or
   command is not; a local agent never occupies a host identity; a
   non-exclusive entry is never taken however many agents run it; and an absent
   flag is exactly today's behavior.
-- `lib/pinnedHarness.test.mjs` — rule 19's derivation, plus the label table's
+- `lib/pinnedHarness.test.mjs` — rule 20's derivation, plus the label table's
   agreement with the Rust catalogs in BOTH directions (it reads
   `discovery.rs` as text, the same trick `presetLogos.test.mjs` uses; a TS-only
   key must be listed in `NOT_IN_RUST_CATALOG` with the surface that carries the
@@ -403,7 +403,7 @@ with a TypeScript lookup table or an id comparison in a component.
   a remote card starts naming a harness the host does not run, this is the test
   that should have caught it.
 - `../profile/ui/profileEditAgentTarget.test.mjs` and
-  `agentManagementUpdateTarget.test.mjs` — rule 19's editing route, once per
+  `agentManagementUpdateTarget.test.mjs` — rule 20's editing route, once per
   door. Both pin the same pair: a provider-backed record selects the instance
   editor even though it has a personaId (every provider create does), and a
   local persona-backed one still selects the definition editor. If a remote
@@ -414,7 +414,7 @@ with a TypeScript lookup table or an id comparison in a component.
   edit-mode `editsProviderRecord` guard. Its create-mode sibling asks
   `runsRemotely`, which is false in edit mode, so a remote record's blank
   runtime was being filled with the local default.
-- `lib/agentAvatarUrl.test.mjs` — rule 19's precedence chain. A human's choice
+- `lib/agentAvatarUrl.test.mjs` — rule 20's precedence chain. A human's choice
   beats the agent's own published avatar beats the record's stamp beats the
   harness mark; a LOCAL record never reaches the harness step, so its rendering
   is unchanged.
@@ -423,7 +423,7 @@ with a TypeScript lookup table or an id comparison in a component.
   (a relay agent's declared `agentType`) through the SAME owner. A second label
   table here is what let `codex-acp` be "Codex" in one place and a harness
   learned in Rust be a raw command in the other.
-- `lib/agentLocationLabel.test.mjs` — rule 17. A local, undefined or null
+- `lib/agentLocationLabel.test.mjs` — rule 18. A local, undefined or null
   backend is unlabelled; a provider-backed one is named by its id; and a
   config carrying an `ssh_host` still yields the provider's name, so the host
   cannot leak into a card by accident.
@@ -435,7 +435,7 @@ with a TypeScript lookup table or an id comparison in a component.
   states. Pending stays pending over a cached list, because rendering the
   install hint and then contradicting it a frame later is the failure this
   projection exists to prevent.
-- `features/settings/ui/remoteServerGalleryLogic.test.mjs` — rule 18.
+- `features/settings/ui/remoteServerGalleryLogic.test.mjs` — rule 19.
   `remoteServerProbes` lands every settled query somewhere (a response-less
   success is a failed row, not a permanent spinner), and `remoteServerEntries`
   covers ready/probing/unavailable, blank-vs-absent metadata, and the
@@ -460,7 +460,7 @@ with a TypeScript lookup table or an id comparison in a component.
   underneath a live remote catalog, these are the tests that should have
   caught it. The staleness guard in `WhereToRunSection` itself is NOT covered
   (no hook/DOM test infrastructure in this workspace — `pnpm test` is bare
-  `node --test`); it is held by rule 11 and review, so read it carefully.
+  `node --test`); it is held by rule 12 and review, so read it carefully.
 - `ui/usePersonaModelDiscovery.test.mjs` — `synthesizeEmptyDiscoveryStatus`,
   `isCacheableDiscoveryResponse`, `deriveModelDiscoveryPending`,
   `isSuccessfulEmptyDiscovery`. If the "reopen to retry" copy becomes inert
@@ -475,12 +475,12 @@ with a TypeScript lookup table or an id comparison in a component.
   acceptance coverage for readiness, failure states, defaults, navigation,
   successful-empty vs failed optional-model discovery, and persistence races.
 - Rust: `runtime_metadata_env_vars` tests pin spawn-time key application.
+- Rust: persona sharing/retention tests pin relay+owner scoping, durable
+  enqueue errors, relay rejection/unavailability, and accepted publication.
 - Rust: `discovery/tests/create_time_args.rs` — the create-time args authority.
   Every case asserts the local AND provider backend over the same input,
   because a remote binary sharing a basename with a local runtime is
   normalized without complaint otherwise.
-- Rust: persona sharing/retention tests pin relay+owner scoping, durable
-  enqueue errors, relay rejection/unavailability, and accepted publication.
 
 ## Keep this file true
 

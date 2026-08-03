@@ -10,8 +10,6 @@ import type {
 import { cn } from "@/shared/lib/cn";
 import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
 import { Dialog } from "@/shared/ui/dialog";
-import { Input } from "@/shared/ui/input";
-import { Textarea } from "@/shared/ui/textarea";
 import { AgentCreationPreview } from "./AgentCreationPreview";
 import {
   createGateHarnessId,
@@ -19,7 +17,6 @@ import {
   runtimeDropdownOptions as buildRuntimeDropdownOptions,
   runtimeDropdownPlaceholder,
 } from "./createRuntimeGate";
-import { PersonaDropdownField } from "./PersonaDropdownField";
 import type { EnvVarsValue } from "./EnvVarsEditor";
 import { PersonaAdvancedFields } from "./PersonaAdvancedFields";
 import { PersonaModelField } from "./PersonaModelField";
@@ -51,12 +48,8 @@ import {
   NO_RUNTIME_DROPDOWN_VALUE,
   runtimeSupportsLlmProviderSelection,
   type PersonaDropdownOption,
-  PERSONA_FIELD_CONTROL_CLASS,
-  PERSONA_FIELD_SHELL_CLASS,
-  PERSONA_LABEL_OPTIONAL_CLASS,
   shouldClearKnownModelForSelectionScope,
 } from "./agentConfigOptions";
-import { RequiredFieldLabel } from "./agentConfigControls";
 import {
   modelDropdownOptions as buildModelDropdownOptions,
   relayMeshModelPickerState,
@@ -85,16 +78,18 @@ import {
 } from "./agentAiConfigurationPolicy";
 import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { buildRuntimeModelProviderPayload } from "./agentDefinitionSubmitPayload";
-import { useCreateRuntimeSeed } from "./useCreateRuntimeSeed";
-import { useRemoteAwareModelDiscovery } from "./useRemoteAwareModelDiscovery";
-import type { RemoteModelDiscoveryView } from "./whereToRunIntent";
 import { AgentDefinitionDialogFooter } from "./AgentDefinitionDialogFooter";
+import { AgentDefinitionIdentityFields } from "./AgentDefinitionIdentityFields";
+import { AgentLlmProviderField } from "./AgentLlmProviderField";
 import { AddCustomHarnessDialog } from "./AddCustomHarnessDialog";
 import {
   ADD_CUSTOM_HARNESS_OPTION,
   runtimeDropdownAction,
   usePendingHarnessSelection,
 } from "./addCustomHarness";
+import { useCreateRuntimeSeed } from "./useCreateRuntimeSeed";
+import { useRemoteAwareModelDiscovery } from "./useRemoteAwareModelDiscovery";
+import type { RemoteModelDiscoveryView } from "./whereToRunIntent";
 
 type AgentDefinitionDialogProps = {
   open: boolean;
@@ -624,9 +619,6 @@ export function AgentDefinitionDialog({
     runtimes,
     runtimesLoading,
   });
-  // Upstream's inline "Add custom harness..." entry is appended after the
-  // gate-aware options so it is never subject to the availability disabling
-  // the gate applies to real harnesses.
   runtimeDropdownOptions.push(ADD_CUSTOM_HARNESS_OPTION);
   // The host's pick wins outright for a remote create: `runtime` still holds
   // whatever the local seeding effects resolved, and naming that harness in
@@ -836,55 +828,13 @@ export function AgentDefinitionDialog({
                 and then silently re-scoping them. */}
             {isCreateMode ? createRunSection?.({ envVars }) : null}
 
-            <div className="space-y-1.5">
-              <label
-                className="text-sm font-medium text-foreground"
-                htmlFor="persona-display-name"
-              >
-                Agent name
-              </label>
-              <div
-                className={cn(
-                  "flex min-h-11 items-center px-3",
-                  PERSONA_FIELD_SHELL_CLASS,
-                )}
-              >
-                <Input
-                  autoCorrect="off"
-                  className={cn(
-                    "h-8 px-0 py-0 leading-6",
-                    PERSONA_FIELD_CONTROL_CLASS,
-                  )}
-                  disabled={isPending}
-                  id="persona-display-name"
-                  onChange={(event) => setDisplayName(event.target.value)}
-                  placeholder="Fizz"
-                  value={displayName}
-                />
-              </div>
-            </div>
-
-            <div className="space-y-1.5">
-              <label
-                className="text-sm font-medium text-foreground"
-                htmlFor="persona-system-prompt"
-              >
-                Agent instructions
-              </label>
-              <div className={PERSONA_FIELD_SHELL_CLASS}>
-                <Textarea
-                  className={cn(
-                    "min-h-40 resize-y px-3 py-3 leading-5",
-                    PERSONA_FIELD_CONTROL_CLASS,
-                  )}
-                  disabled={isPending}
-                  id="persona-system-prompt"
-                  onChange={(event) => setSystemPrompt(event.target.value)}
-                  placeholder="Describe what this agent should do."
-                  value={systemPrompt}
-                />
-              </div>
-            </div>
+            <AgentDefinitionIdentityFields
+              disabled={isPending}
+              displayName={displayName}
+              onDisplayNameChange={setDisplayName}
+              onSystemPromptChange={setSystemPrompt}
+              systemPrompt={systemPrompt}
+            />
 
             {modelFieldVisible ? (
               <AgentAiConfigurationModeField
@@ -919,49 +869,16 @@ export function AgentDefinitionDialog({
               ) : null}
 
               {llmProviderFieldVisible && aiConfigurationMode === "custom" ? (
-                <div className="space-y-1.5">
-                  <RequiredFieldLabel
-                    htmlFor="persona-llm-provider"
-                    isRequired={providerIsRequired}
-                  >
-                    LLM provider
-                    {!providerIsRequired ? (
-                      <span className={PERSONA_LABEL_OPTIONAL_CLASS}>
-                        Optional
-                      </span>
-                    ) : null}
-                  </RequiredFieldLabel>
-                  <PersonaDropdownField
-                    disabled={isPending}
-                    id="persona-llm-provider"
-                    onValueChange={handleProviderDropdownChange}
-                    options={providerDropdownOptions}
-                    placeholder="Choose a provider"
-                    value={providerSelectValue}
-                  />
-                  {showCustomProviderInput ? (
-                    <div
-                      className={cn(
-                        "mt-2 flex min-h-11 items-center px-3",
-                        PERSONA_FIELD_SHELL_CLASS,
-                      )}
-                    >
-                      <Input
-                        aria-label="Custom provider ID"
-                        autoCorrect="off"
-                        className={cn(
-                          "h-8 px-0 py-0 leading-6",
-                          PERSONA_FIELD_CONTROL_CLASS,
-                        )}
-                        disabled={isPending}
-                        id="persona-custom-provider"
-                        onChange={(event) => setProvider(event.target.value)}
-                        placeholder="Custom provider ID"
-                        value={provider}
-                      />
-                    </div>
-                  ) : null}
-                </div>
+                <AgentLlmProviderField
+                  disabled={isPending}
+                  isRequired={providerIsRequired}
+                  onCustomProviderChange={setProvider}
+                  onProviderValueChange={handleProviderDropdownChange}
+                  options={providerDropdownOptions}
+                  provider={provider}
+                  selectValue={providerSelectValue}
+                  showCustomInput={showCustomProviderInput}
+                />
               ) : null}
 
               {llmProviderFieldVisible &&
@@ -1028,8 +945,6 @@ export function AgentDefinitionDialog({
               returnFocusRef={aiDefaultsTriggerRef}
             />
 
-            {/* The create-mode "Where to run" section renders above, next to
-                the harness field it gates — see `createRunSection?.(...)`. */}
             <AddCustomHarnessDialog
               onOpenChange={setIsAddHarnessOpen}
               onSaved={selectSavedHarness}

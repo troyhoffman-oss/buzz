@@ -480,7 +480,7 @@ export function usePersonaActions() {
 
   function openEdit(persona: AgentPersona, linkedAgent?: ManagedAgent) {
     clearFeedback("library");
-    // Rule 19, on the card's own door into the same dialog — see
+    // Rule 20, on the card's own door into the same dialog — see
     // `personaCardEditAction`, which owns the decision so it can be tested
     // the way the profile panel's and `!model`'s doors already are.
     const action = personaCardEditAction(persona, linkedAgent);

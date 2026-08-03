@@ -807,7 +807,6 @@ dependencies = [
  "buzz-sdk",
  "chrono",
  "clap",
- "dirs",
  "evalexpr",
  "futures-util",
  "hex",
@@ -819,7 +818,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.29.0",
@@ -922,6 +920,8 @@ name = "buzz-backend-ssh"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "bech32",
+ "secp256k1 0.31.1",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -5756,9 +5756,9 @@ dependencies = [
 
 [[package]]
 name = "nostr-relay-pool"
-version = "0.44.1"
+version = "0.44.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91b2c039df4f96c4bf7dae52a74fd5516ad6dda83a11c0c69dea91b5255a4f37"
+checksum = "fb94d61a467a869a6790b907838a9bea82c813d567d9fcbac995f207be8cee4b"
 dependencies = [
  "async-utility",
  "async-wsocket",

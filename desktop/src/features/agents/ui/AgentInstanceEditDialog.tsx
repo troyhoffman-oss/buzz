@@ -1005,15 +1005,26 @@ export function AgentInstanceEditDialog({
                 selectedRuntimeId === "custom" && !inheritHarness
               }
             />
+            {/* Observable parity loss, not metadata: local spawn hands the
+                harness `BUZZ_ACP_TEAM_INSTRUCTIONS`, and the deploy payload has
+                no team field, so this record is running without its team's
+                standing rules right now. Stated where the record's remoteness
+                is already the subject rather than presenting it as equivalent
+                to a local agent. See `remoteTeamInstructions`, which owns both
+                the predicate and the copy. */}
             <RemoteTeamInstructionsNotice agent={agent} />
             {/* Modal mount, not layout: the harness dropdown's
                 "Add custom harness..." option opens it from wherever the
-                field renders — including inside EditAgentHarnessFields. */}
-            <AddCustomHarnessDialog
-              onOpenChange={setIsAddHarnessOpen}
-              onSaved={selectSavedHarness}
-              open={isAddHarnessOpen}
-            />
+                field renders — including inside EditAgentHarnessFields. Only
+                the local branch renders that dropdown, so only it can raise
+                the dialog. */}
+            {pinnedHarness ? null : (
+              <AddCustomHarnessDialog
+                onOpenChange={setIsAddHarnessOpen}
+                onSaved={selectSavedHarness}
+                open={isAddHarnessOpen}
+              />
+            )}
             {/* LLM provider */}
             {llmProviderFieldVisible ? (
               <div className="space-y-1.5">

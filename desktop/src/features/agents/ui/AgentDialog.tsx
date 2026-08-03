@@ -87,6 +87,12 @@ type AgentDialogDefinitionEditProps = {
    */
   editsProviderRecord?: boolean;
   publishCatalogUpdatesOnSave?: boolean;
+  /**
+   * The definition being edited backs a provider record. Suppresses the local
+   * harness auto-seed — see `createRuntimeSeedAction`. Callers now route such
+   * records to instance-edit instead, so this is the belt-and-braces path.
+   */
+  editsProviderRecord?: boolean;
 };
 
 type AgentDialogProps =

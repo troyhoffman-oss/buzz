@@ -234,7 +234,7 @@ export function WhereToRunSection({
       onDraftChange(next);
       if (!catalog.buzzAcp) {
         // Deploy installs buzz-acp only when this desktop has a binary to
-        // push (see docs/remote-agents.md); without one it fails with install
+        // push (see docs/remote-agents-ssh.md); without one it fails with install
         // guidance. The copy promises the union honestly rather than guessing
         // which case applies from here.
         setHarnessError({
@@ -427,7 +427,7 @@ export function WhereToRunSection({
           {/* Stated the moment "elsewhere" is the answer, and unconditionally:
               the team is chosen after this section, so waiting for one to be
               picked would surface the limitation only where it is already too
-              late to weigh. */}
+              late to weigh. See `remoteTeamInstructions`. */}
           <RemoteTeamInstructionsHint />
           {probeError ? (
             <p className="rounded-2xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">

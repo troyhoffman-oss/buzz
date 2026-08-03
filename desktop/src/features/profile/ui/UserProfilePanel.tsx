@@ -32,7 +32,6 @@ import {
   buildInstanceInputForDefinition,
   resolveStartRuntimeForDefinition,
 } from "@/features/agents/lib/instanceInputForDefinition";
-import { providerRecordHarness } from "@/features/agents/lib/pinnedHarness";
 import { describeLogFile } from "@/features/agents/ui/agentUi";
 import { AgentDialog } from "@/features/agents/ui/AgentDialog";
 import { useAgentLifecycleActions } from "@/features/profile/ui/useAgentLifecycleActions";
@@ -69,13 +68,20 @@ import {
 } from "@/features/profile/ui/UserProfilePanelSections";
 import { AgentConfigurationFocusedView } from "@/features/profile/ui/UserProfilePanelAgentDetails";
 import { UserProfileAgentSettingsMenuSlot } from "@/features/profile/ui/UserProfileAgentActions";
-import { collectPersonaRemoteCascadeInstances } from "@/features/agents/lib/personaCascade";
-import { useProfileAgentDeletion } from "@/features/profile/ui/UserProfilePanelDeletion";
+import {
+  useProfileAgentDeletion,
+  usePersonaDeleteCascade,
+} from "@/features/profile/ui/UserProfilePanelDeletion";
 import { useProfileFieldBuckets } from "@/features/profile/ui/UserProfilePanelFields";
-import { profileEditAgentTarget } from "@/features/profile/ui/profileEditAgentTarget";
+import {
+  profileDialogEditsProviderRecord,
+  profileEditAgentTarget,
+} from "@/features/profile/ui/profileEditAgentTarget";
 import { submitProfilePersonaDialog } from "@/features/profile/ui/UserProfilePanelPersonaSubmit";
-import { UserProfilePersonaDialogs } from "@/features/profile/ui/UserProfilePersonaDialogs";
-import { UserProfileSnapshotExportDialog } from "@/features/profile/ui/UserProfileSnapshotExportDialog";
+import {
+  type CardMintTarget,
+  UserProfilePersonaDialogs,
+} from "@/features/profile/ui/UserProfilePersonaDialogs";
 import {
   deriveProfileChannels,
   type ProfilePanelTab,
@@ -184,6 +190,8 @@ export function UserProfilePanel({
     React.useState<AgentPersona | null>(null);
   const [personaToExportSnapshot, setPersonaToExportSnapshot] =
     React.useState<AgentPersona | null>(null);
+  const [cardMintTarget, setCardMintTarget] =
+    React.useState<CardMintTarget | null>(null);
 
   const personasQuery = usePersonasQuery();
   const managedAgentsQuery = useManagedAgentsQuery({ enabled: true });
@@ -602,17 +610,11 @@ export function UserProfilePanel({
     setPersonaActiveMutation.mutateAsync,
   ]);
 
-  // Cascade instances the delete cannot stop, named in the confirm dialog.
-  const personaDeleteRemoteInstances = React.useMemo(
-    () =>
-      personaToDelete
-        ? collectPersonaRemoteCascadeInstances(
-            managedAgentsQuery.data ?? [],
-            personaToDelete.id,
-          )
-        : [],
-    [managedAgentsQuery.data, personaToDelete],
-  );
+  // What the delete takes with it: the count, and the remote units it cannot stop.
+  const {
+    instanceCount: personaDeleteInstanceCount,
+    remoteInstances: personaDeleteRemoteInstances,
+  } = usePersonaDeleteCascade(managedAgentsQuery.data, personaToDelete);
 
   const handleConfirmDeletePersona = React.useCallback(
     async (personaToConfirm: AgentPersona) => {
@@ -639,18 +641,6 @@ export function UserProfilePanel({
       }
     },
     [deletePersonaMutation.mutateAsync, onClose, personaDeleteRemoteInstances],
-  );
-
-  // Count of managed-agent instances backed by the persona being deleted.
-  // Shown in the confirm dialog so the user knows what will be cascade-deleted.
-  const personaDeleteInstanceCount = React.useMemo(
-    () =>
-      personaToDelete
-        ? (managedAgentsQuery.data ?? []).filter(
-            (a) => a.personaId === personaToDelete.id,
-          ).length
-        : 0,
-    [managedAgentsQuery.data, personaToDelete],
   );
 
   const handleAddedToChannel = React.useCallback(
@@ -848,6 +838,19 @@ export function UserProfilePanel({
           onOpenInstructions={() => setView("instructions")}
           onTabChange={setTab}
           onOpenDm={onOpenDm}
+          onCreateCard={
+            canManagePersona && resolvedPersona
+              ? () =>
+                  setCardMintTarget({
+                    // Prefer the live instance pubkey; fall back to the
+                    // persona/definition id (same resolution as export).
+                    id: managedAgent?.pubkey ?? resolvedPersona.id,
+                    name: resolvedPersona.displayName,
+                    // Locking needs an instance keypair to encrypt to.
+                    canLock: Boolean(managedAgent?.pubkey),
+                  })
+              : undefined
+          }
           presenceStatus={presenceStatus}
           profile={profile}
           pubkey={effectivePubkey}
@@ -945,22 +948,16 @@ export function UserProfilePanel({
   const personaDialogs = (
     <>
       <UserProfilePersonaDialogs
+        cardMintTarget={cardMintTarget}
         createError={
           createPersonaMutation.error instanceof Error
             ? createPersonaMutation.error
             : null
         }
-        // Edit-only, and the shape is what says so: this one dialog is driven
-        // by three handlers, and Duplicate seeds a CREATE (no `id`) from the
-        // same provider-backed profile an Edit would. The guard shed the
-        // create's harness while `useCreateRuntimeSeed`'s create-only effect
-        // re-seeded it, so the two fought until React gave up.
-        editsProviderRecord={
-          personaDialogState?.initialValues != null &&
-          "id" in personaDialogState.initialValues &&
-          managedAgent !== undefined &&
-          providerRecordHarness(managedAgent) !== null
-        }
+        editsProviderRecord={profileDialogEditsProviderRecord({
+          initialValues: personaDialogState?.initialValues,
+          managedAgent,
+        })}
         instanceCount={personaDeleteInstanceCount}
         isPending={
           createPersonaMutation.isPending ||
@@ -968,9 +965,12 @@ export function UserProfilePanel({
           updateManagedAgentMutation.isPending ||
           createAgentMutation.isPending
         }
+        linkedAgentPubkey={managedAgent?.pubkey ?? null}
         personaDialogState={personaDialogState}
         personaToDelete={personaToDelete}
+        personaToExportSnapshot={personaToExportSnapshot}
         remoteInstances={personaDeleteRemoteInstances}
+        resolvedPersona={resolvedPersona}
         runtimes={acpRuntimesQuery.data ?? []}
         runtimesLoading={acpRuntimesQuery.isLoading}
         updateError={
@@ -978,22 +978,16 @@ export function UserProfilePanel({
             ? updatePersonaMutation.error
             : null
         }
+        onCloseCardMint={() => setCardMintTarget(null)}
         onCloseDelete={() => setPersonaToDelete(null)}
         onCloseDialog={() => setPersonaDialogState(null)}
+        onCloseExportSnapshot={() => setPersonaToExportSnapshot(null)}
         onConfirmDelete={(selectedPersona) => {
           void handleConfirmDeletePersona(selectedPersona);
         }}
+        onExportSnapshot={setPersonaToExportSnapshot}
         onSubmit={handleSubmitPersona}
       />
-      {personaToExportSnapshot ? (
-        <UserProfileSnapshotExportDialog
-          linkedAgentPubkey={managedAgent?.pubkey ?? null}
-          onOpenChange={(open) => {
-            if (!open) setPersonaToExportSnapshot(null);
-          }}
-          persona={personaToExportSnapshot}
-        />
-      ) : null}
     </>
   );
   return (

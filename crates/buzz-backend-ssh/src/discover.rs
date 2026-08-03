@@ -275,11 +275,14 @@ fn discover_script(config: &SshConfig) -> String {
 /// is skipped rather than sanitized: a mangled name would name a profile that
 /// does not exist, and deploy an agent pointing at nothing.
 fn is_hermes_profile_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > 64 {
+    if name.len() > 64 {
         return false;
     }
     let mut chars = name.chars();
-    let first = chars.next().expect("non-empty");
+    // `let-else` also covers the empty name: no first character, no match.
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
         return false;
     }

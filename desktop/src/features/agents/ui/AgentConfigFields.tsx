@@ -54,7 +54,10 @@ import {
 } from "@/features/agents/ui/buzzAgentModelTuningFields";
 import { SettingsOptionGroup } from "@/features/settings/ui/SettingsOptionGroup";
 import { AdvancedRequiredBadge } from "./AdvancedRequiredBadge";
-import { modelFieldStatus } from "./agentAiConfigurationPolicy";
+import {
+  modelFieldStatus,
+  shouldRenderModelControl,
+} from "./agentAiConfigurationPolicy";
 import { getGlobalAgentCredentialState } from "./globalAgentCredentialState";
 
 export const EMPTY_GLOBAL_CONFIG: GlobalAgentConfig = {
@@ -155,41 +158,6 @@ export function shouldShowModelStatusMessage(
   status: { message: string; tone: string } | null,
 ): boolean {
   return showDescriptions || status !== null;
-}
-
-/**
- * Whether the Model control should render given discovery state.
- *
- * Optional-model harnesses (Claude Code / Codex, `acpNative`) omit the control
- * while discovery is in flight and after a **confirmed successful empty**
- * catalog (IPC resolved, no usable options) — there is nothing useful to pick.
- * Discovery failures / unavailable runtimes keep the control so #2246 failure
- * UI can render. Full disclosure still shows the control when Custom model is
- * available. Required-model harnesses always render the control.
- */
-export function shouldRenderModelControl({
-  discoveredModelOptions,
-  modelDiscoveryLoading,
-  modelDiscoverySuccessfulEmpty,
-  modelIsOptional,
-  showCustomModelOption,
-}: {
-  discoveredModelOptions: readonly { id: string }[] | null;
-  modelDiscoveryLoading: boolean;
-  /** True only when discovery IPC resolved with a response that yielded no options. */
-  modelDiscoverySuccessfulEmpty: boolean;
-  modelIsOptional: boolean;
-  showCustomModelOption: boolean;
-}): boolean {
-  if (!modelIsOptional) return true;
-  if (modelDiscoveryLoading) return false;
-  const hasExplicitModel = (discoveredModelOptions ?? []).some(
-    (option) => option.id.trim().length > 0,
-  );
-  if (hasExplicitModel) return true;
-  if (showCustomModelOption) return true;
-  // Omit only on confirmed successful empty — not on failure/unavailable.
-  return !modelDiscoverySuccessfulEmpty;
 }
 
 export type AgentConfigFieldsProps = {

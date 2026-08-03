@@ -3,8 +3,9 @@ import { BuzzMark } from "@/shared/ui/buzz-logo/BuzzMark";
 /**
  * Positions in the first-launch flow: landing, identity/key, where agents run
  * (harness setup), default config, community choice, community profile, meet
- * the team. Password backup is an optional subview of identity/key, not
- * another position.
+ * the team. Password backup is an optional subview of identity/key, not another
+ * position. Used as the default pagination length when a flow doesn't pass an
+ * explicit total.
  */
 export const TOTAL_ONBOARDING_PAGES = 7;
 

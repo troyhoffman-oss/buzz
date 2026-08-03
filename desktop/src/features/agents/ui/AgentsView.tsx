@@ -428,7 +428,7 @@ export function AgentsView() {
         />
       ) : null}
       {personas.agentToEditInstance ? (
-        // Rule 19: the card's Edit on a provider-backed agent edits the record
+        // Rule 20: the card's Edit on a provider-backed agent edits the record
         // itself. The definition dialog reads an AgentDefinition, which carries
         // no backend or agent_command, so a remote target would open on a blank
         // harness and be re-seeded with this computer's default. Local personas

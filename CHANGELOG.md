@@ -4,6 +4,8 @@
 
 ### Desktop and shared changes
 
+- Revert "chore(release): release Buzz Desktop version 0.5.3" ([#3960](https://github.com/block/buzz/pull/3960)) ([`bb34bc4d98fe4dabe847046103ac5e2859917ac5`](https://github.com/block/buzz/commit/bb34bc4d98fe4dabe847046103ac5e2859917ac5))
+- chore(release): release Buzz Desktop version 0.5.3 ([`d12b3d6a79d56a95fc99ce4fadd2d2235d5a3131`](https://github.com/block/buzz/commit/d12b3d6a79d56a95fc99ce4fadd2d2235d5a3131))
 - feat(desktop): import local Pocket voices ([#3259](https://github.com/block/buzz/pull/3259)) ([`c104eecfb38620de2c35c7e20a716f8658b5a6b1`](https://github.com/block/buzz/commit/c104eecfb38620de2c35c7e20a716f8658b5a6b1))
 - fix(desktop): open profiles from avatars ([#3751](https://github.com/block/buzz/pull/3751)) ([`39ce3dfc3cf2d12f0d6c64b4cd4293df86567663`](https://github.com/block/buzz/commit/39ce3dfc3cf2d12f0d6c64b4cd4293df86567663))
 - refactor(voice): extract reusable Pocket primitives + Pocket voice settings (relands #2467 + #3208) ([#3910](https://github.com/block/buzz/pull/3910)) ([`61ba9dfaa00852925058d1a024322fa53663a5bc`](https://github.com/block/buzz/commit/61ba9dfaa00852925058d1a024322fa53663a5bc))
@@ -49,6 +51,9 @@
 
 ### Other repository changes
 
+- fix(release): require exact-head approval for desktop tags ([#3973](https://github.com/block/buzz/pull/3973)) ([`54c8ef30a9bb9c59a4415a8a7ee84c7c5454b48a`](https://github.com/block/buzz/commit/54c8ef30a9bb9c59a4415a8a7ee84c7c5454b48a))
+- fix(release): make desktop tagging squash-safe ([#3965](https://github.com/block/buzz/pull/3965)) ([`db7e84d4f815127236b9cb080c5d374f48eaac09`](https://github.com/block/buzz/commit/db7e84d4f815127236b9cb080c5d374f48eaac09))
+- docs(nips): add single-coordinate manual-unread override layer and verification model to NIP-RS ([#2864](https://github.com/block/buzz/pull/2864)) ([`209536ade6c5ebf7fa82671d7ca0b74f599a40cc`](https://github.com/block/buzz/commit/209536ade6c5ebf7fa82671d7ca0b74f599a40cc))
 - fix(release): make immutable desktop release operable ([#3943](https://github.com/block/buzz/pull/3943)) ([`052174a148f9f6bcbb2b5a1d20ce0317645e49f8`](https://github.com/block/buzz/commit/052174a148f9f6bcbb2b5a1d20ce0317645e49f8))
 - docs: add VISION_REMOTE_AGENTS.md ([#3924](https://github.com/block/buzz/pull/3924)) ([`689617af7ad420c3266d5d2eb437757371327089`](https://github.com/block/buzz/commit/689617af7ad420c3266d5d2eb437757371327089))
 - fix(relay): align NIP-11 max_limit with REQ ceiling ([#3635](https://github.com/block/buzz/pull/3635)) ([`23f0c26b1ceba8e07bf3c160a1e08c7bda82ccd9`](https://github.com/block/buzz/commit/23f0c26b1ceba8e07bf3c160a1e08c7bda82ccd9))

@@ -61,7 +61,7 @@
 //! would silently reinstall underneath a running fleet on every start, and a
 //! desktop pinned to an older artifact would *downgrade* the host. Refreshing
 //! an existing install is a deliberate act and belongs to a follow-up that
-//! fetches release artifacts by version; see `docs/remote-agents.md`.
+//! fetches release artifacts by version; see `docs/remote-agents-ssh.md`.
 
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
@@ -300,12 +300,17 @@ impl Payload {
     }
 }
 
-/// base64 output is ASCII, so chunking bytes cannot split a character.
+/// base64 output is ASCII, so every byte offset is a character boundary and
+/// the line breaks can be taken on the `str` directly — no byte round trip,
+/// and nothing to unwrap.
 fn wrap(encoded: &str) -> String {
     let mut out = String::with_capacity(encoded.len() + encoded.len() / LINE_WIDTH + 1);
-    for chunk in encoded.as_bytes().chunks(LINE_WIDTH) {
-        out.push_str(std::str::from_utf8(chunk).expect("base64 output is ASCII"));
+    let mut rest = encoded;
+    while !rest.is_empty() {
+        let (line, tail) = rest.split_at(LINE_WIDTH.min(rest.len()));
+        out.push_str(line);
         out.push('\n');
+        rest = tail;
     }
     out
 }
