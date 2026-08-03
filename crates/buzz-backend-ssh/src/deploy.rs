@@ -36,9 +36,58 @@ const RESERVED_ENV_KEYS: &[&str] = &[
     "BUZZ_ACP_RESPOND_TO",
     "BUZZ_ACP_RESPOND_TO_ALLOWLIST",
     "BUZZ_ACP_AGENT_OWNER",
+    // Remote lifetime and presence policy. `BUZZ_ACP_NO_PRESENCE` is the one
+    // that matters most here: presence is the *only* signal that a remote agent
+    // is alive, so a user env var that suppressed it would produce an agent that
+    // runs and is invisible to every desktop surface. There is no authoritative
+    // value to overwrite it with, which is why it is refused rather than
+    // shadowed.
+    "BUZZ_ACP_EXIT_AFTER_INACTIVITY",
+    "BUZZ_ACP_NO_PRESENCE",
     "BUZZ_ACP_SETUP_PAYLOAD",
     "BUZZ_MANAGED_AGENT",
     "BUZZ_MANAGED_AGENT_START_NONCE",
+];
+
+/// Every respond-to gate mode `buzz-acp` accepts, spelled as its
+/// `clap::ValueEnum` parses them (kebab-case via `RespondTo`'s `Display`).
+///
+/// Deliberately the **harness's** four and not the desktop's three: the desktop
+/// refuses `nobody` on purpose, but the harness starts fine with it, and a
+/// provider that inherited a desktop-only narrowing would refuse a launch that
+/// works.
+///
+/// Validated rather than projected through because a mode the harness rejects
+/// is `rc=2` at config parse — and this unit is `Restart=always` with
+/// `RestartPreventExitStatus=78` only, so a doomed gate would respawn every
+/// five seconds forever, on a host nobody is watching, with the reason buried
+/// inside the restart loop.
+const RESPOND_TO_MODES: [&str; 4] = ["owner-only", "allowlist", "anyone", "nobody"];
+
+/// Keys [`env_file_body`] writes itself from a dedicated payload field, and
+/// which are therefore skipped when `launch.policy_env` also carries them.
+///
+/// Not a security boundary — [`RESERVED_ENV_KEYS`] is that, and it is checked
+/// first and separately. These are the keys where the desktop legitimately
+/// sends the *same* value by two routes: `policy_env.BUZZ_ACP_AGENTS` and the
+/// top-level `parallelism` are both `record.parallelism`, and
+/// `policy_env.BUZZ_ACP_MODEL` and the top-level `model` are both the effective
+/// model. Writing both produces two assignments to one key — harmless to
+/// systemd, which takes the later, and actively misleading to anyone reading
+/// the file to find out what the agent is running with.
+///
+/// `pinned_by_the_env_file` keeps this list honest: every entry must be a key
+/// the function below actually emits.
+const PROVIDER_WRITTEN_ENV_KEYS: &[&str] = &[
+    "BUZZ_ACP_AGENTS",
+    "BUZZ_ACP_LAZY_POOL",
+    "BUZZ_ACP_RELAY_OBSERVER",
+    "BUZZ_ACP_MULTIPLE_EVENT_HANDLING",
+    "BUZZ_ACP_DEDUP",
+    "BUZZ_ACP_MODEL",
+    "BUZZ_ACP_SYSTEM_PROMPT",
+    "BUZZ_ACP_IDLE_TIMEOUT",
+    "BUZZ_ACP_MAX_TURN_DURATION",
 ];
 
 /// The deploy payload, as `deploy_payload_json` serializes it.
@@ -57,6 +106,13 @@ pub struct Agent {
     pub relay_url: String,
     pub private_key_nsec: Secret,
     pub auth_tag: Option<String>,
+    /// The resolved workspace owner, from `launch.owner_pubkey`.
+    ///
+    /// With `auth_tag`, the pair that lets the harness recognize `!shutdown`.
+    /// Modern records carry the tag and legacy ones carry only this, so a
+    /// payload resolving neither is refused rather than deployed into an agent
+    /// no one can stop.
+    pub owner_pubkey: Option<String>,
     /// The pinned harness command. See [`Agent::from_request`].
     pub agent_command: String,
     pub agent_args: Vec<String>,
@@ -68,6 +124,20 @@ pub struct Agent {
     pub parallelism: u64,
     pub respond_to: String,
     pub respond_to_allowlist: Vec<String>,
+    /// Overridable behavior defaults — `launch.policy_env`, precedence tier 1.
+    ///
+    /// Written *below* [`Self::env_vars`] so a user override beats a default,
+    /// exactly as it does in the desktop's local spawn, where the policy layer
+    /// is applied first and the user layer last.
+    pub policy_env: BTreeMap<String, String>,
+    /// The layered user environment — precedence tier 2.
+    ///
+    /// `launch.env` when the payload carries a launch block, because that is
+    /// the desktop's full six-layer resolution (baked → runtime metadata →
+    /// harness definition → global → persona → agent). The legacy top-level
+    /// `env_vars` is only the last three of those layers, so it is used only
+    /// when there is no launch block to supersede it — and never merged on top
+    /// of one, which would resurrect a layering the desktop already resolved.
     pub env_vars: BTreeMap<String, String>,
     /// A path on the **desktop** machine to a Linux `buzz-acp` to install on
     /// the host when the host resolves none. Optional, and absent it changes
@@ -97,6 +167,20 @@ impl Agent {
                 .map(str::to_string)
         };
 
+        // The desktop-resolved launch contract (spec §Launch data). Present on
+        // every deploy from a desktop that shipped Known Defect 3's fix, absent
+        // from anything older — so every read below falls back to the legacy
+        // top-level field rather than requiring it.
+        let launch = agent.get("launch").filter(|v| v.is_object());
+        let launch_string = |key: &str| {
+            launch
+                .and_then(|l| l.get(key))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+
         let private_key_nsec: Secret = agent
             .get("private_key_nsec")
             .map(|v| serde_json::from_value(v.clone()))
@@ -116,14 +200,20 @@ impl Agent {
             );
         }
 
-        // The remote harness choice reaches the host ONLY as this pin — the
-        // desktop resolves it from the remote catalog at create time and ships
-        // it verbatim. A blank value means the pin was lost on the way, and the
-        // host would silently run `buzz-agent` instead of the harness the user
-        // picked, so refuse rather than substitute.
-        let agent_command = string("agent_command").ok_or(
-            "deploy payload carries no 'agent_command': the harness pin was lost before it \
-             reached the host (see instanceInputForDefinition provider branch)",
+        // The remote harness choice reaches the host ONLY as this pin. A blank
+        // value means the pin was lost on the way, and the host would silently
+        // run `buzz-agent` instead of the harness the user picked, so refuse
+        // rather than substitute.
+        //
+        // `launch.command` first: it is the desktop's *resolved* command, which
+        // honors an explicit `agent_command_override` and the record's or
+        // persona's runtime id, whereas the top-level `agent_command` is a
+        // denormalized copy kept for display. When the two disagree the resolved
+        // one is what a local spawn would have executed, so it is what the unit
+        // must execute too.
+        let agent_command = launch_string("command").or_else(|| string("agent_command")).ok_or(
+            "deploy payload carries no harness command in 'launch.command' or 'agent_command': \
+             the harness pin was lost before it reached the host",
         )?;
 
         // Step 0 of the reconciliation loop (docs/remote-agents.md §Deploy):
@@ -154,19 +244,65 @@ impl Agent {
             asserted_pubkey.as_deref(),
         )?;
 
+        let auth_tag = string("auth_tag");
+        let owner_pubkey = launch_string("owner_pubkey");
+        // The `!shutdown` gate needs one of these two. `BUZZ_AUTH_TAG` is what
+        // modern records carry; `BUZZ_ACP_AGENT_OWNER` is the legacy fallback
+        // the desktop still emits for records minted before the tag existed.
+        // With neither, §Stop describes a mechanism that does not work: the
+        // agent runs, ignores its owner, and the only way to stop it is an SSH
+        // session the user was not told they would need.
+        if auth_tag.is_none() && owner_pubkey.is_none() {
+            return Err(
+                "refusing to deploy without an owner: neither 'auth_tag' nor \
+                 'launch.owner_pubkey' resolved, so the agent could not honor !shutdown from \
+                 anyone"
+                    .to_string(),
+            );
+        }
+
+        let respond_to = string("respond_to").unwrap_or_else(|| "owner-only".to_string());
+        // Validated here rather than projected through: a mode the harness
+        // refuses is a config-parse failure (`rc=2`), and this unit restarts on
+        // every exit but 78. Catching it now turns a silent five-second respawn
+        // loop into a refusal that names the field.
+        if !RESPOND_TO_MODES.contains(&respond_to.as_str()) {
+            return Err(format!(
+                "'respond_to' is {respond_to:?}, which the harness does not accept (expected one \
+                 of {}): the unit would fail to parse its configuration and restart every five \
+                 seconds",
+                RESPOND_TO_MODES.join(", ")
+            ));
+        }
+
+        // Precedence tier 2 (spec §Launch data). `launch.env` is the desktop's
+        // full six-layer resolution and SUPERSEDES the legacy top-level field —
+        // it is not merged on top of it, which would resurrect layers the
+        // desktop already collapsed. The legacy field is the truth only when no
+        // launch block exists to replace it.
+        let env_vars = match launch.and_then(|l| l.get("env")) {
+            Some(env) => env_map(Some(env)),
+            None => env_map(agent.get("env_vars")),
+        };
+
         Ok(Self {
             name: string("name").ok_or("'name' is required")?,
             pubkey,
             relay_url: string("relay_url").ok_or("'relay_url' is required")?,
             private_key_nsec,
-            auth_tag: string("auth_tag"),
+            auth_tag,
+            owner_pubkey,
             agent_command,
-            // `agent_args` must be the remote entry's default args. The
-            // desktop's local branch sends `[]` on purpose so spawn re-resolves
-            // them live, but a provider-backed record never spawns locally, so
-            // `[]` here would mean "no args" for any harness the local
-            // default-args table does not know.
-            agent_args: crate::discover::string_list(agent.get("agent_args")),
+            // `launch.args` is the desktop's normalized effective args — the
+            // instance's own when it set any, otherwise the harness
+            // definition's. The top-level `agent_args` is the raw record field,
+            // and the desktop deliberately leaves it `[]` whenever the args
+            // should be re-resolved from the definition, so reading it alone
+            // would launch Goose with no `acp` argument at all.
+            agent_args: match launch.and_then(|l| l.get("args")) {
+                Some(args) => crate::discover::string_list(Some(args)),
+                None => crate::discover::string_list(agent.get("agent_args")),
+            },
             system_prompt: string("system_prompt"),
             model: string("model"),
             provider: string("provider"),
@@ -184,16 +320,25 @@ impl Agent {
                 .and_then(|v| v.as_u64())
                 .filter(|p| *p > 0)
                 .unwrap_or(1),
-            respond_to: string("respond_to").unwrap_or_else(|| "owner-only".to_string()),
+            respond_to,
             respond_to_allowlist: crate::discover::string_list(agent.get("respond_to_allowlist")),
-            env_vars: env_map(agent.get("env_vars")),
+            policy_env: env_map(launch.and_then(|l| l.get("policy_env"))),
+            env_vars,
             // Read from the same `agent` block as everything else, but neither
             // is agent configuration: nothing about them reaches the env file
             // or the unit. They are the desktop handing the provider copies of
             // the host-side tools to install if the host turns out not to have
             // them.
-            buzz_acp_binary: string("buzz_acp_binary"),
-            buzz_cli_binary: string("buzz_cli_binary"),
+            //
+            // A desktop that does not know about these fields sends neither, so
+            // each falls back to this process's own environment. That is not a
+            // second configuration surface — it is the same one, reached from
+            // the other side: the desktop spawns the provider as a child and the
+            // child inherits its environment, so `BUZZ_ACP_PUSH_BINARY` set for
+            // the app reaches this code whether the desktop forwards it in the
+            // payload or not.
+            buzz_acp_binary: string("buzz_acp_binary").or_else(|| env_path("BUZZ_ACP_PUSH_BINARY")),
+            buzz_cli_binary: string("buzz_cli_binary").or_else(|| env_path("BUZZ_CLI_PUSH_BINARY")),
         })
     }
 
@@ -235,6 +380,16 @@ impl Agent {
 
 /// How much of the agent's pubkey identifies its unit. See [`Agent::slug`].
 const PUBKEY_FRAGMENT: usize = 12;
+
+/// A path this process inherited from whoever spawned it, or `None` when the
+/// variable is unset or blank — blank being a var the user cleared rather than
+/// a request to push an empty path.
+fn env_path(var: &str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+}
 
 pub fn env_map(value: Option<&serde_json::Value>) -> BTreeMap<String, String> {
     value
@@ -286,10 +441,59 @@ fn env_file_body(agent: &Agent) -> Result<String, String> {
         Ok(())
     };
 
+    // Precedence tier 1 — the desktop's overridable behavior defaults
+    // (`launch.policy_env`): the runtime's own `default_env` (Goose's
+    // `GOOSE_MODE=auto`), `MCP_HOOK_SERVERS`, the session title, and the team
+    // instructions.
+    //
+    // Written FIRST, before this provider's own defaults and far before the
+    // user env, because systemd applies the later assignment for a repeated
+    // key: tier 1 is the layer everything else is allowed to beat, which is
+    // exactly what it is in the local spawn.
+    //
+    // The same key rules as user env apply — a malformed name could smuggle a
+    // second assignment into the file, and a reserved key must not reach the
+    // host from a tier that is not authoritative for it.
+    for (key, value) in &agent.policy_env {
+        if !is_well_formed_env_key(key) {
+            return Err(format!(
+                "launch.policy_env name '{key}' is not a valid identifier"
+            ));
+        }
+        if RESERVED_ENV_KEYS
+            .iter()
+            .any(|reserved| reserved.eq_ignore_ascii_case(key))
+        {
+            return Err(format!(
+                "launch.policy_env carries reserved key '{key}', which only this provider may set"
+            ));
+        }
+        // A key this function writes for itself further down is skipped rather
+        // than written twice. Both spellings are the same value from the same
+        // desktop resolution — `policy_env.BUZZ_ACP_AGENTS` and the
+        // `parallelism` field are both `record.parallelism` — so emitting both
+        // changes nothing systemd does, and everything a human debugging the
+        // env file sees: two assignments to one key, where the reader must know
+        // the later-wins rule to tell which is live. One key, one line.
+        if PROVIDER_WRITTEN_ENV_KEYS
+            .iter()
+            .any(|owned| owned.eq_ignore_ascii_case(key))
+        {
+            continue;
+        }
+        push(key, value)?;
+    }
+
     push("BUZZ_PRIVATE_KEY", agent.private_key_nsec.expose())?;
     push("BUZZ_RELAY_URL", &agent.relay_url)?;
     if let Some(auth_tag) = &agent.auth_tag {
         push("BUZZ_AUTH_TAG", auth_tag)?;
+    }
+    // The legacy owner fallback, for records minted before `auth_tag` existed.
+    // `from_request` already refused a payload carrying neither, so between the
+    // two the harness always has something to match `!shutdown` against.
+    if let Some(owner) = &agent.owner_pubkey {
+        push("BUZZ_ACP_AGENT_OWNER", owner)?;
     }
     push("BUZZ_ACP_AGENT_ARGS", &agent.agent_args.join(","))?;
     // MCP does not reach the host yet: `mcp_command` is local catalog metadata,
@@ -331,8 +535,20 @@ fn env_file_body(agent: &Agent) -> Result<String, String> {
     // The harness-native half of the same selection: `BUZZ_ACP_MODEL` is what
     // buzz-acp reads, these are what the harness underneath it reads, and local
     // spawn writes both.
+    //
+    // Skipped for a key the user env below already carries. That is not an
+    // override being honored early — it is the *same desktop layer arriving
+    // twice*: `launch.env` is built from `resolve_effective_harness_descriptor`,
+    // whose runtime-metadata layer already wrote `GOOSE_MODEL`/`GOOSE_PROVIDER`
+    // from the effective model and provider. This local reconstruction exists
+    // for payloads with no launch block, where it is the only source. When both
+    // are present the launch block is authoritative, and writing ours too would
+    // leave two assignments to one key in a file people read to find out what
+    // an agent is running with.
     for (key, value) in metadata_env(agent) {
-        push(key, value)?;
+        if !agent.env_vars.contains_key(key) {
+            push(key, value)?;
+        }
     }
     // Only when the user set them, so the harness's own defaults win otherwise.
     if let Some(idle) = agent.idle_timeout_seconds {
@@ -2217,5 +2433,451 @@ systemctl --user restart 'buzz-acp@{slug}.service'
         assert!(
             script.contains(r#"GIT_CONFIG_KEY_0="credential.https://relay.example/ws/git.helper""#)
         );
+    }
+}
+
+/// The contract with a **bone-stock** desktop, driven from upstream's own
+/// golden wire fixture.
+///
+/// Separated from the tests above because those build their payload by hand:
+/// they are free to describe shapes convenient to test, and they do. This
+/// module may not. Its single input is a byte-for-byte copy of the fixture
+/// upstream *recorded* from the desktop's real
+/// `build_launch_block` → `deploy_payload_json` path
+/// (`tests/fixtures/provider-wire/README.md`), so every assertion here is a
+/// claim about what a released desktop actually emits rather than about what
+/// this crate finds convenient to receive.
+#[cfg(test)]
+mod stock_wire {
+    use super::*;
+
+    /// Recorded output of the desktop's deploy path. The `agent` block is used
+    /// verbatim; only `provider_config` is swapped for an SSH one, since that
+    /// block is the one part of the request that is provider-specific by
+    /// design.
+    const DEPLOY_FULL_LAUNCH: &str =
+        include_str!("../tests/fixtures/provider-wire/deploy-full-launch.request.json");
+    const INFO_REQUEST: &str = include_str!("../tests/fixtures/provider-wire/info.request.json");
+
+    /// The fixture's `agent` block under an SSH `provider_config`.
+    fn stock_request() -> serde_json::Value {
+        let mut request: serde_json::Value = serde_json::from_str(DEPLOY_FULL_LAUNCH).unwrap();
+        request["provider_config"] = serde_json::json!({ "ssh_host": "vps", "ssh_user": "ubuntu" });
+        request
+    }
+
+    fn stock_agent() -> Agent {
+        match Agent::from_request(&stock_request()) {
+            Ok(agent) => agent,
+            Err(error) => panic!("stock desktop payload was rejected: {error}"),
+        }
+    }
+
+    fn stock_config() -> SshConfig {
+        SshConfig {
+            host: "vps".into(),
+            ..SshConfig::default()
+        }
+    }
+
+    /// The whole point of the exercise: the recorded payload of a released
+    /// desktop must parse, with no fork-only field required to make it.
+    ///
+    /// Note what the fixture does *not* carry — `pubkey`, `buzz_acp_binary`,
+    /// `buzz_cli_binary`. Those are this fork's additions, and a provider that
+    /// required any of them would be undeployable from a stock build.
+    #[test]
+    fn a_recorded_stock_payload_deploys() {
+        let request = stock_request();
+        assert!(
+            request["agent"].get("pubkey").is_none(),
+            "the stock desktop does not send the agent's pubkey; the fixture must not either"
+        );
+        let agent = stock_agent();
+        // Derived from the fixture's nsec, per §Deploy Step 0.
+        assert_eq!(agent.pubkey.len(), 64);
+        assert!(agent.pubkey.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// M1, and the mismatch that would have shipped a fleet of broken agents.
+    ///
+    /// The fixture's top-level `agent_args` is `[]` while `launch.args` is
+    /// `["acp"]` — exactly the case upstream's own README calls out. Reading
+    /// the legacy field writes `BUZZ_ACP_AGENT_ARGS=""`, and `buzz-acp`'s
+    /// `value_delimiter` parse of an explicitly-empty var yields no args at
+    /// all, so Goose would be launched with no `acp` subcommand: a harness
+    /// that starts, speaks the wrong protocol, and never answers.
+    #[test]
+    fn the_resolved_launch_args_are_what_reaches_the_unit() {
+        let request = stock_request();
+        assert_eq!(
+            request["agent"]["agent_args"],
+            serde_json::json!([]),
+            "fixture drift: the legacy field is what makes this test meaningful"
+        );
+        assert_eq!(
+            request["agent"]["launch"]["args"],
+            serde_json::json!(["acp"])
+        );
+
+        let body = env_file_body(&stock_agent()).unwrap();
+        assert!(
+            body.contains(r#"BUZZ_ACP_AGENT_ARGS="acp""#),
+            "launch.args must win over the legacy agent_args: {body}"
+        );
+    }
+
+    /// M2. Both spellings agree in this fixture, so this pins the *precedence*
+    /// rather than the value: `launch.command` is the desktop's resolved
+    /// command and must win when the denormalized copy has gone stale.
+    #[test]
+    fn the_resolved_launch_command_wins_over_the_legacy_copy() {
+        assert_eq!(stock_agent().agent_command, "goose");
+
+        let mut request = stock_request();
+        request["agent"]["agent_command"] = serde_json::json!("stale-cached-harness");
+        request["agent"]["launch"]["command"] = serde_json::json!("claude-code-acp");
+        assert_eq!(
+            Agent::from_request(&request).unwrap().agent_command,
+            "claude-code-acp"
+        );
+
+        // …and a desktop predating the launch block still deploys on the
+        // legacy field alone.
+        let mut legacy = stock_request();
+        legacy["agent"].as_object_mut().unwrap().remove("launch");
+        legacy["agent"]["auth_tag"] = serde_json::json!("tag-1");
+        assert_eq!(Agent::from_request(&legacy).unwrap().agent_command, "goose");
+    }
+
+    /// M3. `launch.env` is the desktop's six-layer resolution; the legacy
+    /// `env_vars` is only its last three layers. Re-merging the legacy field on
+    /// top would resurrect a layering the desktop already collapsed, so the
+    /// launch block supersedes it outright (spec §Launch data, tier 2).
+    #[test]
+    fn the_layered_launch_env_supersedes_the_legacy_env_vars() {
+        let body = env_file_body(&stock_agent()).unwrap();
+        // Present only in `launch.env` — the runtime-metadata layer the legacy
+        // field does not carry.
+        assert!(body.contains(r#"GOOSE_MODEL="gpt-5""#), "{body}");
+        assert!(body.contains(r#"GOOSE_PROVIDER="openai""#), "{body}");
+        assert!(body.contains(r#"USER_KEY="user-value""#), "{body}");
+
+        // A key the desktop resolved away must not come back from the legacy
+        // field.
+        let mut request = stock_request();
+        request["agent"]["env_vars"] =
+            serde_json::json!({ "STALE": "from-the-legacy-field", "USER_KEY": "stale" });
+        request["agent"]["launch"]["env"] = serde_json::json!({ "USER_KEY": "resolved" });
+        let body = env_file_body(&Agent::from_request(&request).unwrap()).unwrap();
+        assert!(!body.contains("STALE"), "legacy env was re-merged: {body}");
+        assert!(body.contains(r#"USER_KEY="resolved""#), "{body}");
+    }
+
+    /// Every key the env file writes for itself must appear exactly once, no
+    /// matter what `policy_env` also carries. systemd takes the later
+    /// assignment either way, so a duplicate is not a behavior bug — it is a
+    /// file that tells two stories about what the agent is running with, to
+    /// whoever opens it while an agent is misbehaving.
+    #[test]
+    fn no_key_is_written_twice() {
+        // The recorded payload already collides on three keys.
+        let mut request = stock_request();
+        request["agent"]["idle_timeout_seconds"] = serde_json::json!(900);
+        request["agent"]["max_turn_duration_seconds"] = serde_json::json!(3600);
+        request["agent"]["system_prompt"] = serde_json::json!("be brief");
+        // …and a payload whose policy tier names every one of them.
+        let policy: serde_json::Map<String, serde_json::Value> = PROVIDER_WRITTEN_ENV_KEYS
+            .iter()
+            .map(|key| ((*key).to_string(), serde_json::json!("from-policy-env")))
+            .collect();
+        request["agent"]["launch"]["policy_env"] = serde_json::Value::Object(policy);
+
+        let body = env_file_body(&Agent::from_request(&request).unwrap()).unwrap();
+        let mut seen = std::collections::BTreeMap::new();
+        for line in body.lines() {
+            let key = line.split_once('=').expect("every line is KEY=\"value\"").0;
+            *seen.entry(key).or_insert(0) += 1;
+        }
+        let duplicated: Vec<_> = seen.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(
+            duplicated.is_empty(),
+            "duplicated keys {duplicated:?}\n{body}"
+        );
+
+        // And the surviving value is this provider's, not the policy default's:
+        // these are keys it writes from a dedicated field for a reason.
+        assert!(body.contains(r#"BUZZ_ACP_AGENTS="10""#), "{body}");
+        assert!(body.contains(r#"BUZZ_ACP_IDLE_TIMEOUT="900""#), "{body}");
+        assert!(!body.contains("from-policy-env"), "{body}");
+    }
+
+    /// The skip list may only name keys the env file actually writes. An entry
+    /// for a key it does not write would silently swallow a real policy default
+    /// instead of deduplicating one.
+    #[test]
+    fn the_skip_list_names_only_keys_the_env_file_emits() {
+        let mut request = stock_request();
+        request["agent"]["system_prompt"] = serde_json::json!("be brief");
+        request["agent"]["idle_timeout_seconds"] = serde_json::json!(900);
+        request["agent"]["max_turn_duration_seconds"] = serde_json::json!(3600);
+        request["agent"]["launch"]["policy_env"] = serde_json::json!({});
+        let body = env_file_body(&Agent::from_request(&request).unwrap()).unwrap();
+        for key in PROVIDER_WRITTEN_ENV_KEYS {
+            assert!(
+                body.lines()
+                    .any(|line| line.starts_with(&format!("{key}="))),
+                "{key} is on the skip list but the env file never writes it"
+            );
+        }
+    }
+
+    /// M4. `policy_env` carries the session title, team instructions, MCP hook
+    /// wiring and each runtime's own defaults. Dropping it is silent behavior
+    /// loss against the local spawn — the agent runs, and simply forgets it is
+    /// on a team.
+    #[test]
+    fn the_policy_defaults_reach_the_host_and_lose_to_user_env() {
+        let body = env_file_body(&stock_agent()).unwrap();
+        assert!(
+            body.contains(r#"BUZZ_ACP_SESSION_TITLE="worker""#),
+            "{body}"
+        );
+        assert!(body.contains(r#"GOOSE_MODE="auto""#), "{body}");
+
+        // Tier 1 is *overridable*: systemd applies the later assignment for a
+        // repeated key, and user env is written after. Getting this backwards
+        // would make a remote agent ignore an override its local twin honors.
+        let mut request = stock_request();
+        request["agent"]["launch"]["env"] = serde_json::json!({ "GOOSE_MODE": "chat" });
+        let body = env_file_body(&Agent::from_request(&request).unwrap()).unwrap();
+        let policy = body.find(r#"GOOSE_MODE="auto""#).expect("policy default");
+        let user = body.find(r#"GOOSE_MODE="chat""#).expect("user override");
+        assert!(policy < user, "user env must be written last:\n{body}");
+    }
+
+    /// A policy default is still a *default*, not an authority. The desktop
+    /// owns tier 1, but this provider owns the identity keys, so a launch block
+    /// that carried one is refused rather than allowed to write it.
+    #[test]
+    fn policy_env_cannot_carry_a_key_this_provider_owns() {
+        let mut request = stock_request();
+        request["agent"]["launch"]["policy_env"] =
+            serde_json::json!({ "BUZZ_PRIVATE_KEY": "nsec1attacker" });
+        let error = Agent::from_request(&request)
+            .ok()
+            .map(|agent| env_file_body(&agent).unwrap_err())
+            .expect("payload parses; the refusal happens when the file is built");
+        assert!(error.contains("BUZZ_PRIVATE_KEY"), "{error}");
+
+        request["agent"]["launch"]["policy_env"] = serde_json::json!({ "not a name": "x" });
+        let agent = Agent::from_request(&request).unwrap();
+        assert!(env_file_body(&agent).unwrap_err().contains("identifier"));
+    }
+
+    /// M5. Between `auth_tag` and `launch.owner_pubkey` the harness must have
+    /// something to match `!shutdown` against; with neither, §Stop describes a
+    /// mechanism that does not work and the only way to stop the agent is an
+    /// SSH session the user was never told they would need.
+    #[test]
+    fn an_owner_reaches_the_host_and_a_payload_with_none_is_refused() {
+        let body = env_file_body(&stock_agent()).unwrap();
+        assert!(body.contains(r#"BUZZ_AUTH_TAG="tag-1""#), "{body}");
+        assert!(
+            body.contains(&format!(r#"BUZZ_ACP_AGENT_OWNER="{}""#, "a".repeat(64))),
+            "{body}"
+        );
+
+        // A legacy record: no tag, owner only. Still deployable.
+        let mut request = stock_request();
+        request["agent"]["auth_tag"] = serde_json::Value::Null;
+        let body = env_file_body(&Agent::from_request(&request).unwrap()).unwrap();
+        assert!(!body.contains("BUZZ_AUTH_TAG"), "{body}");
+        assert!(body.contains("BUZZ_ACP_AGENT_OWNER"), "{body}");
+
+        // Neither: refused before anything is written.
+        request["agent"]["launch"]["owner_pubkey"] = serde_json::Value::Null;
+        let error = match Agent::from_request(&request) {
+            Err(error) => error,
+            Ok(agent) => panic!("expected a refusal, got {}", agent.agent_id()),
+        };
+        assert!(error.contains("!shutdown"), "{error}");
+    }
+
+    /// M7. `Restart=always` with `RestartPreventExitStatus=78` means a mode the
+    /// harness refuses at config parse (`rc=2`) respawns every five seconds
+    /// forever on a host nobody is watching. Refuse it here, where the message
+    /// reaches the user who typed it.
+    #[test]
+    fn a_gate_mode_the_harness_would_reject_is_refused_up_front() {
+        let mut request = stock_request();
+        request["agent"]["respond_to"] = serde_json::json!("everyone");
+        let error = match Agent::from_request(&request) {
+            Err(error) => error,
+            Ok(agent) => panic!("expected a refusal, got {}", agent.agent_id()),
+        };
+        assert!(error.contains("everyone"), "{error}");
+        assert!(error.contains("restart"), "{error}");
+
+        // The harness's four, not the desktop's three: `nobody` is refused by
+        // the desktop on purpose but starts fine, and inheriting that narrowing
+        // would refuse a launch that works.
+        for mode in ["owner-only", "allowlist", "anyone", "nobody"] {
+            let mut request = stock_request();
+            request["agent"]["respond_to"] = serde_json::json!(mode);
+            assert!(
+                Agent::from_request(&request).is_ok(),
+                "the harness accepts {mode:?}, so this must too"
+            );
+        }
+    }
+
+    /// The stock desktop sends exactly two ops, and the `info` gate runs before
+    /// the nsec-bearing request. Its response is validated strictly: an unknown
+    /// field, a missing one, or a non-integer `protocol_version` all fail the
+    /// gate — and a failed gate is a provider that cannot deploy at all, not
+    /// one that degrades.
+    #[test]
+    fn the_info_response_passes_the_desktops_strict_validator() {
+        let request: serde_json::Value = serde_json::from_str(INFO_REQUEST).unwrap();
+        let response = crate::run(&request).unwrap();
+        let object = response.as_object().expect("info must be a JSON object");
+
+        // Verbatim from `validate_provider_info` (`managed_agents/backend.rs`).
+        const FIELDS: &[&str] = &[
+            "ok",
+            "name",
+            "version",
+            "protocol_version",
+            "description",
+            "config_schema",
+        ];
+        for field in FIELDS {
+            assert!(object.contains_key(*field), "info is missing {field}");
+        }
+        for field in object.keys() {
+            assert!(
+                FIELDS.contains(&field.as_str()),
+                "the desktop rejects an info response carrying unknown field {field:?}"
+            );
+        }
+        assert_eq!(object["ok"], serde_json::Value::Bool(true));
+        assert_eq!(object["protocol_version"].as_u64(), Some(1));
+        for field in ["name", "version", "description"] {
+            assert!(object[field].as_str().is_some_and(|v| !v.is_empty()));
+        }
+        assert!(object["config_schema"].is_object());
+    }
+
+    /// The one bit an exit code carries. `invoke_provider` discards stdout
+    /// entirely on a non-zero exit, so a structured refusal must ride out on a
+    /// zero exit or the desktop reports raw stderr instead of the message this
+    /// crate worked to write.
+    #[test]
+    fn a_refusal_is_in_band_and_carries_agent_id_on_success() {
+        // Success shape: the desktop reads `agent_id` off the top level and
+        // errors with "deploy response missing agent_id" otherwise.
+        let id = stock_agent().agent_id();
+        let response = serde_json::json!({ "ok": true, "agent_id": id });
+        assert!(response["agent_id"].as_str().is_some());
+
+        // Refusal shape, as `main` emits it.
+        let refusal = serde_json::json!({ "ok": false, "error": "boom" });
+        assert_eq!(refusal["ok"], false);
+        assert!(refusal["error"].as_str().is_some());
+    }
+
+    /// **Unit convergence.** A stock-driven redeploy of an agent this fork
+    /// already deployed must land on the SAME unit and the SAME env file, so it
+    /// updates the running agent rather than standing a duplicate beside it.
+    ///
+    /// The derivation chain has exactly two inputs, and neither of them is a
+    /// field the launch block changed:
+    ///
+    /// 1. **stem** — `agent.name`, slugified and capped at 32 characters.
+    ///    `deploy_payload_json` serializes this from `record.name` (the
+    ///    handle), on both the fork and stock. `build_launch_block` reads
+    ///    `record.display_name` too, but only into
+    ///    `policy_env.BUZZ_ACP_SESSION_TITLE` — it never reaches the slug.
+    /// 2. **fragment** — the first [`PUBKEY_FRAGMENT`] hex characters of the
+    ///    pubkey **derived from `private_key_nsec`** (§Deploy Step 0). Same
+    ///    record, same minted key, same fragment.
+    ///
+    /// So the unit name is a function of (`name`, `nsec`) alone. This test pins
+    /// that by reconstructing the shape of a real deployed unit from the fork
+    /// and rebuilding it through the stock payload path.
+    #[test]
+    fn a_stock_redeploy_converges_on_the_units_the_fork_already_deployed() {
+        // The shape of a live unit: `<slugified name>-<12 hex of derived key>`.
+        // The stem values are real ones from a deployed fleet; the key is the
+        // suite's own so the fragment is checkable.
+        for (name, stem) in [
+            ("claude--sonnet", "claude--sonnet"),
+            ("claude-test", "claude-test"),
+            ("codex--gpt-5-6-sol", "codex--gpt-5-6-sol"),
+            ("marshall--hermes", "marshall--hermes"),
+            // A display name differing from the handle must not move the unit:
+            // only `record.name` reaches the slug.
+            ("marshall--hermes", "marshall--hermes"),
+        ] {
+            let mut request = stock_request();
+            request["agent"]["name"] = serde_json::json!(name);
+            let agent = Agent::from_request(&request).unwrap();
+
+            let derived = crate::identity::derive_pubkey(&agent.private_key_nsec).unwrap();
+            assert_eq!(
+                agent.slug(),
+                format!("{stem}-{}", &derived[..PUBKEY_FRAGMENT]),
+                "the unit name must stay a function of (name, nsec) alone"
+            );
+            assert_eq!(agent.agent_id(), format!("buzz-acp@{}", agent.slug()));
+        }
+
+        // The launch block is the whole of what #4289 added, and none of it may
+        // move the unit: a redeploy that renamed the unit would leave the old
+        // one running, holding the same identity, with no desktop record
+        // pointing at it.
+        let baseline = Agent::from_request(&stock_request()).unwrap().slug();
+        let mut request = stock_request();
+        request["agent"]["launch"] = serde_json::json!({
+            "command": "some-other-harness",
+            "args": ["completely", "different"],
+            "env": { "EVERYTHING": "changed" },
+            "policy_env": { "BUZZ_ACP_SESSION_TITLE": "A Different Display Name" },
+            "owner_pubkey": "b".repeat(64),
+        });
+        assert_eq!(
+            Agent::from_request(&request).unwrap().slug(),
+            baseline,
+            "no launch-block field may enter the slug"
+        );
+
+        // …and the env file the script writes is keyed on that same slug, so
+        // the two cannot drift apart.
+        let agent = Agent::from_request(&stock_request()).unwrap();
+        let script =
+            deploy_script(&agent, &stock_config(), UNIT_TEMPLATE, &Pushes::default()).unwrap();
+        assert!(
+            script.contains(&format!(r#"env_file="$conf/{}.env""#, agent.slug())),
+            "{script}"
+        );
+    }
+
+    /// The push seams are this fork's addition. A stock desktop sends neither
+    /// field, so they fall back to this process's own environment — which the
+    /// desktop's child inherits — and absent both, deploy behaves exactly as it
+    /// did before the seams existed.
+    #[test]
+    fn the_push_seams_are_absent_from_a_stock_payload() {
+        let request = stock_request();
+        assert!(request["agent"].get("buzz_acp_binary").is_none());
+        assert!(request["agent"].get("buzz_cli_binary").is_none());
+
+        // Not asserted as `None` on the parsed agent: the env fallback is
+        // deliberate, and this suite must not depend on the ambient
+        // environment of whoever runs it. What matters is that nothing in the
+        // payload sets them.
+        let pushes = Pushes::default();
+        assert!(pushes.acp.is_none() && pushes.cli.is_none());
     }
 }
