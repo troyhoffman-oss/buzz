@@ -269,6 +269,8 @@ test("personaModelOptionDescription drops empty and label-repeating text", () =>
   assert.equal(personaModelOptionDescription("   ", "Opus"), undefined);
   // A description that only echoes the label is noise, not a second fact.
   assert.equal(personaModelOptionDescription(" opus ", "Opus"), undefined);
+});
+
 // ── getProviderApiKeyLabel — provider-accurate credential field labels ────────
 //
 // Each provider with a secretEnvVar must have a distinct label. The helper
