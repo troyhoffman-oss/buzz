@@ -152,9 +152,11 @@ pub(super) fn build_deploy_payload(
             &record.relay_url,
             &relay_ws_url_with_override(state),
         ),
-        effective.model.value,
-        effective.provider.value,
-        effective.system_prompt.value,
+        EffectiveDeployConfig {
+            model: effective.model.value,
+            provider: effective.provider.value,
+            prompt: effective.system_prompt.value,
+        },
         merged_user_env,
         launch,
         BinariesToPush::from_env(),
@@ -198,18 +200,33 @@ impl BinariesToPush {
     }
 }
 
+/// The three values `resolve_effective_config` resolves together.
+///
+/// Grouped for the same reason as [`BinariesToPush`]: they are produced by one
+/// resolution step and read as one unit, so passing them as three loose
+/// `Option<String>` invited transposing model for provider at a call site — all
+/// three are the same type — and pushed the arity past clippy's limit.
+pub(super) struct EffectiveDeployConfig {
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub prompt: Option<String>,
+}
+
 /// Pure serialization half of [`build_deploy_payload`]. Legacy top-level fields
 /// remain for display/bookkeeping; providers execute the resolved `launch` block.
 pub(super) fn deploy_payload_json(
     record: &ManagedAgentRecord,
     relay_url: String,
-    effective_model: Option<String>,
-    effective_provider: Option<String>,
-    effective_prompt: Option<String>,
+    effective: EffectiveDeployConfig,
     merged_env: BTreeMap<String, String>,
     launch: serde_json::Value,
     binaries_to_push: BinariesToPush,
 ) -> serde_json::Value {
+    let EffectiveDeployConfig {
+        model: effective_model,
+        provider: effective_provider,
+        prompt: effective_prompt,
+    } = effective;
     serde_json::json!({
         "name": &record.name,
         "relay_url": relay_url,

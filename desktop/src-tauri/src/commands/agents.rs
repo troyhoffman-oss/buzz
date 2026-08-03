@@ -1297,7 +1297,9 @@ mod deploy;
 pub(crate) use deploy::resolve_deploy_model_provider;
 use deploy::{build_deploy_payload, deploy_to_provider};
 #[cfg(test)]
-use deploy::{deploy_payload_json, BinariesToPush};
+use deploy::{
+    deploy_payload_json, ensure_remote_provider_supported, BinariesToPush, EffectiveDeployConfig,
+};
 
 #[path = "agents_profile.rs"]
 mod profile;

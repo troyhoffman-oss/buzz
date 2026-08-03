@@ -465,9 +465,11 @@ fn deploy_payload_matches_the_shared_full_launch_fixture() {
     let agent = deploy_payload_json(
         &record,
         "wss://relay.example".into(),
-        Some("gpt-5".into()),
-        Some("openai".into()),
-        None,
+        EffectiveDeployConfig {
+            model: Some("gpt-5".into()),
+            provider: Some("openai".into()),
+            prompt: None,
+        },
         std::collections::BTreeMap::from([("USER_KEY".into(), "user-value".into())]),
         launch,
         // Unset, which is what the recorded fixture carries: the push seams are
@@ -512,9 +514,11 @@ fn deploy_payload_carries_the_full_behavioral_quad() {
     let payload = deploy_payload_json(
         &record,
         "wss://relay.example".to_string(),
-        Some("gpt-x".to_string()),
-        Some("openai".to_string()),
-        None,
+        EffectiveDeployConfig {
+            model: Some("gpt-x".to_string()),
+            provider: Some("openai".to_string()),
+            prompt: None,
+        },
         std::collections::BTreeMap::new(),
         serde_json::Value::Null,
         BinariesToPush::default(),
@@ -537,9 +541,11 @@ fn deploy_payload_carries_the_full_behavioral_quad() {
     let pushed = deploy_payload_json(
         &record,
         "wss://relay.example".to_string(),
-        None,
-        None,
-        None,
+        EffectiveDeployConfig {
+            model: None,
+            provider: None,
+            prompt: None,
+        },
         std::collections::BTreeMap::new(),
         serde_json::Value::Null,
         BinariesToPush {

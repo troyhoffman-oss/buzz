@@ -292,9 +292,13 @@ esac"#,
         &serde_json::json!({}),
     )
     .unwrap_err();
-    assert!(error.contains("protocol version 2"), "{error}");
+    assert!(error.message.contains("protocol version 2"), "{error}");
     assert!(!marker.exists());
-    assert!(!error.contains("nsec1must-not-cross"));
+    // The secret must not surface anywhere the frontend can read, so this
+    // checks the whole serialized failure, not just `message` — `recovery`
+    // crosses the IPC boundary too.
+    let serialized = serde_json::to_string(&error).unwrap();
+    assert!(!serialized.contains("nsec1must-not-cross"), "{serialized}");
 }
 
 #[cfg(unix)]
@@ -311,7 +315,7 @@ printf '%s\n' '{"ok":true,"version":"1.0.0"}'"#,
     let error =
         provider_deploy(&provider, &serde_json::json!({}), &serde_json::json!({})).unwrap_err();
     assert!(
-        error.contains("missing integer protocol_version"),
+        error.message.contains("missing integer protocol_version"),
         "{error}"
     );
 }
