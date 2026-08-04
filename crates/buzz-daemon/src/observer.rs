@@ -947,6 +947,65 @@ mod tests {
         );
     }
 
+    /// A frame carrying **two** `agent` tags cannot smuggle a second identity.
+    ///
+    /// Tag lookup takes the first match, so a frame tagged
+    /// `[agent, me], [agent, victim]` passes guard 3 on its own pubkey — and
+    /// that is the correct outcome, because every downstream decision keys on
+    /// `event.pubkey` rather than on the tag. Worth pinning: the alternative
+    /// reading (last-match, or "any tag matches") would let a signer file its
+    /// telemetry under someone else's stream, which is the impersonation guard 3
+    /// exists to stop.
+    #[test]
+    fn a_duplicate_agent_tag_cannot_smuggle_a_second_identity() {
+        let (owner, agent) = owner_and_agent();
+        let victim = Keys::generate();
+        let mut pipeline = registered_pipeline(&owner, &agent, NOW);
+        pipeline.register_agent(victim.public_key().to_hex(), &owner, NOW);
+
+        let owner_pubkey = nostr::PublicKey::from_hex(&owner.pubkey).unwrap();
+        let ciphertext = buzz_core::observer::encrypt_observer_payload(
+            &agent,
+            &owner_pubkey,
+            &payload(1, "acp_read"),
+        )
+        .unwrap();
+        let event = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_AGENT_OBSERVER_FRAME as u16),
+            ciphertext,
+        )
+        .tags([
+            Tag::parse([
+                buzz_core::observer::OBSERVER_AGENT_TAG,
+                &agent.public_key().to_hex(),
+            ])
+            .unwrap(),
+            Tag::parse([
+                buzz_core::observer::OBSERVER_AGENT_TAG,
+                &victim.public_key().to_hex(),
+            ])
+            .unwrap(),
+        ])
+        .custom_created_at(nostr::Timestamp::from_secs(NOW as u64))
+        .sign_with_keys(&agent)
+        .unwrap();
+
+        let Ingest::Accepted(frame) = pipeline.ingest(&event, &owner, NOW) else {
+            panic!("the frame is validly signed by a registered agent");
+        };
+        assert_eq!(
+            frame.agent_pubkey,
+            agent.public_key().to_hex(),
+            "the frame is filed under its signer, never under a claimed tag"
+        );
+        assert!(
+            pipeline
+                .live_frames(&victim.public_key().to_hex())
+                .is_empty(),
+            "nothing landed in the impersonated agent's stream"
+        );
+    }
+
     /// §5.2: "a frame whose `pubkey ≠ agent` tag is dropped."
     ///
     /// The frame is genuinely signed and genuinely encrypted — it just claims
