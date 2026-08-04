@@ -310,6 +310,37 @@ describe("cross-cutting invariants", () => {
     expect(s.focusGlyphCount()).toBe(1);
   });
 
+  test("§5.2 ← walks the cursor through text before it ascends", () => {
+    // Not a bug, and worth pinning because it reads like one: with a draft in
+    // the composer, `←` is a *text* key until the cursor reaches column 0, and
+    // only the press after that ascends. §5.2's rule is "arrows type whenever
+    // there is text under the cursor to move through, and navigate only when
+    // that interpretation is vacuous" — so a half-written reply is not
+    // something you can accidentally `←` out of mid-word.
+    const s = Session.open("seeded-basic", 100, 26)
+      .goTo("Channels")
+      .key("right")
+      .key("right")
+      .key("up")
+      .key("up", { shift: true })
+      .key("right");
+    expect(s.layer()).toBe("thread");
+
+    s.type("draft");
+    expect(s.state.cursor).toBe(5);
+    for (let i = 0; i < 5; i++) s.key("left");
+    // Five presses spent on the text; still in the thread, draft intact.
+    expect(s.state.cursor).toBe(0);
+    expect(s.layer()).toBe("thread");
+    expect(s.state.composer).toBe("draft");
+
+    s.key("left");
+    expect(s.layer()).toBe("channel");
+    // §5.4: the draft is persisted per layer, not discarded by the ascent.
+    s.key("right");
+    expect(s.state.composer).toBe("draft");
+  });
+
   test("[G8] zero ❯ is as broken as two — L4 ACTIVITY has no conversation", () => {
     // Regression. ACTIVITY is a chat layer (the composer owns `❯`, so `↓`
     // opens the drawer) but its body is a *transcript*, not a message list.
