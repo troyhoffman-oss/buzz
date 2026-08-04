@@ -84,6 +84,36 @@ scan() {
   (cd "$CODE_ONLY" && grep -rnE "$1" "$SRC" 2>/dev/null) || return 1
 }
 
+# Exact source paths exempted from **rule 2 only** (the 4-digit scan).
+#
+# §6.4's digit rule is blunt on purpose — narrowing it to `kind`-adjacent
+# numbers is what let `OBSERVER_FRAME = 24200` through once already. But a front
+# end does legitimately need `1000` to turn milliseconds into seconds, and the
+# two ways to satisfy a blunt gate are: allowlist the value, or write it in a
+# form the scan misses (`1_000`). The second makes the gate bypassable by
+# formatting, in an undocumented way the next author would find and copy.
+#
+# So the exemption is by **exact path**, never by pattern, and the exempted file
+# is required to contain nothing but time constants — the same shape as
+# `themes/*.json` for the no-hex rule: the rule stays absolute, and the
+# legitimate values get one auditable home. A glob here (`src/time/*`) would
+# grow into a directory nobody reads; a path list has to be edited, in a diff,
+# with a reason.
+KIND_SCAN_EXEMPT='src/time/units.ts'
+
+scan_kinds() {
+  # Rule 2's scan, minus the exempted paths. `grep -v` on a fixed path list
+  # rather than `--exclude`, so the exemption is visible in the pipeline and an
+  # unexpected match still prints its real path.
+  local out
+  out="$( (cd "$CODE_ONLY" && grep -rnE "$1" "$SRC" 2>/dev/null) || true)"
+  for exempt in $KIND_SCAN_EXEMPT; do
+    out="$(grep -v "^${exempt}:" <<<"$out" || true)"
+  done
+  [[ -n "$out" ]] || return 1
+  printf '%s\n' "$out"
+}
+
 # 1. No protocol dependency may be declared. The daemon owns NIP-44, bech32,
 #    secp256k1, and every nsec/npub decode; the TUI never sees a key (§2.1).
 PROTOCOL_PKGS='nostr nostr-tools secp256k1 @noble/secp256k1 @noble/curves @scure/base bech32 nip44 nip-44 nsecs'
@@ -120,11 +150,13 @@ done
 #    constant of that size is rare in a front end and can be allowlisted
 #    explicitly below, whereas a missed kind is silent.
 #
-#    Allowlisted, with a reason each:
-#      - the timing/geometry literals the shell legitimately carries (none yet);
+#    Allowlisted, with a reason each — see `KIND_SCAN_EXEMPT` above:
+#      - `src/time/units.ts`, which holds the millisecond conversions and
+#        nothing else, so `1000` has one auditable home rather than being
+#        smuggled past the scan as `1_000` at a dozen call sites;
 #      - anything inside a string that is obviously not a kind is NOT
 #        allowlisted, because a kind in a string is still a kind.
-if scan '(^|[^0-9a-zA-Z_.])[0-9]{4,}'; then
+if scan_kinds '(^|[^0-9a-zA-Z_.])[0-9]{4,}'; then
   fail "a bare 4-digit-or-longer integer appears in $SRC/: event kinds are daemon vocabulary (§6.4)"
 fi
 

@@ -77,6 +77,15 @@ describe("violations are caught", () => {
     ).toBe(1);
   });
 
+  test("the kind-scan exemption is exact-path, not prefix or glob", () => {
+    // `src/time/units.ts` is exempted from rule 2 so `1000` has one auditable
+    // home (see KIND_SCAN_EXEMPT in the script). The exemption must not extend
+    // to a sibling: an exemption that matched by directory or prefix would turn
+    // "one file of time constants" into a place kinds could be parked, which is
+    // the false negative the blanket digit rule exists to prevent.
+    expect(runWithProbe("units.ts", "export const k = 40002;\n")).toBe(1);
+  });
+
   test("a kind on a line after a URL literal", () => {
     // Regression: the comment stripper used `sub(/\/\/.*$/, "")`, which
     // truncated at the `//` inside `https://` — so anything after a URL, on
