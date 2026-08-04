@@ -85,6 +85,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // listener is up would leave a half-started daemon behind.
     identity::refuse_env_key_paths()?;
 
+    // The identity flags parse but are not yet honoured (deliverable 2). Refuse
+    // them rather than accepting them silently: §2.5 makes "keyless" a visible
+    // state precisely because a daemon that looks keyed while archiving nothing
+    // is the §1.3-property-3 failure. A flag that is accepted and ignored
+    // creates exactly that appearance, and an operator debugging an empty
+    // observer archive would have no way to see it from the outside.
+    for (flag, present) in [
+        ("--identity-ncryptsec", cli.identity_ncryptsec.is_some()),
+        ("--passphrase-stdin", cli.passphrase_stdin),
+        ("--identity-credential", cli.identity_credential.is_some()),
+        ("--passphrase-file", cli.passphrase_file.is_some()),
+        ("--detach", cli.detach),
+    ] {
+        if present {
+            return Err(format!(
+                "{flag} is not implemented yet (DESIGN.md §4.1.1 deliverable 2); \
+                 refusing rather than starting a daemon that looks keyed but archives nothing"
+            )
+            .into());
+        }
+    }
+
     let idle_timeout = match cli.idle_timeout {
         0 => None,
         secs => Some(std::time::Duration::from_secs(secs)),

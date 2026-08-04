@@ -174,7 +174,11 @@ export function findLabelledMocks(markdown: string): LabelledMock[] {
     // future edit may not.
     const from = Math.max(0, i - LABEL_LOOKBACK, previousFenceEnd + 1);
     const context = lines.slice(from, i).join(" ");
-    const match = context.match(/(?:drawn at|at)\s+(\d+)\s*[×x]\s*(\d+)/i);
+    // `\bat\b` is load-bearing: an unanchored `at` matches inside "chat", so
+    // ordinary prose ("chat 120x40 sessions") would fabricate a label and fail
+    // the build on a block that was never claiming a size. Widening the
+    // lookback to 24 lines made that far more likely, not less.
+    const match = context.match(/(?:drawn\s+at|\bat)\s+(\d+)\s*[×x]\s*(\d+)/i);
 
     if (match?.[1] && match[2] && body.length > 0) {
       mocks.push({

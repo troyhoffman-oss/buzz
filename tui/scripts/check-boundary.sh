@@ -37,22 +37,44 @@ trap 'rm -rf "$CODE_ONLY"' EXIT
 
 while IFS= read -r file; do
   mkdir -p "$CODE_ONLY/$(dirname "$file")"
-  # Blank out /* ... */ blocks and // ... tails, keeping line count intact.
+  # Character-wise scan rather than a regex sub. A naive `sub(/\/\/.*$/, "")`
+  # truncates at the `//` inside a URL string — so a violation on the same line
+  # as, or *after*, any `https://` literal silently disappears. That is a
+  # false negative in a security-shaped gate, which is the one direction a gate
+  # must never fail.
+  #
+  # String contents are preserved rather than blanked: a kind embedded in a
+  # string is still a kind.
   awk '
-    { line = $0 }
-    inblock {
-      if (match(line, /\*\//)) { line = substr(line, RSTART + 2); inblock = 0 }
-      else { print ""; next }
-    }
     {
-      while (match(line, /\/\*/)) {
-        head = substr(line, 1, RSTART - 1)
-        rest = substr(line, RSTART + 2)
-        if (match(rest, /\*\//)) { line = head substr(rest, RSTART + 2) }
-        else { line = head; inblock = 1; break }
+      line = $0
+      out = ""
+      i = 1
+      n = length(line)
+      while (i <= n) {
+        c = substr(line, i, 1)
+        two = substr(line, i, 2)
+        if (inblock) {
+          if (two == "*/") { inblock = 0; i += 2 } else { i++ }
+          continue
+        }
+        if (instr) {
+          out = out c
+          if (c == "\\") { out = out substr(line, i + 1, 1); i += 2; continue }
+          if (c == quote) instr = 0
+          i++
+          continue
+        }
+        if (c == "\"" || c == "'"'"'" || c == "`") { instr = 1; quote = c; out = out c; i++; continue }
+        if (two == "/*") { inblock = 1; i += 2; continue }
+        if (two == "//") { break }
+        out = out c
+        i++
       }
-      sub(/\/\/.*$/, "", line)
-      print line
+      # A template literal may span lines; reset at end of line only when not
+      # inside one, so its contents keep being scanned.
+      if (instr && quote != "`") instr = 0
+      print out
     }
   ' "$file" > "$CODE_ONLY/$file"
 done < <(find "$SRC" -type f \( -name '*.ts' -o -name '*.tsx' \))
@@ -70,12 +92,24 @@ for pkg in nostr nostr-tools secp256k1 @noble/secp256k1 bech32 nip44 nip-44 nsec
   fi
 done
 
-# 2. No bare event-kind integer in the 4-digit-and-up range. Kinds are daemon
-#    vocabulary — the TUI receives `type: "message.new"`, never `kind: 40002`.
-#    Matched as `kind`-adjacent so ordinary numbers (widths, timeouts, ports)
-#    are not false positives.
-if scan '\bkinds?\b[^a-zA-Z]{0,4}[0-9]{4,}'; then
-  fail "a bare event-kind integer appears in $SRC/: kinds are daemon vocabulary (§6.4)"
+# 2. No bare event-kind integer in the 4-digit-and-up range (§6.4, verbatim).
+#    Kinds are daemon vocabulary — the TUI receives `type: "message.new"`,
+#    never `kind: 40002`.
+#
+#    Deliberately NOT narrowed to `kind`-adjacent numbers. That reading passes
+#    `const OBSERVER_FRAME = 24200` and even `kind2 = 40002` (a `\b` after
+#    `kind` requires a non-word character, and `2` is one), which is precisely
+#    the leak the gate exists to stop. A blanket 4-digit rule is what §6.4
+#    actually specifies, and it is the safer default: a genuine non-kind
+#    constant of that size is rare in a front end and can be allowlisted
+#    explicitly below, whereas a missed kind is silent.
+#
+#    Allowlisted, with a reason each:
+#      - the timing/geometry literals the shell legitimately carries (none yet);
+#      - anything inside a string that is obviously not a kind is NOT
+#        allowlisted, because a kind in a string is still a kind.
+if scan '(^|[^0-9a-zA-Z_.])[0-9]{4,}'; then
+  fail "a bare 4-digit-or-longer integer appears in $SRC/: event kinds are daemon vocabulary (§6.4)"
 fi
 
 # 3. No cursor decoding. [D-6] makes cursors decodable for humans debugging,

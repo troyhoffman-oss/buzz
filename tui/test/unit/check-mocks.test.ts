@@ -76,6 +76,22 @@ describe("findLabelledMocks", () => {
     ).toHaveLength(1);
   });
 
+  test("prose containing 'chat' does not fabricate a label", () => {
+    // Regression: an unanchored `at` matches inside "ch-at-", so ordinary
+    // prose ("chat 999x9 sessions") invented a label for a block that never
+    // claimed a size — and then failed the build on it. Widening the lookback
+    // to 24 lines made this more likely, not less.
+    const markdown = [
+      "Some chat 999x9 prose here.",
+      "",
+      "```",
+      "┌──┐",
+      "└──┘",
+      "```",
+    ].join("\n");
+    expect(findLabelledMocks(markdown)).toHaveLength(0);
+  });
+
   test("an unlabelled fence is skipped, not failed", () => {
     // §2.1's process diagram and §5.x's shell snippets are not mocks.
     const markdown = ["```bash", "tmux new-session", "```"].join("\n");
