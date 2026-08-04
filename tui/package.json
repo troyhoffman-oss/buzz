@@ -1,0 +1,30 @@
+{
+  "name": "buzz-tui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Terminal client for Buzz. Front end only — all protocol knowledge lives in crates/buzz-daemon (DESIGN.md §2.1, §6.4).",
+  "license": "Apache-2.0",
+  "module": "src/main.ts",
+  "scripts": {
+    "dev": "bun run src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "biome check .",
+    "format": "biome format --write .",
+    "test:unit": "bun test test/unit",
+    "test:render": "bun test test/render",
+    "test:tmux": "bun test test/tmux",
+    "smoke": "bash scripts/smoke.sh",
+    "build": "bun run scripts/build.ts"
+  },
+  "dependencies": {
+    "@opentui/core": "0.5.1",
+    "@opentui/keymap": "0.5.1",
+    "@opentui/solid": "0.5.1",
+    "solid-js": "1.9.12"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.9.3"
+  }
+}

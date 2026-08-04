@@ -1,0 +1,23 @@
+# The Solid transform must be installed before any `.tsx` is loaded.
+#
+# Without this preload, Bun resolves `solid-js` through its `node` export
+# condition to `dist/server.js` — the SSR build — and the reconciler fails at
+# first render with "Orphan text error: must have a <text> as a parent". The
+# failure looks like a component bug rather than a resolution problem, so it is
+# worth stating plainly: the preload is load-bearing, not decoration.
+#
+# `bun build --compile` does NOT apply this transform, which is why the release
+# path goes through `scripts/build.ts` (Bun.build + @opentui/solid/bun-plugin)
+# rather than the plain CLI. See DESIGN.md §6.2(b) and upstream issue #122.
+#
+# A *compiled* binary re-reads whatever bunfig.toml sits in its CWD, and its
+# embedded module graph has no `@opentui/solid/preload` to resolve — so running
+# `./dist/buzz-tui-*` from inside this directory fails with
+# `preload not found "@opentui/solid/preload"` even though the same binary runs
+# fine anywhere else. The transform is already baked in at build time, so the
+# preload is genuinely dev/test-only. `scripts/smoke.sh` therefore runs the
+# compiled binary from a scratch directory, not from `tui/`.
+preload = ["@opentui/solid/preload"]
+
+[test]
+preload = ["@opentui/solid/preload"]
