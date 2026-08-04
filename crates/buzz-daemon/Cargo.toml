@@ -1,0 +1,70 @@
+[package]
+name = "buzz-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local daemon that owns all Buzz protocol knowledge for terminal clients"
+
+[lib]
+name = "buzz_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "buzz-daemon"
+path = "src/main.rs"
+
+[dependencies]
+# Internal — reused VERBATIM per DESIGN.md §2.1. The daemon owns all protocol
+# knowledge and gets it from these two crates rather than reimplementing it.
+buzz-core = { workspace = true }
+buzz-sdk = { workspace = true }
+buzz-ws-client = { workspace = true }
+
+# Nostr. `nip49` is the ncryptsec (NIP-49) identity format of DESIGN.md §2.5
+# [D-8]; `nip44` is the observer-frame envelope of §2.5's guard chain; `nip98`
+# is the HTTP-bridge auth the relay's REST surface expects.
+nostr = { version = "0.44", features = ["std", "nip44", "nip49", "nip98"] }
+
+# Async runtime
+tokio = { workspace = true }
+
+# HTTP server over a Unix domain socket. axum implements `Listener` for
+# `tokio::net::UnixListener`, so no TCP listener ever ships (§2.5).
+axum = { workspace = true }
+tower = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Paths / IDs / time
+dirs = "6"
+uuid = { workspace = true }
+chrono = { workspace = true }
+url = { workspace = true }
+
+# Socket-path hashing (§2.2 preimage)
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+
+# Key material and passphrases are held in zeroizing buffers (§2.5).
+zeroize = { workspace = true }
+
+# Errors + logging
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# uid for the peercred check of §2.5. Same crate/version as buzz-acp,
+# buzz-agent, and buzz-dev-mcp; `user` is the feature carrying `getuid`.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["user"] }
+
+[dev-dependencies]
+tempfile = "3"
