@@ -248,7 +248,17 @@ export function drawerListHeight(
   );
 }
 
-/** Render the drawer list (§2.3), selection marked with `❯`. */
+/**
+ * Render the drawer list (§2.3), selection marked with `❯`.
+ *
+ * **`selected` indexes `rows`, not the fitted subset.** Degradation can drop
+ * rows ({@link fitDrawerRows}), so an index into the *rendered* list would mean
+ * something different from the index the reducer holds — the `❯` would sit on
+ * one row while `→` committed to another. That desync is invisible until the
+ * drawer degrades, which is exactly when a user is least able to tell a
+ * mis-navigation from a crowded screen. Matching by identity rather than by
+ * position is what keeps the two in agreement at every height.
+ */
 export function renderDrawerList(
   rows: readonly DrawerRow[],
   selected: number,
@@ -260,6 +270,7 @@ export function renderDrawerList(
   // the hint rows. What is left is what the list itself may use.
   const listRows = Math.max(1, availableRows - 4 - hints.length);
   const fitted = fitDrawerRows(rows, listRows);
+  const selectedId = rows[selected]?.id;
 
   const out: string[] = [
     pad("  Live", cols),
@@ -268,12 +279,12 @@ export function renderDrawerList(
   ];
 
   let lastSection: DrawerSection | null = null;
-  fitted.rows.forEach((row, index) => {
+  fitted.rows.forEach((row) => {
     if (!fitted.compactHeaders && row.section !== lastSection) {
       out.push(pad(`  ${row.section}`, cols));
       lastSection = row.section;
     }
-    const marker = index === selected ? "❯ " : "  ";
+    const marker = row.id === selectedId ? "❯ " : "  ";
     const label = row.detail ? `${row.label}   ${row.detail}` : row.label;
     out.push(
       pad(

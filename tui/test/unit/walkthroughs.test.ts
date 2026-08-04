@@ -310,6 +310,54 @@ describe("cross-cutting invariants", () => {
     expect(s.focusGlyphCount()).toBe(1);
   });
 
+  test("[G8] zero ❯ is as broken as two — L4 ACTIVITY has no conversation", () => {
+    // Regression. ACTIVITY is a chat layer (the composer owns `❯`, so `↓`
+    // opens the drawer) but its body is a *transcript*, not a message list.
+    // Because it carries a `channelId` for its back target, "the messages for
+    // this layer" resolved to the channel's messages — so `↑` replaced the
+    // composer with a hint footer and put the cursor on a message that was
+    // nowhere on screen. Nothing was marked, and the glyph's whole job is to
+    // say where keys go.
+    const s = Session.open("seeded-basic", 100, 26)
+      .goTo("Channels")
+      .key("right")
+      .key("right")
+      .key("down")
+      .key("down")
+      .key("right");
+    expect(s.layer()).toBe("activity");
+    s.key("up");
+    expect(s.state.messageSelect).toBeNull();
+    expect(s.focusGlyphCount()).toBe(1);
+  });
+
+  test("§2.4 the drawer's ❯ and its → target are the same row", () => {
+    // Regression. The reducer indexed the *unfitted* row list while the
+    // renderer marked a row in the *fitted* one, so under §2.3's degradation
+    // the glyph sat on one row and `→` committed to another. Invisible until
+    // the drawer degrades — which is exactly when a user can least tell a
+    // mis-navigation from a crowded screen. Matching by row identity is what
+    // keeps them in agreement at every height.
+    for (const rows of [30, 20, 18]) {
+      const s = Session.open("seeded-basic", 100, rows)
+        .goTo("Channels")
+        .key("right")
+        .key("right")
+        .key("down");
+      s.key("down");
+      const marked = s.focusRow() ?? "";
+      s.key("right");
+      // Whatever was marked is what we arrived at.
+      const name =
+        marked
+          .replace("❯", "")
+          .trim()
+          .split(/\s{2,}/)[0] ?? "";
+      expect(name.length).toBeGreaterThan(0);
+      expect(s.crumb()).toContain(name);
+    }
+  });
+
   test("[G3] ← at L0 is a no-op, not a quit and not a wrap", () => {
     const s = Session.open("seeded-basic");
     const before = s.text();

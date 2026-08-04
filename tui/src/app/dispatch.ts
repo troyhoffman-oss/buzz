@@ -351,6 +351,16 @@ export function applyIntent(
       return jumpStructural(state, intent.delta);
 
     case "enterMessageSelect": {
+      // `↑` goes up **the conversation** (§3), so it needs a conversation. On
+      // L4 ACTIVITY the body is a transcript, not a message list — entering
+      // message-select there replaced the composer with a hint footer and left
+      // **zero** `❯` on screen, since there was nothing for the cursor to mark.
+      // [G8] says exactly one, and zero is as broken as two: the glyph's whole
+      // job is to say where keys go.
+      //
+      // §5.2's chain is written for chat layers generally, and the honest
+      // reading is that the interpretation is *vacuous* here — so the press
+      // falls through to nothing rather than to a surface with no content.
       const messages = timelineMessages(state);
       if (messages.length === 0) return state;
       return enterMessageSelect(state, initialSelectIndex(messages));

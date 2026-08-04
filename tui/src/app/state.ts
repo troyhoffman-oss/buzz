@@ -269,7 +269,10 @@ export function ascend(state: AppState): AppState {
     stack: nextStack,
     completion: null,
   };
-  if (!isChatLayer(to.kind)) return restored;
+  // `hasConversation`, not `isChatLayer`: ascending into L4 ACTIVITY must not
+  // restore a message-select there, because its body is a transcript with
+  // nothing for the cursor to mark. See {@link hasConversation}.
+  if (!hasConversation(to.kind)) return restored;
   return {
     ...restored,
     messageSelect: { index: to.selection },
@@ -296,12 +299,34 @@ export function openDrawer(state: AppState): AppState {
   };
 }
 
+/**
+ * Layers whose body **is a conversation**, and which can therefore hold a
+ * message-select cursor.
+ *
+ * A strict subset of {@link isChatLayer}, and the difference is L4 ACTIVITY:
+ * it is a chat layer (the composer owns `❯`, so `↓` opens the drawer there),
+ * but its body is a *transcript*, not a message list. The two predicates were
+ * the same function for a while, and the bug that produced was subtle —
+ * ACTIVITY carries a `channelId` for its back target, so "the messages for this
+ * layer" resolved to the **channel's** messages while the screen showed the
+ * transcript. `↑` then replaced the composer with a hint footer and put the
+ * cursor on a message that was nowhere on screen: **zero** `❯` visible, which
+ * breaks [G8] exactly as badly as two would.
+ *
+ * §3's own wording is the rule: `↑` goes up *the conversation*. Where there is
+ * no conversation the interpretation is vacuous, and [G6] says a vacuous
+ * interpretation falls through rather than firing.
+ */
+export function hasConversation(kind: Layer["kind"]): boolean {
+  return kind === "channel" || kind === "thread";
+}
+
 /** Enter message-select — `↑` from an empty composer on a chat layer (§3). */
 export function enterMessageSelect(
   state: AppState,
   newestIndex: number,
 ): AppState {
-  if (!isChatLayer(current(state.stack).kind)) return state;
+  if (!hasConversation(current(state.stack).kind)) return state;
   return {
     ...state,
     messageSelect: { index: newestIndex },
