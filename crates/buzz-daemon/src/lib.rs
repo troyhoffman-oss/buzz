@@ -38,7 +38,9 @@
 //! [`config`] (§2.2 socket-path identity), [`socket`] (§2.5 peercred),
 //! [`lifecycle`] (§2.2/§2.3 registry, cap, idle timer), [`redact`] (§2.5
 //! redactor superset), [`cache`] (§4.1.1-3 SQLite), [`cursor`] ([D-6]),
-//! [`error`] (§2.4 error model), and [`api`] (the HTTP routes themselves).
+//! [`error`] (§2.4 error model), [`rest`] (the relay's NIP-98 HTTP bridge,
+//! re-exported as `session::RestClient`), and [`api`] (the HTTP routes
+//! themselves).
 
 pub mod api;
 pub mod askcard;
@@ -57,6 +59,7 @@ pub mod openapi;
 pub mod presence;
 pub mod readstate;
 pub mod redact;
+pub mod rest;
 pub mod search;
 pub mod session;
 pub mod socket;

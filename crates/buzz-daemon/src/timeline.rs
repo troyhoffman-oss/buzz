@@ -58,6 +58,29 @@ pub const TIMELINE_KINDS: [u32; 11] = [
     buzz_core::kind::KIND_HUDDLE_STARTED, // 48100 — and only 48100
 ];
 
+/// The **conversational** subset of [`TIMELINE_KINDS`].
+///
+/// §4.1.1 deliverable 5: "unread counting gated by `isConversationalUnreadKind`
+/// so system/job/huddle rows never create phantom unreads." A job-lifecycle
+/// event or a huddle-started row is a thing that *happened*, not a thing
+/// somebody said to you — counting it produces an unread badge that clears
+/// itself and a divider anchored to a row nobody wrote.
+pub const CONVERSATIONAL_KINDS: [u32; 3] = [
+    9,     // channel message
+    40002, // rich message
+    40008, // diff message
+];
+
+/// Whether an event kind creates unread state.
+///
+/// The gate of §4.1.1 deliverable 5. Deliberately a whitelist rather than a
+/// blacklist: a new non-conversational kind added upstream defaults to "does
+/// not create unreads", which fails toward a quiet badge rather than a phantom
+/// one.
+pub fn is_conversational_unread_kind(kind: u32) -> bool {
+    CONVERSATIONAL_KINDS.contains(&kind)
+}
+
 /// Relay-signed thread summary overlay. Source of §3.1's `⤷ 4` reply count.
 pub const KIND_THREAD_SUMMARY: u32 = buzz_core::kind::KIND_THREAD_SUMMARY;
 
