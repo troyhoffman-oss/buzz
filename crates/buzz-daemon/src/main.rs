@@ -70,7 +70,13 @@ struct Cli {
     detach: bool,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// `socket::bind` calls `tokio::net::UnixListener::bind`, which **panics**
+/// without a reactor ("there is no reactor running"). A synchronous `main` made
+/// every real invocation abort at the bind — exit 101, a panic message, and a
+/// stale socket file left behind — while the unit tests passed, because each is
+/// `#[tokio::test]` and therefore has a runtime the binary did not.
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

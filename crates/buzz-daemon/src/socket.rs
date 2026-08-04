@@ -32,7 +32,16 @@ use crate::error::{DaemonError, Result};
 /// 3. any stale socket file is removed — **only after** the caller has
 ///    confirmed the previous daemon is dead by probing the socket, never by
 ///    checking a pidfile pid, which is a PID-reuse race (§2.3);
-/// 4. the bound socket is `chmod 0600`.
+/// 4. the socket is created `0600` **at bind**, not chmod-ed afterwards.
+///
+/// Step 4 is a `umask` and not a `set_permissions` because `bind(2)` applies the
+/// process umask, and the default `0022` yields a `0755` socket that is
+/// *connectable by every uid on the box* for the window between bind and chmod.
+/// §1.2's own premise is a host running arbitrary AI agents under other uids
+/// with shell access, so that window is a real bar rather than a theoretical
+/// one — and §2.5 makes filesystem permissions the authorization model, with
+/// peercred only the belt to that suspenders. Narrowing the window is not the
+/// fix; never opening it is.
 pub fn bind(path: &Path) -> Result<UnixListener> {
     let dir = path
         .parent()
@@ -44,10 +53,29 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
         std::fs::remove_file(path)?;
     }
 
+    #[cfg(unix)]
+    let listener = {
+        use nix::sys::stat::{umask, Mode};
+        // Mask every group and other bit for the duration of the bind, then
+        // restore — leaving the process umask changed would silently affect the
+        // cache database and every other file the daemon creates later.
+        let previous = umask(Mode::from_bits_truncate(0o077));
+        let bound = UnixListener::bind(path);
+        umask(previous);
+        bound?
+    };
+    #[cfg(not(unix))]
     let listener = UnixListener::bind(path)?;
 
     #[cfg(unix)]
     {
+        // Belt to the umask's suspenders, and the normalization to exactly
+        // `0600`. The umask is what closes the security-relevant window (no
+        // group or other bit is ever set, even transiently); this chmod only
+        // clears the owner-execute bit that `bind`'s `0777` base mode leaves
+        // behind, which is cosmetic and has no window of its own because
+        // owner-only access holds either way. Doing it unconditionally means a
+        // platform whose `bind` ignores the umask still ends at `0600`.
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
@@ -100,6 +128,32 @@ mod tests {
         assert_eq!(sock_mode & 0o777, 0o600, "socket mode {sock_mode:o}");
         let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode();
         assert_eq!(dir_mode & 0o777, 0o700, "dir mode {dir_mode:o}");
+    }
+
+    /// §2.5: the socket is **never** group- or world-accessible, not even for
+    /// the window between `bind` and a chmod.
+    ///
+    /// Regression. `bind(2)` applies the process umask, so under the default
+    /// `0022` the socket existed as `0755` — connectable by every uid on the
+    /// box — until the following `set_permissions` ran. The old test could not
+    /// see it: it inspected the mode only *after* bind returned, which is after
+    /// the window closed. This runs under `umask 000`, where a bind that
+    /// depends on an inherited-umask accident produces `0777` and fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_is_never_group_or_world_accessible_under_a_permissive_umask() {
+        use nix::sys::stat::{umask, Mode};
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("buzz").join("umask.sock");
+
+        let previous = umask(Mode::empty());
+        let listener = bind(&sock);
+        umask(previous);
+        let _listener = listener.unwrap();
+
+        let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "socket mode {mode:o} under umask 000");
     }
 
     /// §2.5/§6.5: a group- or world-writable parent is refused before bind.

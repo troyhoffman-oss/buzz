@@ -62,9 +62,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 # uid for the peercred check of §2.5. Same crate/version as buzz-acp,
-# buzz-agent, and buzz-dev-mcp; `user` is the feature carrying `getuid`.
+# buzz-agent, and buzz-dev-mcp; `user` is the feature carrying `getuid` and
+# `fs` the `umask` that makes the socket 0600 at bind rather than after it.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["user"] }
+nix = { version = "0.31", default-features = false, features = ["user", "fs"] }
 
 [dev-dependencies]
 tempfile = "3"
