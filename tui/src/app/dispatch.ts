@@ -281,12 +281,18 @@ function commit(state: AppState): AppState {
       if (!target) return state;
       // A teleport inserts the group it came from, so the crumb records the
       // route rather than the tree (§4.4, [G15]).
+      //
+      // The seeded entry is **`home` scoped to the group**, not `channels`.
+      // §4.4 is explicit that "`←` returns to the mentions list, not to a
+      // channel list you never visited" — seeding a `channels` layer produced a
+      // crumb reading `home › mentions` above a rendered channel list, which is
+      // the exact confusion the rule forbids, wearing the right label.
       const via = teleportCrumb(row);
       if (via) {
         const seeded = descend(state, {
-          kind: "channels",
+          kind: "home",
           crumb: via,
-          selection: 0,
+          selection: layer.selection,
         });
         return { ...seeded, stack: push(seeded.stack, target) };
       }

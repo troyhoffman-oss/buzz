@@ -30,6 +30,12 @@ TIMEOUT_SECS="${SMOKE_TIMEOUT:-30}"
 # binary re-reads whatever `bunfig.toml` is in its CWD and cannot resolve the
 # dev-only preload from its embedded graph, so it must not run from `tui/`
 # (see the comment in bunfig.toml).
+# The fixture transport is the only transport until the daemon attach path
+# lands (§2.3), and it is a *product* path rather than a test hook — §5.5's
+# whole point is that the harness drives the shipped binary. An absolute path,
+# because a compiled binary runs from a scratch directory (below).
+FIXTURE="${SMOKE_FIXTURE:-$PWD/fixtures/seeded-basic.jsonl}"
+
 if [[ -n "${SMOKE_BIN:-}" ]]; then
   LAUNCH="$(cd "$(dirname "$SMOKE_BIN")" && pwd)/$(basename "$SMOKE_BIN")"
   LAUNCH_CWD="$STATE_DIR"
@@ -45,7 +51,9 @@ cleanup() {
 trap cleanup EXIT
 
 tmux new-session -d -s "$SESSION" -c "$LAUNCH_CWD" -x "$COLS" -y "$ROWS" \
-  "XDG_STATE_HOME=$STATE_DIR BUZZ_TUI_NO_ANIM=1 TZ=UTC LANG=C.UTF-8 $LAUNCH"
+  "XDG_STATE_HOME=$STATE_DIR BUZZ_TUI_FIXTURE=$FIXTURE \
+   BUZZ_TUI_FIXED_TIME=2026-08-04T14:12:00Z BUZZ_TUI_NO_ANIM=1 \
+   TZ=UTC LANG=C.UTF-8 $LAUNCH"
 
 # `-x/-y` alone is NOT enough, and getting this wrong is silent. tmux's default
 # `window-size latest` resizes a session to whatever client attached most
@@ -64,11 +72,11 @@ if [[ "$actual" != "${COLS}x${ROWS}" ]]; then
   exit 1
 fi
 
-# Poll for the shell frame rather than sleeping. `composer` is a §3.0 region
-# that never drops at any tier, so it is a readiness marker that stays valid as
-# the screens land on top of this frame.
+# Poll for the frame rather than sleeping. The statusline's relay row is the
+# readiness marker: it is the last band drawn and it never drops at any width
+# (NAVIGATION.md §2.1), so it stays valid as layers land on top of this frame.
 deadline=$((SECONDS + TIMEOUT_SECS))
-until tmux capture-pane -p -t "$SESSION" | grep -q 'composer'; do
+until tmux capture-pane -p -t "$SESSION" | grep -q 'buzz://'; do
   if [[ $SECONDS -ge $deadline ]]; then
     echo "::error::TUI did not render the shell within ${TIMEOUT_SECS}s" >&2
     echo "--- final pane ---" >&2
@@ -80,26 +88,48 @@ done
 
 pane="$(tmux capture-pane -p -t "$SESSION")"
 
-# Every §3.0 region that this tier draws must be present. At 120 cols the tier
-# is LG: list + main + aux, no rail (§3.9).
-for region in list main aux composer; do
-  if ! grep -q "$region" <<<"$pane"; then
-    echo "::error::shell region '$region' missing at ${COLS}x${ROWS}" >&2
+# The bands of §2, plus the L0 zones. There are no rail/list/main/aux regions
+# any more — §7 supersedes that shell outright, and asserting on them would
+# keep a gate green against a layout the design deleted.
+#
+# `❯` is the [G8] check in its cheapest form: exactly one focus glyph, which is
+# the invariant most likely to break silently when a new surface is added.
+for marker in 'ATTENTION' 'PLACES' 'buzz://' '⏵'; do
+  if ! grep -q "$marker" <<<"$pane"; then
+    echo "::error::'$marker' missing from the frame at ${COLS}x${ROWS}" >&2
     echo "$pane" >&2
     exit 1
   fi
 done
 
-# Quits cleanly on `q`.
-tmux send-keys -t "$SESSION" 'q'
+glyphs="$(grep -o '❯' <<<"$pane" | wc -l | tr -d ' ')"
+if [[ "$glyphs" != "1" ]]; then
+  echo "::error::[G8] expected exactly one ❯ on screen, found $glyphs" >&2
+  echo "$pane" >&2
+  exit 1
+fi
+
+# §1.1's default selection: home opens on the top mention when there is one.
+# This is what makes §4.4's jump two keystrokes, and it is worth asserting in a
+# real PTY because it is a boot-order property the unit tests reach differently.
+if ! grep -q '❯ matt' <<<"$pane"; then
+  echo "::error::home did not open on the top mention (§1.1)" >&2
+  echo "$pane" >&2
+  exit 1
+fi
+
+# Quits cleanly on ctrl+c with an empty composer (§5.5: mid-compose it clears
+# the composer and does NOT exit on the first press — that case is a T2
+# sequence, not this smoke).
+tmux send-keys -t "$SESSION" C-c
 
 deadline=$((SECONDS + TIMEOUT_SECS))
 while tmux has-session -t "$SESSION" 2>/dev/null; do
   if [[ $SECONDS -ge $deadline ]]; then
-    echo "::error::TUI did not exit within ${TIMEOUT_SECS}s of 'q'" >&2
+    echo "::error::TUI did not exit within ${TIMEOUT_SECS}s of ctrl+c" >&2
     exit 1
   fi
   sleep 0.1
 done
 
-echo "smoke ok: shell rendered at ${COLS}x${ROWS} and quit cleanly on q"
+echo "smoke ok: shell rendered at ${COLS}x${ROWS} and quit cleanly on ctrl+c"

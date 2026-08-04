@@ -59,8 +59,20 @@ async function main(): Promise<void> {
   const client = new FixtureClient(await Bun.file(fixture).text());
   const clock = resolveClock();
 
-  await render(() =>
-    Shell({ client, now: clock, onQuit: () => process.exit(0) }),
+  await render(
+    () => Shell({ client, now: clock, onQuit: () => process.exit(0) }),
+    {
+      // **`exitOnCtrlC` must be off.** OpenTUI's default is to exit the process
+      // on `ctrl+c` before any key handler runs, which silently defeats §5.5's
+      // requirement: "`ctrl+c` mid-compose clears the composer and does **not**
+      // exit on first press." A chat client that discards a half-written
+      // message on the key every terminal user presses reflexively is exactly
+      // the small betrayal §5.4's draft persistence exists to prevent — and it
+      // would have shipped looking like an OpenTUI behaviour rather than a bug.
+      //
+      // `Shell` owns the binding instead, and implements both halves.
+      exitOnCtrlC: false,
+    },
   );
 }
 
