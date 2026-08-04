@@ -1,0 +1,274 @@
+name: TUI Release
+
+# Publishes the pair of DESIGN.md §6.3: `buzz-tui` and `buzz-daemon`, three
+# targets each, six binaries plus six checksums.
+#
+# Modelled directly on this fork's `provider-release.yml`, which is a working,
+# reviewed pattern in this repo. The properties copied deliberately:
+#
+#   - Push-triggered on a tag, so the workflow is read from the *pushed ref* and
+#     needs no default-branch registration on the fork (unlike
+#     workflow_dispatch, which does).
+#   - **No** `if: github.repository == 'block/buzz'` guard. Every upstream
+#     release workflow carries one and silently skips on a fork; this file is
+#     fork-owned and must run there.
+#   - A **shared packaging script** (`.github/scripts/package-tui.sh`) so
+#     targets cannot drift in naming or checksum format. macOS runners have
+#     `shasum` not `sha256sum`; the script handles both and emits the identical
+#     `<hex>  <name>` line the publish job reads back with `sha256sum -c`.
+#   - A publish job that re-verifies **every** checksum after the round trip
+#     through artifact storage and asserts an exact artifact count, so a
+#     silently dropped artifact fails the release rather than producing a
+#     partial one.
+#
+# Ships as `--prerelease` until Wave 1's exit criteria (§4.1.4) pass.
+on:
+  push:
+    tags: ["tui-v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tui-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BUN_VERSION: "1.3.11"
+
+jobs:
+  daemon-linux:
+    name: buzz-daemon (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # Rust comes from rust-toolchain.toml via hermit — never
+      # dtolnay/rust-toolchain, which would shadow the pin.
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: tui-release-${{ env.TARGET }}
+
+      - name: Build
+        run: cargo build --release --target "$TARGET" -p buzz-daemon
+
+      - name: Package
+        run: .github/scripts/package-tui.sh buzz-daemon "$TARGET"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: buzz-daemon-${{ env.TARGET }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  daemon-macos:
+    name: buzz-daemon (${{ matrix.target }})
+    runs-on: macos-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      # macos-latest is arm64, so the Intel target is a cross-compile. Same
+      # convention as release.yml's `release-macos-x64` job.
+      - name: Add Rust target
+        run: rustup target add "$TARGET"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: tui-release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target "$TARGET" -p buzz-daemon
+
+      - name: Package
+        run: .github/scripts/package-tui.sh buzz-daemon "$TARGET"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: buzz-daemon-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  tui-linux:
+    name: buzz-tui (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install
+        run: bun install --frozen-lockfile
+        working-directory: tui
+
+      # `scripts/build.ts` (Bun.build + @opentui/solid/bun-plugin), NOT
+      # `bun build --compile`: the CLI does not apply the Solid transform, so a
+      # CLI-built binary ships untransformed JSX, compiles green, and dies at
+      # first render (anomalyco/opentui#122).
+      - name: Compile
+        run: bun run scripts/build.ts "$TARGET"
+        working-directory: tui
+
+      # An artifact that compiles but does not render is the precise failure the
+      # build-path choice above exists to prevent, so prove it boots before
+      # publishing it. Linux only: the macOS jobs cross-compile from arm64 and
+      # cannot execute an x64 artifact.
+      - name: Smoke the compiled binary
+        run: SMOKE_BIN="dist/buzz-tui-${TARGET}" bash scripts/smoke.sh
+        working-directory: tui
+
+      - name: Package
+        run: .github/scripts/package-tui.sh buzz-tui "$TARGET"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: buzz-tui-${{ env.TARGET }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  tui-macos:
+    name: buzz-tui (${{ matrix.target }})
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install
+        run: bun install --frozen-lockfile
+        working-directory: tui
+
+      - name: Compile
+        run: bun run scripts/build.ts "$TARGET"
+        working-directory: tui
+
+      - name: Package
+        run: .github/scripts/package-tui.sh buzz-tui "$TARGET"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: buzz-tui-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [daemon-linux, daemon-macos, tui-linux, tui-macos]
+    permissions:
+      contents: write
+    steps:
+      # No checkout: `gh` resolves the repo from GH_REPO, and nothing here reads
+      # the tree.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: staging
+
+      - name: Collect assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # download-artifact fans each artifact out into its own directory; the
+          # filenames inside are already unique per target, so flatten.
+          find staging -type f -exec cp {} dist/ \;
+          ls -l dist
+          # Every binary must arrive with its checksum, and the checksums must
+          # still verify after the round trip through artifact storage.
+          ( cd dist && for f in *.sha256; do sha256sum -c "$f"; done )
+          # §6.3: three targets x two binaries. Guards against a silently
+          # dropped artifact producing a partial release.
+          COUNT=$(find dist -type f ! -name '*.sha256' | wc -l)
+          if [[ "$COUNT" -ne 6 ]]; then
+            echo "::error::expected 6 binaries, found $COUNT"
+            exit 1
+          fi
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Buzz TUI — terminal client plus the daemon that owns the protocol."
+            echo
+            echo "Built from this fork at \`${SHA}\`."
+            echo
+            echo "### \`buzz-tui\` — the terminal client"
+            echo
+            echo "A single binary. Run it; it finds or spawns a \`buzz-daemon\` for your"
+            echo "(relay, identity) and attaches. There is no port to pick and no config"
+            echo "file to author before first use."
+            echo
+            echo "### \`buzz-daemon\` — the protocol process"
+            echo
+            echo "Ships separately because the VPS install runs it under \`systemd --user\`"
+            echo "with \`--idle-timeout 0\` and no TUI attached, and because a mixed-version"
+            echo "setup (new client on a laptop, older daemon on the VPS) must be"
+            echo "resolvable by upgrading the daemon alone."
+            echo
+            echo "### Checksums"
+            echo
+            echo '```'
+            ( cd dist && cat ./*.sha256 )
+            echo '```'
+          } > notes.md
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --target "$SHA" \
+              --prerelease \
+              --title "Buzz TUI ($TAG)" \
+              --notes-file notes.md
+          else
+            gh release edit "$TAG" --prerelease --notes-file notes.md
+          fi
+          gh release upload "$TAG" dist/* --clobber
+
+          gh release view "$TAG" --json tagName,url,assets \
+            --jq '{tag: .tagName, url: .url, assets: [.assets[].name]}'

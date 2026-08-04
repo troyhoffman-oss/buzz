@@ -1,0 +1,178 @@
+name: TUI Gates
+
+# The PR-gate half of DESIGN.md §6.2(a), for `tui/` and `crates/buzz-daemon/`.
+#
+# Why a separate file rather than jobs added to `ci.yml`: upstream `ci.yml`
+# triggers only on push to `main`/`release` and on pull_request, so it never
+# fires for a fork branch push. Same reasoning as `fork-gates.yml`, which this
+# file mirrors — a push-triggered workflow is read from the *pushed ref*, so it
+# takes effect the moment the branch lands on the fork with no default-branch
+# registration required (unlike `workflow_dispatch`, which does need it).
+#
+# Deliberately NOT gated on `github.repository`: every upstream release/CI
+# workflow carries an `if: github.repository == 'block/buzz'` guard that
+# silently skips on a fork. This file is fork-owned and must run there.
+on:
+  push:
+    branches: ["tui-*", "remote-first", "lane/**"]
+    paths:
+      - "tui/**"
+      - "crates/buzz-daemon/**"
+      - "docs/tui/**"
+      - ".github/workflows/tui-gates.yml"
+      - "Justfile"
+  pull_request:
+    paths:
+      - "tui/**"
+      - "crates/buzz-daemon/**"
+      - "docs/tui/**"
+      - ".github/workflows/tui-gates.yml"
+      - "Justfile"
+  workflow_dispatch:
+
+concurrency:
+  group: tui-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tui-check:
+    name: TUI Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # `tui/` is deliberately outside the pnpm workspace (§6.1), so this job
+      # never touches pnpm and never restores the pnpm store.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.11"
+
+      - name: Install
+        run: bun install --frozen-lockfile
+        working-directory: tui
+
+      - name: Typecheck
+        run: bunx tsc --noEmit
+        working-directory: tui
+
+      # Biome runs from the repo root: biome 2.x rejects a nested root config,
+      # and the root `biome.json` already covers `tui/`.
+      - name: Lint and format
+        run: npx --yes @biomejs/biome@2.4.14 check tui/
+
+      # T0 — pure units, no terminal (§5.2).
+      - name: T0 unit tests
+        run: bun test test/unit
+        working-directory: tui
+
+      # T1 — headless render snapshots (§5.3). Currently a `test.todo`
+      # placeholder so the suite cannot pass by being empty; the real matrix
+      # replaces it in Wave 1.
+      - name: T1 render snapshots
+        run: bun test test/render
+        working-directory: tui
+
+      # T2 — tmux drive against a real PTY (§5.5). `tmux` is preinstalled on
+      # ubuntu-latest; assert it rather than discovering its absence as a
+      # confusing test failure.
+      - name: Verify tmux is available
+        run: tmux -V
+
+      - name: T2 tmux drive
+        run: bun test test/tmux
+        working-directory: tui
+
+      # The one T2-shaped check that runs today: boot the shell in a real PTY,
+      # assert the pinned geometry and every §3.0 region, assert a clean quit.
+      - name: Smoke (source tree)
+        run: bash scripts/smoke.sh
+        working-directory: tui
+
+      # §6.4 disposability gate — no protocol knowledge in tui/src/. Invoked as
+      # a script rather than through `just` so this job needs no hermit: the
+      # rest of it is Bun-only, and pulling in the Rust toolchain to run one
+      # shell check would triple the job's setup time.
+      - name: Boundary check
+        run: bash scripts/check-boundary.sh
+        working-directory: tui
+
+      # §3.1/§6.2 — every fenced mock measures what its label claims.
+      - name: Mock width check
+        run: bun run scripts/check-mocks.ts ../docs/tui/DESIGN.md
+        working-directory: tui
+
+  tui-compile:
+    name: TUI Compile (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.11"
+
+      - name: Install
+        run: bun install --frozen-lockfile
+        working-directory: tui
+
+      # Goes through `scripts/build.ts` (Bun.build + @opentui/solid/bun-plugin)
+      # rather than `bun build --compile`: the CLI does not apply the Solid
+      # transform, so a CLI-built binary ships untransformed JSX, compiles
+      # green, and dies at first render. See anomalyco/opentui#122 and the
+      # comment in `tui/bunfig.toml`.
+      - name: Compile
+        run: bun run scripts/build.ts x86_64-unknown-linux-gnu
+        working-directory: tui
+
+      # A binary that compiles but does not render is the exact failure the
+      # build-path choice above exists to prevent, so the compile job proves the
+      # artifact actually boots rather than merely existing.
+      - name: Smoke (compiled binary)
+        run: SMOKE_BIN=dist/buzz-tui-x86_64-unknown-linux-gnu bash scripts/smoke.sh
+        working-directory: tui
+
+  daemon-check:
+    name: Daemon Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # Rust comes from rust-toolchain.toml via hermit — do not add
+      # dtolnay/rust-toolchain here, it would shadow the pin.
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: tui-gates-daemon
+
+      - name: Format check
+        run: cargo fmt -p buzz-daemon -- --check
+
+      - name: Clippy
+        run: cargo clippy -p buzz-daemon --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test -p buzz-daemon
+
+      # §6.2: "adding an endpoint without adding it to the spec is a build
+      # failure", and it catches TS-client drift in the same step because the
+      # generated client is committed and regenerated here.
+      - name: OpenAPI spec check
+        run: just daemon-spec-check

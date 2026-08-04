@@ -5,6 +5,7 @@ set dotenv-load := true
 desktop_dir := "desktop"
 desktop_tauri_manifest := "desktop/src-tauri/Cargo.toml"
 web_dir := "web"
+tui_dir := "tui"
 
 # Opt-in mesh-llm. Off by default so `just dev`/`just staging`/`just production`
 # skip ~420 extra crates + the llama.cpp native runtime build and stay fast to
@@ -957,6 +958,67 @@ goose-bg relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$BU
     source ./scripts/_goose-env.sh "{{relay}}" "{{key}}" "{{agents}}" "{{heartbeat}}" "{{prompt}}"
     screen -dmS goose-agent-{{agents}} bash -c "$(printf '%q ' env "${env_args[@]}") ./target/release/buzz-acp"
     echo "Agent running in screen session 'goose-agent-{{agents}}'. Attach with: screen -r goose-agent-{{agents}}"
+
+# ─── TUI (tui/ + crates/buzz-daemon) ──────────────────────────────────────────
+#
+# DESIGN.md §6.1: `tui/` is deliberately NOT a pnpm workspace member, so these
+# recipes are the entry point rather than a root `package.json` script. Bun
+# is required for every recipe below (https://bun.sh/install).
+
+# Install the TUI's dependencies
+tui-install:
+    cd {{tui_dir}} && bun install
+
+# Install reproducibly for CI
+tui-install-ci:
+    cd {{tui_dir}} && bun install --frozen-lockfile
+
+# Run the TUI against a live daemon (spawns one if absent, per DESIGN.md §2.3)
+tui-dev *ARGS:
+    cd {{tui_dir}} && bun run src/main.ts {{ARGS}}
+
+# Typecheck + lint the TUI
+tui-check:
+    cd {{tui_dir}} && bunx tsc --noEmit
+    npx --yes @biomejs/biome@2.4.14 check {{tui_dir}}
+
+# T0 — pure units, no terminal (DESIGN.md §5.2)
+tui-test-unit:
+    cd {{tui_dir}} && bun test test/unit
+
+# T1 — headless render snapshots (DESIGN.md §5.3). BLESS=1 rewrites.
+tui-test-render:
+    cd {{tui_dir}} && bun test test/render
+
+# T2 — tmux drive against a real PTY (DESIGN.md §5.5)
+tui-test-tmux:
+    cd {{tui_dir}} && bun test test/tmux
+
+# Boot the shell in a real PTY and assert it renders and quits (DESIGN.md §5.5).
+# SMOKE_BIN=<path> drives a compiled binary instead of the source tree.
+tui-smoke:
+    cd {{tui_dir}} && bash scripts/smoke.sh
+
+# Compile a single-binary release for one triple (DESIGN.md §6.3)
+tui-build target="x86_64-unknown-linux-gnu":
+    cd {{tui_dir}} && bun run scripts/build.ts {{target}}
+
+# Every fenced mock in DESIGN.md must measure what its label claims (§3.1, §6.2)
+tui-check-mocks:
+    cd {{tui_dir}} && bun run scripts/check-mocks.ts ../docs/tui/DESIGN.md
+
+# The §6.4 disposability gate: no protocol knowledge may live in tui/src/
+tui-check-boundary:
+    cd {{tui_dir}} && bash scripts/check-boundary.sh
+
+# OpenAPI + generated TS client must match what is committed (DESIGN.md §6.2)
+daemon-spec-check:
+    @echo "TODO(wave1, DESIGN.md §4.1.1 deliverable 14): implement spec regeneration + diff"
+
+# Daemon lint + tests
+daemon-check:
+    cargo clippy -p buzz-daemon --all-targets -- -D warnings
+    cargo test -p buzz-daemon
 
 # ─── Benchmarking ─────────────────────────────────────────────────────────────
 
