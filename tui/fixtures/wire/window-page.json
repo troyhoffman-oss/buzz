@@ -1,0 +1,104 @@
+{
+  "channel_id": "11111111-1111-1111-1111-111111111111",
+  "downgrade_filter": {
+    "#h": [
+      "11111111-1111-1111-1111-111111111111"
+    ],
+    "kinds": [
+      9,
+      40002,
+      40008,
+      40099,
+      43001,
+      43002,
+      43003,
+      43004,
+      43005,
+      43006,
+      48100
+    ],
+    "limit": 2
+  },
+  "events": [
+    {
+      "content": "read-state slots are the risky part",
+      "created_at": 1785852120,
+      "id": "4b73b702161846fcedbd83da8263c9db84e71af88ae5726a886e94cc615b698e",
+      "kind": 9,
+      "pubkey": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337",
+      "sig": "a6c4d36abc314c637e308f82cc9b3d749991a89dd3b0e78f9bacfc6a37fb7d614a5163f688f469236f558831848ee74d3471552f4bf9bcff37a2f85e53b9c454",
+      "tags": [
+        [
+          "h",
+          "11111111-1111-1111-1111-111111111111"
+        ]
+      ]
+    },
+    {
+      "content": "shipping the downgrade branch too",
+      "created_at": 1785852420,
+      "id": "aa46fe96830152a2f5c312467ffb201a9c5ee44066621b26c65d8d48c784111b",
+      "kind": 9,
+      "pubkey": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337",
+      "sig": "31e6e0781f85389744a164658f7689917ed9d592a8045a70d58e756a3af180ba8e9f218c7bc3f0541cb9d5b68893cd75328a38ed494064c89783d2f258a43c16",
+      "tags": [
+        [
+          "h",
+          "11111111-1111-1111-1111-111111111111"
+        ]
+      ]
+    },
+    {
+      "content": "{\"descendant_count\":6,\"last_reply_at\":1785852600,\"participants\":[\"531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337\",\"4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766\"],\"reply_count\":4}",
+      "created_at": 1785852720,
+      "id": "83f9e29b1fbadd1d4dd1d6694099c5f7ad70ac78fe78da14288ca18d1328bba8",
+      "kind": 39005,
+      "pubkey": "56b328b30c8bf5839e24058747879408bdb36241dc9c2e7c619faa12b2920967",
+      "sig": "e5db6b2e20fa61333de12f19257c9ca44937cdc12a5b04ed973ed94fa423ffc405c83bc548e19d1c9c0a7b27a477b6a56e7f55962d9a34100c5bf3dad05e6c9f",
+      "tags": [
+        [
+          "e",
+          "4b73b702161846fcedbd83da8263c9db84e71af88ae5726a886e94cc615b698e"
+        ]
+      ]
+    },
+    {
+      "content": "{\"has_more\":true,\"next_cursor\":{\"created_at\":1785852120,\"id\":\"4b73b702161846fcedbd83da8263c9db84e71af88ae5726a886e94cc615b698e\"}}",
+      "created_at": 1785852720,
+      "id": "ee5e84bf6985c79f00ba300cbc3ff4fecc56ab8de9a9b2b83eb5a73ceb3c9353",
+      "kind": 39006,
+      "pubkey": "56b328b30c8bf5839e24058747879408bdb36241dc9c2e7c619faa12b2920967",
+      "sig": "6fcbfef53059f7de0616c157aa67f18aa93da8408d1cf17346dd74247f56301cf36f4a811a9f02fbb439a4d29e8ba5a5aa33a88b322b78f8f1bfeb7fed22d38f",
+      "tags": [
+        [
+          "d",
+          "11111111-1111-1111-1111-111111111111:head"
+        ]
+      ]
+    }
+  ],
+  "expected_bounds_binding": "11111111-1111-1111-1111-111111111111:head",
+  "note": "NIP-CW page: content rows + 39005 summary + 39006 bounds",
+  "request_filter": {
+    "#h": [
+      "11111111-1111-1111-1111-111111111111"
+    ],
+    "include_aux": true,
+    "include_summaries": true,
+    "kinds": [
+      9,
+      40002,
+      40008,
+      40099,
+      43001,
+      43002,
+      43003,
+      43004,
+      43005,
+      43006,
+      48100
+    ],
+    "limit": 2,
+    "top_level": true
+  }
+}

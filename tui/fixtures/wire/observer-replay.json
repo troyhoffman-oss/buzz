@@ -1,0 +1,20 @@
+{
+  "created_at": 1785852720,
+  "event": {
+    "content": "Aunxu7XoWLTlpbu78g3hAl8NKEAtqNLQbviIPCfZNfwNgHwdVPBam4iVr0ooxPiv7jBV7W7uJ1y/XwKm1P/RvtZBTTYbHX1cX7LyL0dG+pbBuzaIx0FrpBuaUNbQ57QLyfauX0c2bt5Ou1PyzlrDkZekWRoNFI/L1SH5ZTAXWu2BpJLZCItZQTp+COAtriavnUw2nXPEymB6s0HPFcR4adlP2w==",
+    "created_at": 1785852720,
+    "id": "c1d26b36a9e2d574c2c9013e81382bebe964a82bd4978189eab671b9142a11e3",
+    "kind": 24200,
+    "pubkey": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
+    "sig": "7388db23a17650227c4f6990c654957d7b2d66b93de5d8fa2a122ef4c0738590b8d54b690260e4d9a5f017a6c9a8da04a78ba0a34de26f6b6aa85078c6c815bf",
+    "tags": [
+      [
+        "agent",
+        "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+      ]
+    ]
+  },
+  "freshness_window_secs": 300,
+  "note": "the same frame, in-window (deduped) and out-of-window (guard 0)",
+  "replayed_at": 1785853021
+}

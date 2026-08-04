@@ -1,0 +1,26 @@
+{
+  "d_tag": "read-state:slot-a",
+  "desktop_blob": {
+    "client_id": "desktop-abc",
+    "contexts": {
+      "11111111-1111-1111-1111-111111111111": 1785852120,
+      "thread:abababababababababababababababababababababababababababababababab": 1785852420
+    },
+    "v": 1
+  },
+  "merged": {
+    "channel": 1785852120,
+    "msg": 1785852720,
+    "thread": 1785852420
+  },
+  "note": "two clients' 30078 blobs; max-wins merge, never last-write-wins",
+  "phone_blob": {
+    "client_id": "phone-def",
+    "contexts": {
+      "11111111-1111-1111-1111-111111111111": 1785851820,
+      "msg:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd": 1785852720
+    },
+    "v": 1
+  },
+  "signed_events": false
+}

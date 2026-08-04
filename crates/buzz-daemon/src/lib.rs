@@ -28,6 +28,7 @@
 //! | [`search`] | 7 — search with always-set `kinds` |
 //! | [`observer`] | 8 — 24200 pipeline + the nine-guard chain |
 //! | [`askcard`] | 9 — ask-card projection |
+//! | [`post`] | posting: visible-pending sends, ask answers ([D-7]) |
 //! | [`fleet`] | 10 — fleet reduction |
 //! | [`presence`] | 11 — 20001 live + 40902 durable, `unknown` ≠ `offline` |
 //! | [`metric`] | 12 — NIP-AM 44200 |
@@ -56,6 +57,7 @@ pub mod mentions;
 pub mod metric;
 pub mod observer;
 pub mod openapi;
+pub mod post;
 pub mod presence;
 pub mod readstate;
 pub mod redact;

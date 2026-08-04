@@ -1,0 +1,40 @@
+{
+  "decoded": {
+    "cache_read": 9120,
+    "cache_write": 340,
+    "context_window": 200000,
+    "cost_usd": 0.41,
+    "delta_reliable": true,
+    "model": "claude-opus-5",
+    "provider_total": null,
+    "stop_reason": "end_turn",
+    "tokens_in": 12480,
+    "tokens_out": 1932
+  },
+  "event": {
+    "content": "AgKPPjXkJRflTQ1mGMohKv8moWsS+JtS+iiPR6x3jtFtUaUwWqwTPozkNuOzr/2/9i0X5CzVI6Nbi9jKCsH5CzSRs/3Y4QCzvNfuUA5kQhyxbmD7tyqzDbP6f+iEsxk5oaLBTNoy3ib9K7gvRgogdTnE0uTvuzkLQ6xUTGue8kl1T/8VB4ocdircC+9YTPGvxrCsJiviORtkrnr/941eOvS26tYiVFNnkwHKqLxSr5H8bJjyVaeA4R8myar5NkuNnxKpbyyafEGoHO1rKJmldNJkkr1HCqo808zvelwusw2QVZF79tt9bjSgeEOUywlMYiqiMNlsH/MZ2bxA4ZOUTiosCHlawm+q5Dm9zJMf7nOSOev5DQsnMkzZu/7AwDNKRASweyQFpVO+LF5yAULNU4JgOmSTOuoBL5uNIWOy5ARCwG+smO2twOnjQ8z5JN1PKZgpMXo/af15YeZoiN8bL0Mv4MJTGJvaZNvdTNmFVdn/9O8t8mQ5Ei+F3UePHaQk2qccEyVad3BlImtp+GTOfpywGvMFKrYa3SdTOz1cm5+YjYEZR0g2PKg/5XQ3GQRLAJ3mHesLUYrtVZ5xzrAxbzPgcw==",
+    "created_at": 1785852720,
+    "id": "18ed2c7a16ba306f02ea8df400759dd1af6bb7d6c948ab0790c8c0025c79b5eb",
+    "kind": 44200,
+    "pubkey": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
+    "sig": "0f9772d4c647d3948ee13c02e23497e2785bae6054adabb1b8f7bca1e3f67f7e70048cf067427ca4644ba919001efb5bf5046b03b494494fe3335f0b6b4156e0",
+    "tags": [
+      [
+        "p",
+        "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f"
+      ]
+    ]
+  },
+  "filter": {
+    "#p": [
+      "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f"
+    ],
+    "authors": [
+      "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+    ],
+    "kinds": [
+      44200
+    ]
+  },
+  "note": "kind:44200 NIP-AM metric — the filter MUST carry #p = self"
+}
