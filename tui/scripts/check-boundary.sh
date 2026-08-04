@@ -86,9 +86,25 @@ scan() {
 
 # 1. No protocol dependency may be declared. The daemon owns NIP-44, bech32,
 #    secp256k1, and every nsec/npub decode; the TUI never sees a key (§2.1).
-for pkg in nostr nostr-tools secp256k1 @noble/secp256k1 bech32 nip44 nip-44 nsecs; do
+PROTOCOL_PKGS='nostr nostr-tools secp256k1 @noble/secp256k1 @noble/curves @scure/base bech32 nip44 nip-44 nsecs'
+for pkg in $PROTOCOL_PKGS; do
   if grep -q "\"$pkg\"" package.json; then
     fail "package.json declares '$pkg': protocol dependencies belong in crates/buzz-daemon (§6.4)"
+  fi
+done
+
+# 1b. …and no module in `src/` may *import* one either. Scanning only
+#     `package.json` is a false negative in the direction that matters: a
+#     transitive dependency, a workspace link, or a hoisted `node_modules`
+#     entry is importable without ever being declared, so `import { getPublicKey }
+#     from "nostr-tools"` passed the manifest check untouched. §6.4 is about what
+#     `tui/src/` *knows*, and an import is exactly that knowledge — the manifest
+#     is only where it usually comes from.
+for pkg in $PROTOCOL_PKGS; do
+  # Match the package root and its subpaths ("nostr-tools/pure"), not a
+  # same-prefixed unrelated package ("nostrich-ui").
+  if scan "from[[:space:]]+['\"\`]${pkg}(/|['\"\`])|require\([[:space:]]*['\"\`]${pkg}(/|['\"\`])|import\([[:space:]]*['\"\`]${pkg}(/|['\"\`])"; then
+    fail "$SRC/ imports '$pkg': protocol dependencies belong in crates/buzz-daemon (§6.4)"
   fi
 done
 
@@ -118,10 +134,19 @@ if scan 'atob\(|Buffer\.from\([^)]*base64|fromBase64|c1\.'; then
   fail "$SRC/ decodes a pagination cursor: cursors are opaque to the front end (§2.4 [D-6])"
 fi
 
-# 4. No `{nsec}` field. §2.5 deleted that form from POST /session/identity; a
-#    regenerated client that grows one is a spec regression, not a convenience.
-if scan '\bnsec\b'; then
-  fail "$SRC/ references a raw nsec: the {nsec} request form does not exist (§2.5)"
+# 4. No `{nsec}` field, and no raw key material of any shape. §2.5 deleted the
+#    `{nsec}` form from POST /session/identity; a regenerated client that grows
+#    one is a spec regression, not a convenience.
+#
+#    The trailing `\b` here used to be a false negative on the single most
+#    important case: `\bnsec\b` does NOT match `nsec1qqq…`, because `nsec` is
+#    followed by `1` — a word character — so there is no boundary. The gate
+#    matched the bare identifier `nsec` while an actual bech32 secret key
+#    literal pasted into `src/` sailed through. Anchor the left edge only, and
+#    cover the encrypted form too, since §2.5 puts `ncryptsec1` in the daemon's
+#    redactor superset for exactly this reason.
+if scan '\b(nsec|ncryptsec)'; then
+  fail "$SRC/ references a raw nsec/ncryptsec: the {nsec} request form does not exist and key material never reaches the front end (§2.5)"
 fi
 
 # 5. No literal hex colour. §3.10 requires a closed semantic token set with the

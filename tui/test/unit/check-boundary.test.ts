@@ -34,6 +34,18 @@ describe("clean source passes", () => {
     expect(result.exitCode).toBe(0);
   });
 
+  test("a same-prefixed unrelated package is not a protocol import", () => {
+    // The import rule must anchor on the package root plus a subpath or quote,
+    // or every future package starting with "nostr" becomes unusable and the
+    // gate becomes something authors route around.
+    expect(
+      runWithProbe(
+        "prefix.ts",
+        'import { Widget } from "nostrich-ui";\nexport const w = Widget;\n',
+      ),
+    ).toBe(0);
+  });
+
   test("ordinary front-end code does not trip the gate", () => {
     // Topic names, small numbers, and a string that merely contains comment
     // characters must all be fine, or the gate is unusable.
@@ -83,6 +95,49 @@ describe("violations are caught", () => {
   test("a raw nsec reference", () => {
     expect(
       runWithProbe("nsec.ts", 'export const body = { nsec: "x" };\n'),
+    ).toBe(1);
+  });
+
+  test("an actual bech32 nsec literal", () => {
+    // Regression, and the worst false negative this gate has had: the rule was
+    // `\bnsec\b`, whose trailing boundary cannot match `nsec1…` — `1` is a word
+    // character. So the gate caught the *identifier* `nsec` while a real
+    // secret-key literal pasted into src/ passed clean, which inverts the
+    // rule's entire purpose.
+    expect(
+      runWithProbe(
+        "literal.ts",
+        'export const k = "nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqq";\n',
+      ),
+    ).toBe(1);
+  });
+
+  test("an ncryptsec literal", () => {
+    // §2.5 puts `ncryptsec1` in the daemon's redactor superset; the encrypted
+    // form has no more business in the front end than the raw one.
+    expect(
+      runWithProbe("encrypted.ts", 'export const k = "ncryptsec1abc";\n'),
+    ).toBe(1);
+  });
+
+  test("a protocol package imported without being declared", () => {
+    // Regression: rule 1 scanned only package.json, so a transitive,
+    // workspace-linked, or hoisted package was importable without ever being
+    // declared. §6.4 is about what src/ *knows*, and an import is exactly that.
+    expect(
+      runWithProbe(
+        "import.ts",
+        'import { getPublicKey } from "nostr-tools";\nexport const p = getPublicKey;\n',
+      ),
+    ).toBe(1);
+  });
+
+  test("a protocol package imported by subpath", () => {
+    expect(
+      runWithProbe(
+        "subpath.ts",
+        'import { schnorr } from "@noble/curves/secp256k1";\nexport const s = schnorr;\n',
+      ),
     ).toBe(1);
   });
 
