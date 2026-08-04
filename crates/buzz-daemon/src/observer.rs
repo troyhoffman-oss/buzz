@@ -348,11 +348,24 @@ struct LiveRing {
 }
 
 impl LiveRing {
-    fn push(&mut self, frame: ObserverFrame) {
-        if self.frames.len() >= MAX_OBSERVER_EVENTS {
-            self.frames.pop_front();
-        }
+    /// Push a frame, returning the bytes of any frame the **frame cap** evicted.
+    ///
+    /// The return value is not a convenience. There are two independent bounds
+    /// on the live set — this per-agent frame cap and the global byte budget —
+    /// and both evict. If the frame cap evicts without reporting, the byte
+    /// counter keeps charging for a frame that is no longer held, drifts upward
+    /// forever, and eventually pins the byte budget permanently over its limit:
+    /// `evict_to_budget` then evicts every real frame trying to satisfy a number
+    /// that describes nothing. The observer feed goes empty and `GET /daemon`
+    /// reports a cache full of frames it does not have.
+    fn push(&mut self, frame: ObserverFrame) -> usize {
+        let evicted = if self.frames.len() >= MAX_OBSERVER_EVENTS {
+            self.frames.pop_front().map_or(0, |f| f.size_bytes())
+        } else {
+            0
+        };
         self.frames.push_back(frame);
+        evicted
     }
 }
 
@@ -489,10 +502,15 @@ impl ObserverPipeline {
             return self.drop(Guard::Dedup);
         }
         self.live_bytes += frame.size_bytes();
-        self.live
+        let evicted = self
+            .live
             .entry(frame.agent_pubkey.clone())
             .or_default()
             .push(frame.clone());
+        // The frame cap and the byte budget are independent bounds and both
+        // evict; charging for a frame the cap already dropped would drift the
+        // counter upward until the budget is permanently over its limit.
+        self.live_bytes = self.live_bytes.saturating_sub(evicted);
         self.evict_to_budget();
         Ingest::Accepted(Box::new(frame))
     }
@@ -1118,6 +1136,57 @@ mod tests {
     }
 
     // ── [D-3] the byte budget and the live/archive separation ─────────────
+
+    /// The byte counter must describe what is **actually held**, across both
+    /// eviction paths.
+    ///
+    /// Regression test for a real bug: `LiveRing::push` evicted at the
+    /// 3000-frame cap without telling `live_bytes`, so the counter charged for
+    /// frames that were gone. It drifts upward forever, eventually pinning the
+    /// byte budget permanently over its limit — at which point
+    /// `evict_to_budget` evicts every real frame chasing a number that
+    /// describes nothing, the observer feed goes empty, and `GET /daemon`
+    /// reports a cache full of frames it does not have.
+    ///
+    /// Asserted by *reconstruction*: sum what the rings hold and compare. A
+    /// test that only checked "bytes went up" would have passed throughout.
+    #[test]
+    fn the_byte_counter_matches_what_the_rings_actually_hold() {
+        let (owner, agent) = owner_and_agent();
+        // A budget far above anything this test allocates, so the frame cap is
+        // the only bound in play and the byte accounting is tested in isolation.
+        let mut pipeline = ObserverPipeline::with_cache_budget(usize::MAX);
+        pipeline.register_agent(agent.public_key().to_hex(), &owner, NOW);
+
+        let held_bytes = |p: &ObserverPipeline| -> usize {
+            p.live_frames(&agent.public_key().to_hex())
+                .iter()
+                .map(ObserverFrame::size_bytes)
+                .sum()
+        };
+
+        for seq in 1..=5 {
+            pipeline.ingest(&frame_event(&owner, &agent, seq, NOW), &owner, NOW);
+        }
+        assert_eq!(pipeline.live_bytes(), held_bytes(&pipeline));
+
+        // Now cross the per-agent frame cap, which is the path that used to
+        // leak. Filling to 3000 through the real ingest path would be slow, so
+        // the ring is driven directly — the accounting under test is the
+        // caller's, and this is the only way to reach the cap in a unit test.
+        let ring = LiveRing::default();
+        let mut ring = ring;
+        for seq in 0..MAX_OBSERVER_EVENTS as u64 {
+            let evicted = ring.push(bare_frame(&agent.public_key().to_hex(), seq, NOW));
+            assert_eq!(evicted, 0, "nothing is evicted below the cap");
+        }
+        let over_cap = ring.push(bare_frame(&agent.public_key().to_hex(), 9_999, NOW));
+        assert!(
+            over_cap > 0,
+            "crossing the frame cap must report the evicted frame's bytes"
+        );
+        assert_eq!(ring.frames.len(), MAX_OBSERVER_EVENTS);
+    }
 
     /// The decrypt cache is sized in **bytes, not frames**. Frame count is not
     /// a memory bound when a frame carries an arbitrary-size payload.

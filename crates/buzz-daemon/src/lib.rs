@@ -65,6 +65,7 @@ pub mod rest;
 pub mod search;
 pub mod session;
 pub mod socket;
+pub mod state;
 pub mod stream;
 pub mod timeline;
 

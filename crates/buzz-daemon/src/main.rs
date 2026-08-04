@@ -53,6 +53,15 @@ struct Cli {
     #[arg(long)]
     passphrase_file: Option<PathBuf>,
 
+    /// Path to the NIP-OA auth tag beside the ncryptsec (§2.5).
+    ///
+    /// A path, not a value: the tag is a *capability* credential rather than a
+    /// secret, but it is identity-bound and part of the socket-path preimage
+    /// (§2.2), so it belongs on disk beside the key rather than on a command
+    /// line that appears in every process listing.
+    #[arg(long)]
+    auth_tag_file: Option<PathBuf>,
+
     /// Idle shutdown window in seconds; `0` disables it. The VPS install (§6.5)
     /// sets `0`, because on the agent host the daemon *is* the always-on
     /// archive (§2.3).
@@ -97,22 +106,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is the §1.3-property-3 failure. A flag that is accepted and ignored
     // creates exactly that appearance, and an operator debugging an empty
     // observer archive would have no way to see it from the outside.
-    for (flag, present) in [
-        ("--identity-ncryptsec", cli.identity_ncryptsec.is_some()),
-        ("--passphrase-stdin", cli.passphrase_stdin),
-        ("--identity-credential", cli.identity_credential.is_some()),
-        ("--passphrase-file", cli.passphrase_file.is_some()),
-        ("--detach", cli.detach),
-    ] {
-        if present {
-            return Err(format!(
-                "{flag} is not implemented yet (DESIGN.md §4.1.1 deliverable 2); \
-                 refusing rather than starting a daemon that looks keyed but archives nothing"
-            )
-            .into());
-        }
-    }
-
     let idle_timeout = match cli.idle_timeout {
         0 => None,
         secs => Some(std::time::Duration::from_secs(secs)),
@@ -121,30 +114,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_dir = buzz_daemon::config::runtime_dir()?;
     let data_dir = buzz_daemon::config::data_dir()?;
 
-    // The identity tuple is resolved from the decrypted key plus the NIP-OA
-    // auth tag; until the identity path of deliverable 2 lands, an explicit
-    // --socket is required so the process has an unambiguous bind target rather
-    // than a guessed one.
-    let socket_path = match cli.socket {
+    // §2.5: the identity is loaded **before** anything binds. A daemon that
+    // bound its socket and then failed to decrypt would advertise itself as
+    // available while archiving nothing — the §1.3-property-3 failure this
+    // whole section exists to prevent — and a client attaching in that window
+    // could not tell it apart from a healthy one.
+    let identity = load_identity(&cli).await?;
+    if identity.is_none() {
+        // Keyless is a supported state (§2.5), but never a *quiet* one: it is
+        // logged at startup and reported as `archiving: false` on every
+        // `/health` for as long as it lasts.
+        tracing::warn!(
+            "starting without an identity: archiving is OFF and observer frames \
+             will not decrypt until POST /session/identity loads a key"
+        );
+    }
+
+    // §2.2: the socket path is derived from (relay, pubkey, auth-tag owner), so
+    // two effective identities never collide onto one socket, one cache, and
+    // one read-state slot. An explicit `--socket` overrides it for the `ssh -L`
+    // forward case of §6.5.
+    let identity_tuple = SocketIdentity::new(
+        cli.relay.clone().unwrap_or_default(),
+        identity
+            .as_ref()
+            .map(|i| i.pubkey.clone())
+            .unwrap_or_default(),
+        identity
+            .as_ref()
+            .and_then(|i| i.auth_tag.as_ref())
+            .map(|t| t.owner_pubkey.clone())
+            .unwrap_or_default(),
+    );
+    let socket_path = match cli.socket.clone() {
         Some(path) => path,
         None => {
-            return Err(
-                "resolving the socket path from the identity requires the Wave-1 identity \
-                 loader (DESIGN.md §4.1.1 deliverable 2); pass --socket explicitly for now"
-                    .into(),
-            )
+            if identity.is_none() {
+                // Deriving a path from an empty preimage would put every
+                // keyless daemon on the *same* socket, which is a collision
+                // that presents as one daemon mysteriously serving another's
+                // cache. Refusing names the two ways out.
+                return Err(
+                    "cannot derive a socket path without an identity; pass \
+                            --identity-ncryptsec with a passphrase source, or --socket explicitly"
+                        .into(),
+                );
+            }
+            buzz_daemon::config::ensure_private_dir(&runtime_dir)?;
+            identity_tuple.socket_path(&runtime_dir)
         }
     };
 
-    let identity_tuple = SocketIdentity::new(
-        cli.relay.clone().unwrap_or_default(),
-        String::new(),
-        String::new(),
-    );
-
     let config = Config {
         identity: identity_tuple,
-        socket: socket_path.clone(),
+        socket: socket_path,
         runtime_dir,
         data_dir,
         idle_timeout,
@@ -159,19 +182,132 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         socket = %config.socket.display(),
         idle_timeout_secs = cli.idle_timeout,
         systemd_managed = config.systemd_managed,
+        archiving = identity.is_some(),
         "buzz-daemon {} (api {})",
         buzz_daemon::VERSION,
         buzz_daemon::API_VERSION,
     );
 
-    // Binding is the one piece of the serve path that is real today: it applies
-    // the 0700-directory and 0600-socket posture of §2.5 and refuses a
+    // Applies the 0700-directory and 0600-socket posture of §2.5, and refuses a
     // group- or world-writable parent (the `ssh -L` hole of §6.5).
-    let _listener = socket::bind(&config.socket)?;
+    let listener = socket::bind(&config.socket)?;
     tracing::info!(uid = socket::daemon_uid(), "socket bound; peercred armed");
 
-    // TODO(wave1): serve `buzz_daemon::api::router()` over this listener with a
-    // per-connection `socket::authorize_peer` gate, run the session layer of
-    // §4.1.1 deliverable 1, and honour the idle timer of §2.2.
-    Err("serve loop is not implemented yet (DESIGN.md §4.1.1 deliverables 1-14)".into())
+    let socket_path = config.socket.clone();
+    let state = buzz_daemon::state::AppState::new(config, identity)?;
+    let app = buzz_daemon::api::router(state.clone());
+
+    // The idle timer keys on **client activity**, not connection presence
+    // (§2.2): a detached tmux pane holding an `/event` stream open is the normal
+    // state, not a live client.
+    let idle_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if idle_state.should_idle_exit().await {
+                tracing::info!("idle timeout elapsed; shutting down");
+                std::process::exit(0);
+            }
+        }
+    });
+
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    });
+    let result = serve.await;
+
+    // Unlink on the way out so the next spawn's liveness probe sees ENOENT
+    // rather than a socket nothing is listening on. §2.3 probes the socket
+    // rather than a pidfile pid precisely because the pid check is a reuse
+    // race — leaving a stale socket behind makes that probe answer wrong.
+    let _ = std::fs::remove_file(&socket_path);
+    result?;
+    Ok(())
+}
+
+/// Load the identity from whichever of §2.5's three intake paths was requested.
+///
+/// Returns `None` when no identity source was given, which is the keyless state
+/// — supported, and visible on `/health`.
+async fn load_identity(
+    cli: &Cli,
+) -> Result<Option<buzz_daemon::identity::Identity>, Box<dyn std::error::Error>> {
+    use buzz_daemon::identity::{CredentialSource, IntakePath};
+
+    let Some(ncryptsec_path) = cli.identity_ncryptsec.clone() else {
+        // A passphrase source with no blob to decrypt is a misconfiguration
+        // that would otherwise start a keyless daemon looking like a keyed one.
+        if cli.passphrase_stdin
+            || cli.identity_credential.is_some()
+            || cli.passphrase_file.is_some()
+        {
+            return Err("a passphrase source was given without --identity-ncryptsec".into());
+        }
+        return Ok(None);
+    };
+
+    // The three paths of §2.5, and no fourth. The passphrase never arrives on
+    // argv and never through the environment.
+    let (path, passphrase) = match (
+        cli.passphrase_stdin,
+        cli.identity_credential.as_ref(),
+        cli.passphrase_file.as_ref(),
+    ) {
+        (true, None, None) => (
+            IntakePath::SpawnStdin { ncryptsec_path },
+            buzz_daemon::identity::read_passphrase_from_stdin()?,
+        ),
+        (false, Some(name), None) => {
+            let source = CredentialSource::SystemdCreds(name.clone());
+            let passphrase = buzz_daemon::identity::read_passphrase_from_credential(&source)?;
+            (
+                IntakePath::Credential {
+                    ncryptsec_path,
+                    source,
+                },
+                passphrase,
+            )
+        }
+        (false, None, Some(file)) => {
+            let source = CredentialSource::File(file.clone());
+            let passphrase = buzz_daemon::identity::read_passphrase_from_credential(&source)?;
+            (
+                IntakePath::Credential {
+                    ncryptsec_path,
+                    source,
+                },
+                passphrase,
+            )
+        }
+        (false, None, None) => {
+            return Err(
+                "--identity-ncryptsec needs a passphrase source: --passphrase-stdin, \
+                        --identity-credential, or --passphrase-file"
+                    .into(),
+            )
+        }
+        // Two sources is ambiguous, and picking one silently would mean an
+        // operator's `--passphrase-file` being ignored in favour of a stdin
+        // that was never written — a hang with no diagnosis.
+        _ => return Err("give exactly one passphrase source".into()),
+    };
+
+    let auth_tag = match cli.auth_tag_file.as_ref() {
+        Some(path) => {
+            buzz_daemon::identity::assert_secret_file_is_private(path)?;
+            Some(std::fs::read_to_string(path)?.trim().to_string())
+        }
+        None => None,
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // The scrypt decrypt runs on `spawn_blocking` inside `load_identity` —
+    // at log-n 18 it is hundreds of milliseconds and ~256 MiB, and on a tokio
+    // worker it would wedge every other socket client for the duration.
+    Ok(Some(
+        buzz_daemon::identity::load_identity(&path, passphrase, auth_tag, now).await?,
+    ))
 }

@@ -19,6 +19,18 @@ pub const MAX_SLOTS: usize = 8;
 /// Maximum tracked contexts across all slots.
 pub const MAX_CONTEXTS: usize = 10_000;
 
+/// Low-water mark the context cap trims down to.
+///
+/// The gap between this and [`MAX_CONTEXTS`] is what makes eviction amortized:
+/// trimming to exactly the cap makes every subsequent `mark` one-over and pays
+/// a full scan-and-sort per read forever. See
+/// [`ReadState::enforce_context_cap`].
+pub const CONTEXT_LOW_WATER: usize = 9_000;
+
+/// How many new contexts must arrive before retrying a cap scan that could not
+/// make progress. See [`ReadState::enforce_context_cap`].
+pub const CAP_RECHECK_STRIDE: usize = 1_000;
+
 /// Horizon after which `msg:` and `thread:` contexts are pruned, in days.
 pub const CONTEXT_HORIZON_DAYS: u32 = 7;
 
@@ -157,6 +169,11 @@ pub struct ReadState {
     slot_id: String,
     /// Whether anything has changed since the last publish, for the debounce.
     dirty: bool,
+    /// Context count at which the next cap scan runs.
+    ///
+    /// Normally [`MAX_CONTEXTS`]; raised when a scan finds nothing evictable, so
+    /// an unevictable frontier does not pay a full scan per mark forever.
+    cap_check_at: usize,
 }
 
 impl ReadState {
@@ -167,6 +184,7 @@ impl ReadState {
             client_id: client_id.into(),
             slot_id: slot_id.into(),
             dirty: false,
+            cap_check_at: MAX_CONTEXTS,
         }
     }
 
@@ -191,6 +209,9 @@ impl ReadState {
                 changed = true;
             }
         }
+        if changed {
+            self.enforce_context_cap();
+        }
         changed
     }
 
@@ -207,6 +228,7 @@ impl ReadState {
         if marker > *slot {
             *slot = marker;
             self.dirty = true;
+            self.enforce_context_cap();
             return true;
         }
         false
@@ -309,17 +331,24 @@ impl ReadState {
         event_keys.sort_by(|a, b| b.1.cmp(a.1));
 
         let mut slots: Vec<ReadStateBlob> = Vec::new();
-        let mut current = self.empty_blob(0);
+        let mut current = self.empty_blob();
+        // Tracked incrementally rather than re-serializing the blob per entry.
+        // The naive form is O(n²) over a map that is allowed to hold 10,000
+        // contexts, and this runs on the publish debounce — a read-state write
+        // that takes seconds of CPU stalls the socket for every other client.
+        let mut current_len = blob_len(&current);
         for (key, marker) in channel_keys.into_iter().chain(event_keys) {
-            let candidate_len = blob_len(&current) + entry_len(key, *marker);
-            if candidate_len > MAX_SLOT_BYTES && !current.contexts.is_empty() {
+            let entry = entry_len(key, *marker);
+            if current_len + entry > MAX_SLOT_BYTES && !current.contexts.is_empty() {
                 slots.push(current);
                 if slots.len() >= MAX_SLOTS {
                     return slots;
                 }
-                current = self.empty_blob(slots.len());
+                current = self.empty_blob();
+                current_len = blob_len(&current);
             }
             current.contexts.insert(key.clone(), *marker);
+            current_len += entry;
         }
         if !current.contexts.is_empty() || slots.is_empty() {
             slots.push(current);
@@ -327,7 +356,71 @@ impl ReadState {
         slots
     }
 
-    fn empty_blob(&self, _index: usize) -> ReadStateBlob {
+    /// Evict the oldest ageing markers once the context cap is exceeded.
+    ///
+    /// [`MAX_CONTEXTS`] is validated on blobs *arriving* from other devices, but
+    /// nothing bounded the local frontier: [`Self::mark`] is called once per
+    /// message read, so on a busy community the map grows without limit between
+    /// horizon prunes and every publish serializes all of it.
+    ///
+    /// Channel markers are **never** evicted, for the same reason
+    /// [`Self::prune`] never ages them out: losing one un-reads a whole channel.
+    /// Only the per-event families are trimmed, oldest first, which is the same
+    /// order the horizon would have taken them in anyway.
+    ///
+    /// # Trim to a low-water mark, not to the cap
+    ///
+    /// Evicting exactly the excess is the obvious form and it is a performance
+    /// trap: at the cap, *every subsequent* `mark` is one over, so each of them
+    /// pays a full scan and sort of 10,000 entries to remove one. `mark` runs
+    /// once per message read on the socket thread, so a user who has read enough
+    /// to reach the cap makes every later read O(n log n) — the daemon gets
+    /// slower the longer it is used, which is the shape of performance bug
+    /// nobody attributes correctly.
+    ///
+    /// Trimming to [`CONTEXT_LOW_WATER`] instead amortizes that scan over the
+    /// thousand marks it takes to climb back, at the cost of holding slightly
+    /// fewer markers than the cap allows. The markers given up are the oldest
+    /// per-event ones, which the 7-day horizon was going to take anyway.
+    /// # And re-arm rather than rescanning when eviction cannot make progress
+    ///
+    /// Channel markers are not evictable, so a frontier whose contexts are
+    /// mostly channels can sit above the cap with nothing to give up. Without a
+    /// re-arm, *every* later `mark` rediscovers that at full scan cost and
+    /// evicts nothing — an unbounded amount of work for zero progress, and the
+    /// worst case is the one where the map is largest. [`Self::cap_check_at`]
+    /// moves to just above the current size whenever a pass cannot reach the
+    /// low-water mark, so the next scan happens only after enough new contexts
+    /// have arrived to be worth one.
+    fn enforce_context_cap(&mut self) {
+        if self.merged.len() < self.cap_check_at {
+            return;
+        }
+        let mut ageing: Vec<(String, u64)> = self
+            .merged
+            .iter()
+            .filter(|(key, _)| is_msg_context(key) || is_thread_context(key))
+            .map(|(key, marker)| (key.clone(), *marker))
+            .collect();
+        ageing.sort_by_key(|(_, marker)| *marker);
+
+        let excess = self.merged.len().saturating_sub(CONTEXT_LOW_WATER);
+        for (key, _) in ageing.into_iter().take(excess) {
+            self.merged.remove(&key);
+        }
+
+        self.cap_check_at = if self.merged.len() > CONTEXT_LOW_WATER {
+            // Could not reach the low-water mark: everything left is
+            // unevictable. Re-arm above the current size so the next scan waits
+            // for a meaningful number of new contexts rather than firing on the
+            // very next mark.
+            self.merged.len() + CAP_RECHECK_STRIDE
+        } else {
+            MAX_CONTEXTS
+        };
+    }
+
+    fn empty_blob(&self) -> ReadStateBlob {
         ReadStateBlob {
             v: 1,
             client_id: self.client_id.clone(),
@@ -766,6 +859,95 @@ mod tests {
             state.mark(&format!("{n:08}-4444-4444-4444-444444444444"), NOW);
         }
         assert!(state.to_slots().len() <= MAX_SLOTS);
+    }
+
+    // ── The context cap ───────────────────────────────────────────────────
+
+    /// The cap bounds the **local** frontier, not just incoming blobs.
+    ///
+    /// `mark` runs once per message read, so without this the map grows without
+    /// limit between horizon prunes and every publish serializes all of it.
+    #[test]
+    fn the_context_cap_bounds_the_local_frontier() {
+        let mut state = state();
+        for n in 0..(MAX_CONTEXTS as u64 + 500) {
+            state.mark(&format!("{MSG_PREFIX}{n:064x}"), NOW + n);
+        }
+        assert!(
+            state.len() <= MAX_CONTEXTS,
+            "the frontier grew to {} contexts",
+            state.len()
+        );
+    }
+
+    /// Eviction takes the **oldest** ageing markers, which is the same order the
+    /// 7-day horizon would have taken them in.
+    #[test]
+    fn the_cap_evicts_the_oldest_ageing_markers_first() {
+        let mut state = state();
+        for n in 0..(MAX_CONTEXTS as u64 + 100) {
+            // Marker value ascends with n, so low n is oldest.
+            state.mark(&format!("{MSG_PREFIX}{n:064x}"), NOW + n);
+        }
+        assert_eq!(
+            state.own_marker(&format!("{MSG_PREFIX}{:064x}", 0)),
+            None,
+            "the oldest marker was evicted"
+        );
+        let newest = MAX_CONTEXTS as u64 + 99;
+        assert!(
+            state
+                .own_marker(&format!("{MSG_PREFIX}{newest:064x}"))
+                .is_some(),
+            "the newest marker survived"
+        );
+    }
+
+    /// **Channel markers are never evicted**, for the same reason the horizon
+    /// never ages them out: losing one un-reads a whole channel.
+    #[test]
+    fn the_cap_never_evicts_a_channel_marker() {
+        let mut state = state();
+        state.mark(CHANNEL, NOW);
+        for n in 0..(MAX_CONTEXTS as u64 + 500) {
+            state.mark(&format!("{MSG_PREFIX}{n:064x}"), NOW + n);
+        }
+        assert_eq!(
+            state.own_marker(CHANNEL),
+            Some(NOW),
+            "a channel marker must survive any amount of per-message churn"
+        );
+    }
+
+    /// An **unevictable** frontier must not pay a full scan per mark forever.
+    ///
+    /// Regression test for a real performance bug: trimming to exactly the cap
+    /// left every subsequent `mark` one-over, and a frontier made of
+    /// non-evictable channel markers rediscovered "nothing to evict" at full
+    /// scan-and-sort cost on every read. The daemon got slower the longer it was
+    /// used, which is the shape of bug nobody attributes correctly.
+    ///
+    /// Asserted as a **time bound**, because that is the actual property: an
+    /// implementation that scanned per mark takes minutes here, and one that
+    /// re-arms takes well under a second.
+    #[test]
+    fn an_unevictable_frontier_does_not_rescan_on_every_mark() {
+        let mut state = state();
+        let start = std::time::Instant::now();
+        // Channel keys only: nothing here is ever evictable.
+        for n in 0..(MAX_CONTEXTS as u64 + 20_000) {
+            state.mark(&format!("{n:08}-5555-5555-5555-555555555555"), NOW);
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "marking past the cap with nothing evictable took {elapsed:?}; \
+             the cap scan is running per mark instead of re-arming"
+        );
+        assert!(
+            state.len() > MAX_CONTEXTS,
+            "and nothing was wrongly evicted"
+        );
     }
 
     /// Slot 0 keeps the configured id, so a restart republishes into the same

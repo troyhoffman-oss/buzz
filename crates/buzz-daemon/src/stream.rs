@@ -181,6 +181,15 @@ pub struct EventStream {
     /// Latest value per coalescing key, so a slow client gets the current value
     /// rather than every intermediate one ([D-5]).
     coalesced: std::collections::BTreeMap<String, StreamFrame>,
+    /// Highest sequence number lost to **capacity eviction**.
+    ///
+    /// Tracked explicitly rather than read off the ring's oldest frame, because
+    /// the two diverge: a coalescing supersede *withdraws* a frame without
+    /// losing anything, which moves the ring's front without moving the floor.
+    /// Deriving the floor from the front would then report a phantom gap and
+    /// reset a client that had missed nothing — turning an ordinary presence
+    /// beat into a full timeline invalidation.
+    floor: u64,
 }
 
 impl Default for EventStream {
@@ -202,6 +211,7 @@ impl EventStream {
             ring: std::collections::VecDeque::with_capacity(capacity.min(1024)),
             capacity,
             coalesced: std::collections::BTreeMap::new(),
+            floor: 0,
         }
     }
 
@@ -213,30 +223,41 @@ impl EventStream {
 
     /// Publish a frame, assigning it a sequence number.
     ///
-    /// Coalescing topics ([D-5]) replace their previous value **in place** and
-    /// keep their original sequence position, so the ring stays monotonic and a
-    /// `?since=` replay does not deliver a presence beat as if it were new.
-    /// Latest-wins is semantically free for these topics precisely because the
-    /// next value supersedes the last.
+    /// Coalescing topics ([D-5]) **supersede** their previous value: the older
+    /// frame is withdrawn from the ring and the new one takes a fresh sequence
+    /// number at the end.
+    ///
+    /// # Why superseding, and not replacing in place
+    ///
+    /// Replacing in place — keeping the old `seq` and swapping the payload —
+    /// looks like the obvious way to keep the ring monotonic, and it is wrong in
+    /// a way that is invisible until it matters. A client that has already read
+    /// past that `seq` is *caught up*, so the replay returns nothing and the new
+    /// value never reaches it. Concretely: an agent goes offline, its
+    /// `presence.update` overwrites a frame the operator's TUI already consumed,
+    /// and the dot stays green forever. That is precisely the
+    /// looks-alive-while-it-is-dead failure §1.3 property 3 forbids, reached by
+    /// way of an optimization.
+    ///
+    /// Superseding gets both halves of what [D-5] actually asks for:
+    ///
+    /// - **Every client learns the latest value**, because it is newer than any
+    ///   cursor.
+    /// - **No client sees the intermediate ones**, because the superseded frame
+    ///   is gone from the ring before the slow client ever reads it. That is
+    ///   what "latest-wins per key" means, and dropping the intermediates is
+    ///   semantically free precisely because the next value supersedes them.
+    ///
+    /// Withdrawing a frame leaves a hole in the ring's sequence numbers. That is
+    /// fine and deliberate: [`Self::replay`] filters on `seq > since` rather
+    /// than counting, and the aged-out detection reads [`Self::floor`], which
+    /// only capacity eviction moves. A hole is not a gap — nothing was lost.
     pub fn publish(&mut self, topic: impl Into<String>, payload: serde_json::Value) -> u64 {
         let topic = topic.into();
         if policy_for(&topic) == DropPolicy::Coalescing {
             if let Some(key) = coalescing_key(&topic, &payload) {
-                if let Some(existing) = self.coalesced.get(&key) {
-                    let seq = existing.seq;
-                    let frame = StreamFrame {
-                        seq,
-                        topic: topic.clone(),
-                        payload: payload.clone(),
-                    };
-                    if let Some(slot) = self.ring.iter_mut().find(|f| f.seq == seq) {
-                        *slot = frame.clone();
-                        self.coalesced.insert(key, frame);
-                        return seq;
-                    }
-                    // The superseded frame has already aged out of the ring, so
-                    // this value is genuinely new to any client still reading.
-                    self.coalesced.remove(&key);
+                if let Some(superseded) = self.coalesced.remove(&key) {
+                    self.ring.retain(|frame| frame.seq != superseded.seq);
                 }
                 let seq = self.next_seq();
                 let frame = StreamFrame {
@@ -261,9 +282,14 @@ impl EventStream {
     fn push(&mut self, frame: StreamFrame) {
         if self.ring.len() >= self.capacity {
             if let Some(evicted) = self.ring.pop_front() {
+                // Capacity eviction is real loss, so it moves the floor: a
+                // client whose cursor is below it has a genuine gap and must
+                // reset. Withdrawal by supersede does **not** move the floor,
+                // because nothing was lost.
+                self.floor = self.floor.max(evicted.seq);
                 // Keep the coalescing index from pointing at a frame the ring
-                // no longer holds; a stale entry there would make `publish`
-                // try to overwrite a sequence number that has aged out.
+                // no longer holds; a stale entry there would make the next
+                // publish try to withdraw a sequence that has already aged out.
                 self.coalesced.retain(|_, held| held.seq != evicted.seq);
             }
         }
@@ -291,20 +317,29 @@ impl EventStream {
         if since > self.next_seq {
             return Replay::Reset;
         }
-        let floor = self.ring.front().map(|f| f.seq);
-        match floor {
-            // `since + 1` is the first frame the client has not seen. If the
-            // ring's oldest frame is newer than that, the gap is real.
-            Some(oldest) if oldest > since + 1 => Replay::Reset,
-            None if since > 0 => Replay::Reset,
-            _ => Replay::Frames(
-                self.ring
-                    .iter()
-                    .filter(|frame| frame.seq > since)
-                    .cloned()
-                    .collect(),
-            ),
+        // `since` below the floor means frames were evicted that the client
+        // never saw — a real gap, and `stream.reset` is the honest answer.
+        // Compared against the **eviction** floor rather than the ring's oldest
+        // frame, so a coalescing supersede (which loses nothing) never presents
+        // as a gap.
+        if since < self.floor {
+            return Replay::Reset;
         }
+        Replay::Frames(
+            self.ring
+                .iter()
+                .filter(|frame| frame.seq > since)
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// The highest sequence number lost to capacity eviction.
+    ///
+    /// A cursor at or above this has missed nothing; below it, the client must
+    /// invalidate and re-fetch (§2.6).
+    pub fn floor(&self) -> u64 {
+        self.floor
     }
 
     /// The newest sequence number issued.
@@ -531,11 +566,10 @@ mod tests {
         assert_eq!(stream.len(), 2);
     }
 
-    /// A superseded value replaces its predecessor **in place**, so the ring
-    /// stays monotonic and a slow client sees the current value rather than
-    /// every intermediate one.
+    /// A superseded value **withdraws** its predecessor and takes a fresh
+    /// sequence at the end: one frame in the ring, carrying the latest value.
     #[test]
-    fn a_coalesced_topic_replaces_its_previous_value_in_place() {
+    fn a_coalesced_topic_supersedes_its_previous_value() {
         let mut stream = EventStream::new();
         let first = stream.publish(
             "presence.update",
@@ -545,13 +579,75 @@ mod tests {
             "presence.update",
             serde_json::json!({"pubkey": "agent-a", "state": "away"}),
         );
-        assert_eq!(first, second, "the same key keeps its sequence position");
-        assert_eq!(stream.len(), 1);
+        assert!(second > first, "the newer value gets a newer sequence");
+        assert_eq!(stream.len(), 1, "and the older one is gone from the ring");
 
         let Replay::Frames(frames) = stream.replay(0) else {
             panic!()
         };
+        assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].payload["state"], serde_json::json!("away"));
+    }
+
+    /// **The bug this design exists to prevent.**
+    ///
+    /// Replacing in place — keeping the old `seq` and swapping the payload —
+    /// is the obvious optimization and it silently strands every caught-up
+    /// client: the replay returns nothing because the client is already past
+    /// that sequence. An agent goes offline and the operator's dot stays green
+    /// forever, which is the looks-alive-while-it-is-dead failure §1.3 property
+    /// 3 forbids, reached by way of an optimization.
+    #[test]
+    fn a_superseding_value_reaches_a_client_that_was_already_caught_up() {
+        let mut stream = EventStream::new();
+        let seq = stream.publish(
+            "presence.update",
+            serde_json::json!({"pubkey": "agent-a", "state": "present"}),
+        );
+        // The client reads to here and is caught up.
+        assert_eq!(stream.replay(seq), Replay::Frames(Vec::new()));
+
+        stream.publish(
+            "presence.update",
+            serde_json::json!({"pubkey": "agent-a", "state": "offline"}),
+        );
+
+        let Replay::Frames(frames) = stream.replay(seq) else {
+            panic!("nothing was lost, so this must not be a reset");
+        };
+        assert_eq!(
+            frames.len(),
+            1,
+            "the caught-up client must learn the agent went offline"
+        );
+        assert_eq!(frames[0].payload["state"], serde_json::json!("offline"));
+    }
+
+    /// Withdrawal leaves a hole in the sequence, and a hole is **not** a gap:
+    /// nothing was lost, so a client spanning it must not be reset.
+    #[test]
+    fn a_withdrawn_sequence_is_a_hole_not_a_gap() {
+        let mut stream = EventStream::new();
+        let coalesced = stream.publish(
+            "presence.update",
+            serde_json::json!({"pubkey": "agent-a", "state": "present"}),
+        );
+        stream.publish("message.new", message(1));
+        // Supersede the first frame, leaving `coalesced` withdrawn.
+        stream.publish(
+            "presence.update",
+            serde_json::json!({"pubkey": "agent-a", "state": "away"}),
+        );
+
+        assert_eq!(stream.floor(), 0, "no capacity eviction happened");
+        let Replay::Frames(frames) = stream.replay(coalesced - 1) else {
+            panic!("a hole must not present as an aged-out cursor");
+        };
+        assert_eq!(
+            frames.len(),
+            2,
+            "the message and the current presence value"
+        );
     }
 
     /// Durable topics are never coalesced — two messages are two messages, even
@@ -576,24 +672,38 @@ mod tests {
     }
 
     /// Typing keys on (channel, pubkey): the same person typing in two channels
-    /// is two facts.
+    /// is two facts, and both survive. A repeat in one channel supersedes only
+    /// that channel's frame.
     #[test]
     fn typing_keys_on_channel_and_pubkey_together() {
         let mut stream = EventStream::new();
-        let a = stream.publish(
+        stream.publish(
             "typing.start",
             serde_json::json!({"channel_id": "chan-1", "pubkey": "matt"}),
         );
-        let b = stream.publish(
+        stream.publish(
             "typing.start",
             serde_json::json!({"channel_id": "chan-2", "pubkey": "matt"}),
         );
-        let repeat = stream.publish(
+        assert_eq!(stream.len(), 2, "two channels are two keys");
+
+        stream.publish(
             "typing.start",
             serde_json::json!({"channel_id": "chan-1", "pubkey": "matt"}),
         );
-        assert_ne!(a, b);
-        assert_eq!(a, repeat);
+        assert_eq!(
+            stream.len(),
+            2,
+            "the repeat superseded chan-1's frame and left chan-2's alone"
+        );
+        let Replay::Frames(frames) = stream.replay(0) else {
+            panic!()
+        };
+        let channels: std::collections::BTreeSet<&str> = frames
+            .iter()
+            .filter_map(|f| f.payload["channel_id"].as_str())
+            .collect();
+        assert_eq!(channels, ["chan-1", "chan-2"].into_iter().collect());
     }
 
     /// Once a coalesced frame ages out of the ring, the next value for that key

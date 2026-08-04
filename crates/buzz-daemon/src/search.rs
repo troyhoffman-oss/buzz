@@ -35,13 +35,10 @@ pub const SEARCH_DEBOUNCE_MS: u64 = 150;
 
 /// Parsed Slack-style search operators (§3.5).
 ///
-/// TODO(wave1, §4.1.1 deliverable 7): parse identically to the desktop's
-/// `parseSearchOperators.ts`. Operators must start at a **token boundary** —
-/// deliberately not `\b`, so `built-in:react` and `https://x.com/in:foo` are not
-/// misparsed. `after:` is local start-of-day inclusive; `before:` is one second
-/// before local start-of-day, because NIP-01 `until` is inclusive and Slack
-/// excludes the named day. An invalid operator value stays in the FTS text
-/// rather than erroring.
+/// Produced by [`parse_operators`], which ports `parseSearchOperators.ts`
+/// including its three load-bearing rules — the token-boundary anchor, the
+/// inclusive local start-of-day, and the one-second step-back. See that
+/// function for why each one matters.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SearchQuery {
     /// Residual free text after operators are lifted out.
