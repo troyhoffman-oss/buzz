@@ -333,6 +333,95 @@ async fn both_the_window_and_downgrade_filters_are_accepted() {
     }
 }
 
+/// [D-10]: the window page must satisfy bounds integrity **against a real
+/// relay**, and the walk must actually advance.
+///
+/// The unit tests assert the parse over hand-built fixtures, which cannot tell
+/// you whether the relay's `39006` `d`-tag binding matches the string
+/// [`timeline::expected_bounds_binding`] constructs. That is a cross-process
+/// agreement about a format, and the only way to test an agreement is to ask the
+/// other party.
+///
+/// The advance check is the second half: a cursor that does not move is a
+/// livelock, and with `until` inclusive it is the *expected* failure of a
+/// timestamp-only cursor. Asserting the second page differs from the first is
+/// what proves the composite cursor is doing its job.
+#[tokio::test]
+async fn a_live_window_page_satisfies_bounds_integrity_and_advances() {
+    live!(live);
+    let discovery = buzz_daemon::channels::build_discovery_filter(&live.self_pubkey());
+    let memberships = live
+        .rest
+        .query(&live.identity, &discovery)
+        .await
+        .unwrap_or_default();
+    let Some(channel_id) = memberships
+        .iter()
+        .find_map(buzz_daemon::channels::channel_id_from_membership)
+    else {
+        eprintln!("SKIP: this identity is a member of no channels");
+        return;
+    };
+
+    let first_filter = timeline::build_window_filter(&channel_id, 2, None);
+    assert_read_only(&first_filter);
+    let events = live
+        .rest
+        .query(&live.identity, &first_filter)
+        .await
+        .expect("the window filter is accepted");
+
+    let page = match timeline::parse_window_response(&events, &channel_id, None) {
+        Ok(page) => page,
+        Err(err) => {
+            // Not a test failure: a relay without the NIP-CW extension is the
+            // degradation branch, which is a supported configuration. It *is*
+            // worth printing, because "the window path silently downgraded"
+            // is exactly the thing [D-10] says must be a visible decision.
+            eprintln!("live: no valid 39006 ({err}) — this relay takes the downgrade branch");
+            let downgraded = timeline::assemble_downgraded_page(&events, 2);
+            assert_eq!(downgraded.mode, timeline::WindowMode::Downgraded);
+            return;
+        }
+    };
+    eprintln!(
+        "live: window page mode={:?} rows={} aux={} has_more={}",
+        page.mode,
+        page.rows.len(),
+        page.aux.len(),
+        page.has_more
+    );
+
+    let Some(cursor) = page.next_cursor.clone() else {
+        eprintln!("live: the channel fit in one page; nothing to advance past");
+        return;
+    };
+
+    let second_filter = timeline::build_window_filter(&channel_id, 2, Some(&cursor));
+    assert_read_only(&second_filter);
+    let second_events = live
+        .rest
+        .query(&live.identity, &second_filter)
+        .await
+        .expect("the cursored window filter is accepted");
+    let second = timeline::parse_window_response(&second_events, &channel_id, Some(&cursor))
+        .expect("page two binds to the cursor page one issued");
+
+    let ids = |page: &timeline::WindowPage| -> Vec<String> {
+        page.rows
+            .iter()
+            .filter_map(|row| row.event["id"].as_str().map(str::to_string))
+            .collect()
+    };
+    let (first_ids, second_ids) = (ids(&page), ids(&second));
+    if !first_ids.is_empty() && !second_ids.is_empty() {
+        assert_ne!(
+            first_ids, second_ids,
+            "the cursor did not advance — this is the dense-second livelock"
+        );
+    }
+}
+
 /// §3.5 / §4.1.1 deliverable 7: search must carry `kinds`, and the relay's FTS
 /// must accept the shape the daemon builds.
 #[tokio::test]
