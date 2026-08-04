@@ -106,13 +106,16 @@ function parseDay(value: string): number | null {
   return Number.isNaN(ms) ? null : ms;
 }
 
-/**
- * The debounce for search-as-you-type (§3.5).
- *
- * > **Search-as-you-type, debounced 150 ms.** The debounce protects the relay's
- * > FTS, not just the render loop.
- */
-export const SEARCH_DEBOUNCE_MS = 150;
+// §3.5's 150 ms search-as-you-type debounce is deliberately **not** here yet.
+//
+// > The debounce protects the relay's FTS, not just the render loop.
+//
+// That is a property of the *daemon round-trip*, and `localSearch` below has
+// none: it filters an in-memory snapshot, so a debounce would add latency to
+// every keystroke and protect nothing. The constant belongs with the
+// `GET /search` call when it lands, where it can be tested against a request
+// count. Declaring it now would be a number with no behaviour behind it — the
+// shape of dead code most likely to be trusted later.
 
 /**
  * Render the L1 RESULTS list.

@@ -24,6 +24,8 @@ import { type AppState, initialState } from "../app/state";
 import type { DaemonClient } from "../client/daemon-client";
 import { type KeyPress, resolveKey } from "../nav/keys";
 import { current } from "../nav/layers";
+import { resolveTheme } from "../theme/theme";
+import { color } from "../theme/tokens";
 
 /** Props for {@link Shell}. */
 export interface ShellProps {
@@ -161,9 +163,36 @@ export function Shell(props: ShellProps) {
     renderScreen(state(), dimensions().width, dimensions().height, clock()),
   );
 
+  // §3.10: "pre-compute styles once at startup." The theme is resolved from
+  // the environment a single time rather than per frame — it cannot change
+  // without a relaunch, and re-reading `process.env` on every render would put
+  // an environment lookup in the hot path of a streaming chat surface.
+  const theme = resolveTheme();
+  const fg = color(theme, "text");
+  const bg = color(theme, "background");
+
+  // TODO(wave1, §3.10): only the base pair is applied. Per-token colouring —
+  // the [G12] ladder's state tones, `diff*` on diff rows, the deterministic
+  // per-user hue, the per-community accent — needs the renderers to emit
+  // *spans* rather than plain strings, which is a change to the `string[]`
+  // contract `renderScreen` and the whole T1 matrix are built on. Doing it
+  // half-way (colouring only what is easy to reach from here) would leave the
+  // token set looking applied while most of §3.10's disciplines were not, so
+  // it lands as one change with its own snapshot pass rather than as a
+  // sprinkle. `NO_COLOR` and `TERM=dumb` are honoured today because `color()`
+  // returns `undefined` and OpenTUI inherits the terminal's own colours.
   return (
-    <box style={{ flexDirection: "column", width: "100%", height: "100%" }}>
-      <For each={lines()}>{(line) => <text>{line}</text>}</For>
+    <box
+      style={{
+        flexDirection: "column",
+        width: "100%",
+        height: "100%",
+        ...(bg !== undefined ? { backgroundColor: bg } : {}),
+      }}
+    >
+      <For each={lines()}>
+        {(line) => <text style={fg !== undefined ? { fg } : {}}>{line}</text>}
+      </For>
     </box>
   );
 }

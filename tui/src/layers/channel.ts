@@ -135,13 +135,7 @@ export function threadTarget(message: Message): Layer {
  */
 const THREAD_CRUMB_COLS = 24;
 
-/**
- * The channel's scope label for the statusline and crumb.
- *
- * Exported so the shell has one source for it: a crumb that reads
- * `#engineering` while the statusline reads `engineering` is the kind of
- * inconsistency that makes a spine feel assembled rather than designed.
- */
-export function channelScope(layer: Layer): string {
-  return layer.crumb;
-}
+// `channelScope(layer) => layer.crumb` used to live here, "so the shell has one
+// source" for the label. It never had a second caller: `screen.ts` reads
+// `layer.crumb` for both the breadcrumb and the statusline scope, so the crumb
+// *is* the single source and the wrapper only added a name to look through.

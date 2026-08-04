@@ -1,24 +1,15 @@
 {
   "answer_content_for_option_1": "1",
   "answer_tags": [
-    [
-      "h",
-      "11111111-1111-1111-1111-111111111111"
-    ],
+    ["h", "11111111-1111-1111-1111-111111111111"],
     [
       "e",
       "095eabdd2aa08545bcc3edc3e2adf2cd678652a185118cb7002b7e8ba7fc0e9d",
       "",
       "root"
     ],
-    [
-      "p",
-      "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
-    ],
-    [
-      "broadcast",
-      "1"
-    ]
+    ["p", "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"],
+    ["broadcast", "1"]
   ],
   "event": {
     "content": "Which database for the cache?\n1. Postgres\n2. SQLite",
@@ -28,10 +19,7 @@
     "pubkey": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
     "sig": "5e3effd6a44c0d3320dd9e58a34c34629a4313113659f420c777d44215ccdcb5d48f6e00f3a678587b9c3bdfaf4bf15fe147fa4edd0ed31749d0e40d439289d5",
     "tags": [
-      [
-        "h",
-        "11111111-1111-1111-1111-111111111111"
-      ],
+      ["h", "11111111-1111-1111-1111-111111111111"],
       [
         "ask",
         "{\"allowFreeText\":false,\"index\":0,\"multiSelect\":false,\"options\":[{\"description\":\"already a dependency\",\"label\":\"Postgres\"},{\"description\":\"no server to run\",\"label\":\"SQLite\"}],\"question\":\"Which database for the cache?\",\"total\":1,\"v\":1}"

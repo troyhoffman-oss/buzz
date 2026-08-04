@@ -24,7 +24,6 @@
  */
 
 import { RULE_ROWS, renderComposer, rule, topRule } from "../render/bands";
-import { STATUSLINE_ROWS } from "../render/statusline";
 import { pad } from "../render/width";
 
 /** The bottom region: what occupies the rows below the top rule. */
@@ -137,5 +136,7 @@ export function renderFrame(input: FrameInput): string[] {
   return out.length <= rows ? out : out.slice(out.length - rows);
 }
 
-/** Rows the fixed bands occupy when the composer is showing. */
-export const COMPOSER_BAND_ROWS = RULE_ROWS + 1 + RULE_ROWS + STATUSLINE_ROWS;
+// A `COMPOSER_BAND_ROWS` constant used to live here. It had no callers and
+// could not gain one honestly: `renderFrame` derives its overhead from the
+// bottom band it actually built, which is the only correct source once the
+// drawer and message-select can replace that band with a different height.

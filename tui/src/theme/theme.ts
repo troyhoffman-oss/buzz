@@ -58,9 +58,9 @@ export function resolveTheme(
   return { mode, palette: PALETTES[mode], colorless: isColorless(env) };
 }
 
-/** A theme with colour forced off, for `NO_COLOR` snapshots and T1 defaults. */
-export function colorlessTheme(mode: ThemeMode = "dark"): Theme {
-  return { mode, palette: PALETTES[mode], colorless: true };
-}
+// A `colorlessTheme()` helper used to live here "for NO_COLOR snapshots".
+// Nothing called it: `resolveTheme({ NO_COLOR: "1" })` is the same thing said
+// through the real code path, so the tests exercise the resolution the product
+// uses rather than a parallel constructor that could drift from it.
 
 export type { Palette, Theme, ThemeMode, TokenName };

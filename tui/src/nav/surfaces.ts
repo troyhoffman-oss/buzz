@@ -79,11 +79,6 @@ export function unregister(set: SurfaceSet, kind: SurfaceKind): SurfaceSet {
   return next;
 }
 
-/** How many surfaces are registered — the §5.3 counter itself. */
-export function surfaceCount(set: SurfaceSet): number {
-  return set.size;
-}
-
 /** The surface tier 2 would close, or `null` when none is registered. */
 export function topmostSurface(set: SurfaceSet): SurfaceKind | null {
   for (const kind of TIER_TWO_ORDER) if (set.has(kind)) return kind;
@@ -116,14 +111,8 @@ export function resolveEscape(set: SurfaceSet): EscapeResolution {
   return { tier: 3, action: "markChannelRead" };
 }
 
-/**
- * Whether `Esc` at tier 3 is currently gated (§5.4).
- *
- * Exposed separately from {@link resolveEscape} because the statusline needs to
- * know whether the mark-read affordance is live *before* the key is pressed —
- * an advertised action that will not fire is the §3.4.1 "actionable-looking
- * control that cannot act" failure, applied to a hint row.
- */
-export function isMarkReadGated(set: SurfaceSet): boolean {
-  return set.size > 0;
-}
+// An `isMarkReadGated()` predicate used to live here, so "the statusline could
+// know whether the mark-read affordance is live before the key is pressed".
+// The statusline never advertises `Esc` — §2.1 row 3 advertises the arrows —
+// so the predicate had no reader. It returns when a hint row actually names
+// `Esc`, and then it will have the call site that justifies it.
