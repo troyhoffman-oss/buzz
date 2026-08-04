@@ -35,6 +35,27 @@ tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 
+# HTTP client for the relay's NIP-98 bridge (`POST /query`, `/count`,
+# `/events`). Mirrors `buzz-cli/src/client.rs`'s composition verbatim; see
+# `crate::session::RestClient`.
+reqwest = { workspace = true, features = ["json"] }
+bytes = "1"
+
+# `GET /event` is an ndjson/SSE body built from a broadcast receiver; axum wants
+# a `Stream`, and `BroadcastStream` is the adapter (§4.1.1 deliverable 13).
+futures-util = { workspace = true }
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# SQLite cache at `~/.local/share/buzz/<hash>/cache.db`, `0600` (§4.1.1
+# deliverable 3). `sqlx` is already the workspace's database crate and
+# `sqlx-sqlite` is already in `Cargo.lock` via the workspace resolve, so this
+# adds no new dependency cone — only a feature already being built.
+sqlx = { workspace = true, features = ["sqlite"] }
+
+# Byte-budgeted LRU for the decrypted-frame cache ([D-3]). The budget is in
+# bytes, not frames, so the eviction order has to be explicit.
+lru = "0.16"
+
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
