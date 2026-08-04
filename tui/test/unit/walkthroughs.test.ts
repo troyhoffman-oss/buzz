@@ -57,19 +57,27 @@ describe("§4.1 — enter a channel and reply", () => {
     s.type("ack");
     expect(s.state.composer).toBe("ack");
     s.key("return");
-    // The composer clears and an effect is queued for the *channel*, not a
+    // The composer clears and an effect is *delivered* for the channel, not a
     // descent into a thread.
+    //
+    // Asserted on the drained effect rather than on `state.pending`: `pending`
+    // is the reducer's intermediate, and the shell now clears it as it hands
+    // the effect over. Asserting on the intermediate would pass whether or not
+    // anyone drains it — which is how the missing drain went unnoticed.
     expect(s.state.composer).toBe("");
-    expect(s.state.pending).toEqual({
-      kind: "send",
-      channelId: "ch_engineering",
-      content: "ack",
-      // [D-2]: mentions are resolved pubkeys accumulated at pick time. An
-      // unmentioned message carries an empty list, never an absent field —
-      // the daemon's `extract_at_mentions_with_known` fallback exists for
-      // `curl` and second clients, and the TUI must not use it.
-      mentions: [],
-    });
+    expect(s.state.pending).toBeNull();
+    expect(s.effects).toEqual([
+      {
+        kind: "send",
+        channelId: "ch_engineering",
+        content: "ack",
+        // [D-2]: mentions are resolved pubkeys accumulated at pick time. An
+        // unmentioned message carries an empty list, never an absent field —
+        // the daemon's `extract_at_mentions_with_known` fallback exists for
+        // `curl` and second clients, and the TUI must not use it.
+        mentions: [],
+      },
+    ]);
     expect(s.layer()).toBe("channel");
   });
 });
@@ -433,6 +441,52 @@ describe("cross-cutting invariants", () => {
     // "Enter enters the highlighted channel. No post-in-place."
     expect(s.layer()).toBe("channel");
     expect(s.state.pending).toBeNull();
+    expect(s.effects).toHaveLength(0);
     expect(s.crumb()).toBe("home › channels › #buzz-dev");
+  });
+
+  /**
+   * The write path is only real if something **drains** the effect.
+   *
+   * This was a live bug: `dispatch.ts` set `pending` and nothing consumed it,
+   * so `⏎` cleared the composer and the message vanished — no error, no log.
+   * The clear is the visible half, which is why it looked like it worked.
+   *
+   * Asserting on `effects` rather than on `pending` is the point: `pending` is
+   * an intermediate that a reducer test can see whether or not a caller drains
+   * it, so a test written against it would have passed throughout the bug.
+   */
+  test("⏎ with composer text emits a send effect for the drain to perform", () => {
+    const s = Session.open("seeded-basic");
+    s.goTo("Channels").key("right").key("right");
+    s.type("ship it");
+    expect(s.state.composer).toBe("ship it");
+
+    s.key("return");
+
+    expect(s.effects).toHaveLength(1);
+    const effect = s.effects[0];
+    if (effect?.kind !== "send") throw new Error("expected a send effect");
+    expect(effect.content).toBe("ship it");
+    expect(effect.channelId).toBeTruthy();
+    // The composer clears — but only *alongside* the effect, never instead of
+    // it. That pairing is the whole assertion.
+    expect(s.state.composer).toBe("");
+    expect(s.state.pending).toBeNull();
+  });
+
+  /** A reply carries `replyTo`, so a thread post does not land in the channel. */
+  test("⏎ in a thread sends with replyTo set to the thread root", () => {
+    const s = Session.open("seeded-basic");
+    s.key("right").key("up").key("up", { shift: true }).key("right");
+    expect(s.layer()).toBe("thread");
+
+    s.type("acked");
+    s.key("return");
+
+    const effect = s.effects.at(-1);
+    if (effect?.kind !== "send") throw new Error("expected a send effect");
+    expect(effect.content).toBe("acked");
+    expect(effect.replyTo).toBeTruthy();
   });
 });

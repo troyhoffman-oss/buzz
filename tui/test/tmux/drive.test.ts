@@ -297,4 +297,31 @@ describe("§5.5 real-PTY sequences", () => {
     // "a keyless daemon must never look identical to a healthy one."
     expect(await p.waitFor("buzz://")).toContain("keyless");
   }, 30_000);
+
+  /**
+   * `⏎` actually sends — the end-to-end write path through the real Shell.
+   *
+   * This case exists because the write path was dead and looked alive. The
+   * reducer set `pending` and nothing drained it, so `⏎` cleared the composer
+   * — the visible half — and the message was silently dropped. Every unit test
+   * passed, because they asserted on `state.pending`, which is set either way.
+   *
+   * Only a driven app can catch that, and the assertion has to be *the message
+   * appears in the timeline*: "the composer cleared" is exactly what the bug
+   * also produced.
+   */
+  test("⏎ sends and the message lands in the timeline", async () => {
+    const p = await open();
+    p.send("Right");
+    await p.waitFor("#engineering");
+
+    p.type("shipped from a real pty");
+    await p.waitFor("shipped from a real pty");
+
+    p.send("Enter");
+    // The composer resets to its placeholder...
+    const after = await p.waitFor("message #engineering");
+    // ...*and* the text is in the timeline. Both halves, or it is the bug.
+    expect(after).toContain("shipped from a real pty");
+  }, 30_000);
 });

@@ -10,7 +10,12 @@
 
 import { applyIntent, withDefaultSelection } from "../../src/app/dispatch";
 import { renderScreen, rowContext } from "../../src/app/screen";
-import { type AppState, initialState } from "../../src/app/state";
+import {
+  type AppState,
+  type PendingEffect,
+  initialState,
+  takeEffect,
+} from "../../src/app/state";
 import { FixtureClient } from "../../src/client/fixture-client";
 import { type KeyPress, resolveKey } from "../../src/nav/keys";
 import { breadcrumb, current } from "../../src/nav/layers";
@@ -62,9 +67,28 @@ export class Session {
       },
       key,
     );
-    this.state = applyIntent(this.state, intent, this.cols, FIXED_NOW);
+    const next = applyIntent(this.state, intent, this.cols, FIXED_NOW);
+    // **Drain effects exactly as `Shell.tsx` does.** A harness that leaves
+    // `pending` set is not driving the app, it is driving the reducer: the
+    // whole write path (`⏎` to send, `markRead`) can be dead and every
+    // walkthrough here still passes, because the reducer's half — clearing the
+    // composer — is the visible half. That is precisely how the missing
+    // `takeEffect` call in the Shell survived 374 green tests.
+    const [effect, cleared] = takeEffect(next);
+    this.state = cleared;
+    if (effect) this.effects.push(effect);
     return this;
   }
+
+  /**
+   * Effects the reducer emitted, in order — what the Shell would have sent.
+   *
+   * Recorded rather than performed: the fixture client's `send` is async and a
+   * synchronous `press()` cannot await it, and asserting on the *decision* is
+   * the stronger test anyway ([D-2]'s "what you picked is what gets tagged" is
+   * a property of this array, not of the daemon's reply).
+   */
+  readonly effects: PendingEffect[] = [];
 
   /** Press a named key with no modifiers. */
   key(name: string, modifiers: Omit<KeyPress, "name"> = {}): this {

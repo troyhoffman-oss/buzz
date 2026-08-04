@@ -268,13 +268,16 @@ describe("§2.5 the band is a different surface class from the drawer", () => {
   test("the send carries the resolved pubkeys", () => {
     const s = composing("hey @c");
     s.key("return").type("ping").key("return");
-    expect(s.state.pending).toMatchObject({
+    // The *drained* effect, not `state.pending`: the shell clears the slot as
+    // it hands the effect over, and [D-2]'s guarantee is about what reaches
+    // the daemon rather than about what the reducer briefly held.
+    const effect = s.effects.at(-1);
+    expect(effect).toMatchObject({
       kind: "send",
       channelId: "ch_engineering",
       content: "hey @claude-1 ping",
     });
-    const pending = s.state.pending;
-    if (pending?.kind !== "send") throw new Error("expected a send");
-    expect(pending.mentions).toHaveLength(1);
+    if (effect?.kind !== "send") throw new Error("expected a send");
+    expect(effect.mentions).toHaveLength(1);
   });
 });

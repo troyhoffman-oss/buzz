@@ -20,7 +20,7 @@ import { useKeyboard, useTerminalDimensions } from "@opentui/solid";
 import { For, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { applyIntent, withDefaultSelection } from "../app/dispatch";
 import { renderScreen, rowContext } from "../app/screen";
-import { type AppState, initialState } from "../app/state";
+import { type AppState, initialState, takeEffect } from "../app/state";
 import type { DaemonClient } from "../client/daemon-client";
 import { type KeyPress, resolveKey } from "../nav/keys";
 import { current } from "../nav/layers";
@@ -156,8 +156,63 @@ export function Shell(props: ShellProps) {
       press,
     );
 
-    setState((s) => applyIntent(s, intent, dimensions().width, clock()));
+    // The reducer decides on effects but cannot perform them — it is pure. The
+    // shell is the drain, and it is the **only** drain: `takeEffect` clears the
+    // slot as it hands the effect over, so a subsequent keystroke cannot
+    // re-send the same message.
+    //
+    // Without this the whole write path is dead in a way that reads as working:
+    // `⏎` clears the composer (the reducer did that part), so the keystroke
+    // *looks* accepted, and the message is simply gone. Nothing errors and
+    // nothing is logged — the exact §1.3-property-3 failure the rest of this
+    // design works to prevent, reached through the one place effects leave the
+    // pure core.
+    let effect: ReturnType<typeof takeEffect>[0] = null;
+    setState((s) => {
+      const next = applyIntent(s, intent, dimensions().width, clock());
+      const [drained, cleared] = takeEffect(next);
+      effect = drained;
+      return cleared;
+    });
+    if (effect) void perform(effect);
   });
+
+  /**
+   * Perform a drained effect against the daemon.
+   *
+   * Deliberately fire-and-forget from the key handler's perspective: the daemon
+   * is authoritative and every screen re-reads the snapshot on the next stream
+   * frame, so the sent message arrives back through the same path a message
+   * from anyone else does. Optimistically inserting it here would be a second
+   * state machine to keep in agreement with that one, and [D-7]'s
+   * provisional-id correlation is the daemon's job.
+   */
+  async function perform(
+    effect: NonNullable<ReturnType<typeof takeEffect>[0]>,
+  ) {
+    switch (effect.kind) {
+      case "send":
+        await props.client.send(effect.channelId, effect.content, {
+          ...(effect.replyTo ? { replyTo: effect.replyTo } : {}),
+          mentions: effect.mentions,
+        });
+        return;
+      case "markRead":
+        await props.client.markRead(effect.channelId);
+        return;
+      case "markAllRead":
+        // `markAllRead` is a fan-out over every channel that has unread, which
+        // the four-method client expresses as one `markRead` each rather than
+        // as a fifth method. Reading the channel list here rather than in the
+        // reducer keeps the effect a description of intent, not of traffic.
+        await Promise.all(
+          state()
+            .snapshot.channels.filter((channel) => channel.unread > 0)
+            .map((channel) => props.client.markRead(channel.id)),
+        );
+        return;
+    }
+  }
 
   const lines = createMemo(() =>
     renderScreen(state(), dimensions().width, dimensions().height, clock()),
