@@ -157,6 +157,39 @@ export function channelRows(state: AppState): ChannelRow[] {
   return buildChannelRows(state.snapshot.channels, state.composer);
 }
 
+/**
+ * The current search's hits — DESIGN §3.5, NAVIGATION §7.
+ *
+ * Exported so the renderer and the `→` teleport derive them from the same
+ * (query, snapshot) pair. Two derivations would let the row you are looking at
+ * and the row you land on diverge, which on a teleport is the worst kind of
+ * navigation bug: silent, and only reproducible against a specific corpus.
+ *
+ * The composer **is** the query while you are on the results layer — §3.5's
+ * search-as-you-type. `layer.query` is only the seed a deep link or a
+ * `ctrl+k`-with-selection arrives with, so it is used when the composer is
+ * empty and overridden the moment you type. Reading `layer.query ?? composer`
+ * instead would never reach the composer at all, because the layer is created
+ * carrying `query: ""` — a real bug that renders every message in the community
+ * as a "result".
+ *
+ * An empty query returns **nothing**, not everything: a result list showing
+ * every message you have is not a search, and it would make `→` teleport to
+ * whatever sorted first.
+ */
+export function searchQuery(state: AppState): string {
+  const layer = current(state.stack);
+  return state.composer.length > 0 ? state.composer : (layer.query ?? "");
+}
+
+export function searchHits(state: AppState) {
+  const query = searchQuery(state);
+  if (query.trim().length === 0) return [];
+  const names = new Map(state.snapshot.channels.map((c) => [c.id, c.name]));
+  const all = Object.values(state.snapshot.messages).flat();
+  return localSearch(all, names, parseQuery(query));
+}
+
 /** The drawer's rows, in [G12] ladder order. */
 export function drawerRows(state: AppState): DrawerRow[] {
   const system: string[] = [];
@@ -219,14 +252,15 @@ function renderBody(state: AppState, cols: number, now: number): Body {
       };
     }
     case "results": {
-      const names = new Map(state.snapshot.channels.map((c) => [c.id, c.name]));
-      const all = Object.values(state.snapshot.messages).flat();
-      const hits = localSearch(
-        all,
-        names,
-        parseQuery(layer.query ?? state.composer),
+      const hits = searchHits(state);
+      const rendered = renderResults(
+        hits,
+        layer.selection,
+        cols,
+        now,
+        focused,
+        searchQuery(state).trim().length > 0,
       );
-      const rendered = renderResults(hits, layer.selection, cols, now);
       return {
         rows: rendered,
         anchor: "top",
@@ -459,7 +493,7 @@ export function renderScreen(
         rankCandidates(
           state.snapshot.mentionCandidates,
           state.completion.query,
-          false,
+          state.completion.agentsOnly,
         ),
         state.completion.selection,
         cols,

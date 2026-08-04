@@ -114,17 +114,33 @@ function parseDay(value: string): number | null {
  */
 export const SEARCH_DEBOUNCE_MS = 150;
 
-/** Render the L1 RESULTS list. */
+/**
+ * Render the L1 RESULTS list.
+ *
+ * `composerFocused` implements §2.2's one-glyph rule on this layer like any
+ * other picker: while you are typing the query the composer holds `❯` and the
+ * selected row demotes to `▌`. Search is the one layer where the composer is
+ * *always* non-empty in normal use, so getting this wrong puts two `❯` on
+ * screen for the entire life of the layer — [G8] broken continuously rather
+ * than in a corner case.
+ *
+ * An empty query renders a prompt rather than "no results": you have not
+ * searched for anything yet, and telling someone their empty search found
+ * nothing is a false negative.
+ */
 export function renderResults(
   hits: readonly SearchHit[],
   selected: number,
   cols: number,
   now: number,
+  composerFocused: boolean,
+  hasQuery: boolean,
 ): string[] {
+  if (!hasQuery) return [pad("  type to search", cols)];
   if (hits.length === 0) return [pad("  no results", cols)];
   const rows: string[] = [];
   hits.forEach((hit, index) => {
-    const marker = index === selected ? "❯ " : "  ";
+    const marker = index === selected ? (composerFocused ? "▌ " : "❯ ") : "  ";
     rows.push(
       pad(
         `${marker}${truncateKeepingSuffix(

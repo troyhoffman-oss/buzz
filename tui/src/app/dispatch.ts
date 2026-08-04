@@ -11,7 +11,13 @@
  * closing a surface and inserting in one keystroke.
  */
 
-import { channelRows, drawerRows, homeRows, selectableCount } from "./screen";
+import {
+  channelRows,
+  drawerRows,
+  homeRows,
+  searchHits,
+  selectableCount,
+} from "./screen";
 import {
   type AppState,
   applyEscape,
@@ -58,7 +64,12 @@ import {
   push,
   sendTarget,
 } from "../nav/layers";
-import { register } from "../nav/surfaces";
+import { register, unregister } from "../nav/surfaces";
+import {
+  applyCompletion,
+  detectTrigger,
+  rankCandidates,
+} from "../render/completion";
 
 /**
  * Descend into a layer, applying §1.1's default selection on arrival.
@@ -73,6 +84,56 @@ import { register } from "../nav/surfaces";
  */
 function descend(state: AppState, layer: Layer): AppState {
   return withDefaultSelection(pushLayer(state, layer));
+}
+
+/**
+ * Re-detect the completion trigger against the current composer text — §2.5.
+ *
+ * Called after every text change. Detection is a **pure function of (text,
+ * cursor)** (§3.3's P11 rules), so the band's open/closed state is *derived*
+ * rather than tracked: typing `@` opens it, typing more narrows it, deleting
+ * back past the `@` closes it, and none of those needs its own branch. A
+ * tracked flag would be a second source of truth that can disagree with what
+ * the composer actually contains.
+ *
+ * The selection resets to 0 on every re-filter, matching §3.3's
+ * `input: "keyboard"` rule — the previous highlight is meaningless against a
+ * new candidate list, and keeping it is how a picker hands you the wrong name.
+ */
+function syncCompletion(state: AppState): AppState {
+  const trigger = detectTrigger(state.composer, state.cursor);
+  if (!trigger) {
+    if (!state.completion) return state;
+    return {
+      ...state,
+      completion: null,
+      surfaces: unregister(state.surfaces, "completion"),
+    };
+  }
+  // Only the mention band is wired in Wave 1; `#`, `:` and `/` detect but do
+  // not yet render, and opening an empty band would be worse than not opening
+  // one — §3.4.1's "an actionable-looking control that cannot act is worse than
+  // no control", applied to a completion surface.
+  if (trigger.kind !== "mention") {
+    return state.completion
+      ? {
+          ...state,
+          completion: null,
+          surfaces: unregister(state.surfaces, "completion"),
+        }
+      : state;
+  }
+  return {
+    ...state,
+    completion: {
+      kind: trigger.kind,
+      query: trigger.query,
+      triggerAt: trigger.at,
+      agentsOnly: trigger.agentsOnly,
+      selection: 0,
+    },
+    surfaces: register(state.surfaces, "completion"),
+  };
 }
 
 /** Messages on the current layer's channel, oldest first, top-level only. */
@@ -245,10 +306,15 @@ function commit(state: AppState): AppState {
       return agent ? descend(state, agentDescendTarget(agent)) : state;
     }
     case "results": {
-      // The results list re-derives its hits from the query the layer carries,
-      // so a teleport lands on the row the user is looking at even if the
-      // snapshot changed underneath.
-      return state;
+      // The hits are re-derived from the same (query, snapshot) pair the screen
+      // rendered from, so `→` lands on the row the user is looking at rather
+      // than on a stale index — the results list has no state of its own.
+      const hit = searchHits(state)[layer.selection];
+      if (!hit) return state;
+      // A teleport, exactly as §4.4's mention route is: straight to L2 at the
+      // message, with the back stack seeded so `←` returns to the results you
+      // were reading rather than to a channel list you never opened [G15].
+      return descend(state, teleportTarget(hit));
     }
     case "channel": {
       // With no message-select active there is nothing selected to descend
@@ -317,7 +383,80 @@ export function applyIntent(
       // row — where `→` and `⏎` both silently do nothing, because the index
       // resolves to no row at all. That is the "key that sometimes does
       // nothing" outcome §5.1 rules out.
-      return withDefaultSelection(insertChar(state, intent.char));
+      //
+      // `syncCompletion` then re-detects the trigger against the new text, so
+      // the band opens on `@`, follows the query, and closes when the trigger
+      // is deleted — all from one pure function of (text, cursor) rather than
+      // from an open/close flag that could disagree with what is on screen.
+      return syncCompletion(
+        withDefaultSelection(insertChar(state, intent.char)),
+      );
+
+    case "completionAccept": {
+      if (!state.completion) return state;
+      const candidates = rankCandidates(
+        state.snapshot.mentionCandidates,
+        state.completion.query,
+        state.completion.agentsOnly,
+      );
+      const picked = candidates[state.completion.selection];
+      // §3.3: "Enter with zero candidates sends nothing and inserts nothing. It
+      // is a no-op that keeps the popup open with a `no matches` footer." The
+      // worst outcome here is a half-composed message sent by a reflexive
+      // Enter, so the guard is load-bearing rather than defensive.
+      if (!picked) return state;
+      const trigger = {
+        kind: state.completion.kind,
+        at: state.completion.triggerAt,
+        query: state.completion.query,
+        agentsOnly: state.completion.agentsOnly,
+      };
+      const { text, cursor } = applyCompletion(
+        state.composer,
+        trigger,
+        `@${picked.handle}`,
+      );
+      return {
+        ...state,
+        composer: text,
+        cursor,
+        completion: null,
+        surfaces: unregister(state.surfaces, "completion"),
+        // [D-2]: the composer's parts hold the **pubkey**, so "what you picked
+        // is what gets tagged" is true by construction rather than by two
+        // implementations agreeing.
+        mentions: [...state.mentions, picked.pubkey],
+      };
+    }
+
+    case "completionMove": {
+      if (!state.completion) return state;
+      const count = rankCandidates(
+        state.snapshot.mentionCandidates,
+        state.completion.query,
+        state.completion.agentsOnly,
+      ).length;
+      return {
+        ...state,
+        completion: {
+          ...state.completion,
+          selection: clampSelection(
+            state.completion.selection + intent.delta,
+            count,
+          ),
+        },
+      };
+    }
+
+    case "completionClose":
+      // §3.3: "`esc` dismisses to literal text" — the typed `@ma` stays in the
+      // composer as characters. Deleting it would lose a keystroke, which [G5]
+      // forbids anywhere in this design.
+      return {
+        ...state,
+        completion: null,
+        surfaces: unregister(state.surfaces, "completion"),
+      };
 
     case "moveTextCursor":
       return {
@@ -369,6 +508,9 @@ export function applyIntent(
           kind: "send",
           channelId,
           content: state.composer,
+          // [D-2]: resolved pubkeys picked in the completion band, not names
+          // re-extracted from the text at send time.
+          mentions: state.mentions,
           ...(target.kind === "thread" ? { replyTo: target.rootEventId } : {}),
         },
       };
@@ -462,6 +604,11 @@ export function withDefaultSelection(state: AppState): AppState {
       return selectRow(state, defaultHomeSelection(homeRows(state)));
     case "channels":
       return selectRow(state, defaultChannelSelection(channelRows(state)));
+    case "results":
+      // A re-filtered result list is a new list; keeping the old index would
+      // leave `❯` past its end, where `→` teleports nowhere. Same reasoning as
+      // the L1 channel filter.
+      return selectRow(state, 0);
     default:
       return state;
   }

@@ -64,6 +64,11 @@ describe("§4.1 — enter a channel and reply", () => {
       kind: "send",
       channelId: "ch_engineering",
       content: "ack",
+      // [D-2]: mentions are resolved pubkeys accumulated at pick time. An
+      // unmentioned message carries an empty list, never an absent field —
+      // the daemon's `extract_at_mentions_with_known` fallback exists for
+      // `curl` and second clients, and the TUI must not use it.
+      mentions: [],
     });
     expect(s.layer()).toBe("channel");
   });

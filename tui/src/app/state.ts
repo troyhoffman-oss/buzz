@@ -43,6 +43,8 @@ export interface CompletionState {
   /** Grapheme offset of the trigger character in the composer text. */
   readonly triggerAt: number;
   readonly selection: number;
+  /** True for `@@`, the agents-only trigger (DESIGN §3.3). */
+  readonly agentsOnly: boolean;
 }
 
 /** The drawer's state, when open (§2.3, §2.4). */
@@ -60,6 +62,16 @@ export interface MessageSelectState {
   readonly index: number;
 }
 
+/**
+ * A saved draft: the text **and** its resolved mentions.
+ *
+ * The pair is the unit, not the text alone — see {@link swapDrafts}.
+ */
+export interface Draft {
+  readonly text: string;
+  readonly mentions: readonly string[];
+}
+
 /** Everything the app holds. */
 export interface AppState {
   readonly stack: NavStack;
@@ -70,6 +82,17 @@ export interface AppState {
   readonly messageSelect: MessageSelectState | null;
   readonly completion: CompletionState | null;
   /**
+   * Resolved pubkeys the composer will tag — [D-2].
+   *
+   * > The TUI sends resolved pubkeys, never names. […] "what you picked is what
+   * > gets tagged" becomes true by construction rather than by two
+   * > implementations agreeing.
+   *
+   * Accumulated at pick time, not re-extracted from the text at send time,
+   * which is the whole point: re-extraction is the second implementation.
+   */
+  readonly mentions: readonly string[];
+  /**
    * Per-layer drafts, keyed by a layer's identity.
    *
    * §5.4's gating table: "`ctrl+g` home with unsent composer text — draft is
@@ -77,7 +100,7 @@ export interface AppState {
    * a navigation key is the kind of small betrayal that makes people stop
    * trusting the arrows, which is the one thing this design cannot afford.
    */
-  readonly drafts: ReadonlyMap<string, string>;
+  readonly drafts: ReadonlyMap<string, Draft>;
   /** Collapsed ATTENTION groups on home (§4.4). */
   readonly collapsedGroups: ReadonlySet<string>;
   /** Collapsed zones on home — `⏎` on `COMMUNITY` / `ATTENTION` / `PLACES`. */
@@ -96,7 +119,14 @@ export interface AppState {
  * sends *this* to *that channel*" without a daemon.
  */
 export type PendingEffect =
-  | { kind: "send"; channelId: string; content: string; replyTo?: string }
+  | {
+      kind: "send";
+      channelId: string;
+      content: string;
+      replyTo?: string;
+      /** Resolved pubkeys, never names — [D-2]. */
+      mentions: readonly string[];
+    }
   | { kind: "markRead"; channelId: string }
   | { kind: "markAllRead" };
 
@@ -120,6 +150,7 @@ export function initialState(snapshot: Snapshot): AppState {
     drawer: null,
     messageSelect: null,
     completion: null,
+    mentions: [],
     drafts: new Map(),
     collapsedGroups: new Set(),
     collapsedZones: new Set(),
@@ -160,13 +191,29 @@ function withComposer(
  * Called on every push and pop, so a draft follows its layer rather than the
  * cursor — which is what makes `←` out of a thread and back into it feel like
  * returning to a place rather than to a cleared form.
+ *
+ * **The resolved mentions travel with the text**, because [D-2] makes them part
+ * of the draft rather than metadata about it: restoring `hey @matt` with an
+ * empty mention list would send a message whose visible `@matt` tags nobody,
+ * which is exactly the "what you picked is what gets tagged" guarantee [D-2]
+ * exists to make structural.
  */
 function swapDrafts(state: AppState, from: Layer, to: Layer): AppState {
   const drafts = new Map(state.drafts);
-  if (state.composer.length > 0) drafts.set(draftKey(from), state.composer);
-  else drafts.delete(draftKey(from));
-  const restored = drafts.get(draftKey(to)) ?? "";
-  return { ...withComposer(state, restored), drafts };
+  if (state.composer.length > 0) {
+    drafts.set(draftKey(from), {
+      text: state.composer,
+      mentions: state.mentions,
+    });
+  } else {
+    drafts.delete(draftKey(from));
+  }
+  const restored = drafts.get(draftKey(to));
+  return {
+    ...withComposer(state, restored?.text ?? ""),
+    mentions: restored?.mentions ?? [],
+    drafts,
+  };
 }
 
 /**
@@ -347,11 +394,18 @@ export function insertChar(state: AppState, char: string): AppState {
   return { ...withComposer(restored, text, restored.cursor + char.length) };
 }
 
-/** Clear the composer after a send, and drop the layer's saved draft with it. */
+/**
+ * Clear the composer after a send, dropping the layer's saved draft **and its
+ * resolved mentions** with it.
+ *
+ * Clearing the text while keeping the mentions would carry the previous
+ * message's `p` tags onto the next one — a silent mis-tag that neither the
+ * composer nor the sent message would show.
+ */
 export function clearComposer(state: AppState): AppState {
   const drafts = new Map(state.drafts);
   drafts.delete(draftKey(current(state.stack)));
-  return { ...withComposer(state, ""), drafts };
+  return { ...withComposer(state, ""), mentions: [], drafts };
 }
 
 /** Record the current layer's selection so `←` can restore it (§1.1). */

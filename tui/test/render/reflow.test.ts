@@ -165,7 +165,9 @@ describe("§7 reflow — the same content at both widths, cut differently", () =
   test("the connection glyph never drops, even at 40 columns", () => {
     // §2.1 row 1: "connection glyph never drops". At 40 the host, identity and
     // scope are all gone and the glyph is still there.
-    const s = Session.open("seeded-basic", 40, 20).goTo("Channels").key("right");
+    const s = Session.open("seeded-basic", 40, 20)
+      .goTo("Channels")
+      .key("right");
     expect(s.text()).toContain("◉");
   });
 
