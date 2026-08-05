@@ -265,6 +265,9 @@ export function wrapText(
     limit = cols;
   };
 
+  /** Width available on a *fresh* row — what decides if a word can ever fit. */
+  const freshRoom = cols - displayWidth(indent);
+
   for (const word of words) {
     let remaining = word;
     while (
@@ -272,16 +275,34 @@ export function wrapText(
       limit - displayWidth(current) - (current.trim() ? 1 : 0)
     ) {
       const room = limit - displayWidth(current) - (current.trim() ? 1 : 0);
-      if (room >= Math.min(4, displayWidth(remaining))) {
-        // Enough room to place a fragment: hard-split it.
+      // **Only hard-split a word that cannot fit on a fresh row.** Splitting
+      // whenever the *current* row is short is what produced `passp` / `hrase`
+      // in the 60-column onboarding capture: "passphrase" is 10 characters and
+      // the body is 58 wide, so it fits perfectly well one line down. Breaking
+      // a word that had somewhere to go is not reflow, it is corruption — §7's
+      // rule is that narrowing changes how content is *cut*, and a word cut
+      // through its middle is unreadable at exactly the width where reading is
+      // already hardest.
+      if (
+        displayWidth(remaining) > freshRoom &&
+        room >= Math.min(4, freshRoom)
+      ) {
+        // Genuinely unbreakable — a 200-character URL. Place what fits and
+        // carry the rest, because the alternative is overflowing the frame.
         const head = clip(remaining, room);
         current = current.trim() ? `${current} ${head}` : `${current}${head}`;
         remaining = remaining.slice(head.length);
         push();
-      } else if (current.trim()) {
+      } else if (current.trim() || displayWidth(indent) > 0) {
+        // It fits on a fresh row: start one rather than breaking the word.
         push();
+        // A degenerate hanging indent could leave a row that still cannot hold
+        // the word. Without this the loop would `push()` forever on an
+        // indent-only row, hanging the render rather than misdrawing it.
+        if (displayWidth(remaining) > freshRoom) continue;
+        break;
       } else {
-        // A fresh row still cannot hold it: hard-split at the full width.
+        // A fresh, unindented row still cannot hold it: split at full width.
         const head = clip(remaining, limit - displayWidth(current));
         if (head.length === 0) return rows;
         current = `${current}${head}`;

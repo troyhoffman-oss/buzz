@@ -172,6 +172,49 @@ describe("wrapText — detail fields wrap with hanging indent (§7)", () => {
     expect(rows.join("")).toBe("x".repeat(50));
   });
 
+  test("a word that fits on a fresh row is never split", () => {
+    // Found in the 60-column onboarding capture, which rendered `passp` /
+    // `hrase`: the old rule split whenever the *current* row was short, so a
+    // 10-character word broke in half on a 58-column body it fits on twice
+    // over. §7 says narrowing changes how content is cut; a word cut through
+    // its middle is not a cut, it is corruption — and it lands at exactly the
+    // width where reading is already hardest.
+    const rows = wrapText(
+      "Write it down somewhere safe. There is no reset: the passphrase",
+      58,
+    );
+    expect(rows).toContain("passphrase");
+    for (const row of rows) expect(row).not.toContain("passp\n");
+    expect(rows.some((r) => r.endsWith("passp"))).toBe(false);
+  });
+
+  test("no word is broken unless it cannot fit on a line of its own", () => {
+    // The general property, swept rather than spot-checked: every output
+    // fragment must be a whole input word, unless that word is itself wider
+    // than the column budget.
+    const text = "alpha bb ccc dddd eeeee ffffff ggggggg hhhhhhhh";
+    const words = new Set(text.split(" "));
+    for (const cols of [10, 12, 16, 20, 24, 40]) {
+      for (const row of wrapText(text, cols)) {
+        for (const fragment of row.trim().split(/\s+/)) {
+          if (fragment.length === 0) continue;
+          if (fragment.length >= cols) continue;
+          expect(words.has(fragment)).toBe(true);
+        }
+      }
+    }
+  });
+
+  test("a hanging indent wider than the content still terminates", () => {
+    // The loop's degenerate case: an indent that leaves less room than the
+    // word needs could `push()` an indent-only row forever. A hang here would
+    // read as the app freezing rather than as a wrap bug.
+    const rows = wrapText("alpha betagammadelta", 8, 6);
+    expect(rows.length).toBeGreaterThan(1);
+    for (const row of rows) expect(displayWidth(row)).toBeLessThanOrEqual(8);
+    expect(rows.join("").replace(/\s+/g, "")).toBe("alphabetagammadelta");
+  });
+
   test("continuation rows carry the hanging indent", () => {
     const rows = wrapText("alpha beta gamma delta", 12, 2);
     expect(rows.length).toBeGreaterThan(1);
