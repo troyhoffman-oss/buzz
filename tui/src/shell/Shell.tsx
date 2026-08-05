@@ -24,6 +24,7 @@ import {
   createSignal,
   onCleanup,
   onMount,
+  untrack,
 } from "solid-js";
 import { applyIntent, withDefaultSelection } from "../app/dispatch";
 import { renderScreen, rowContext } from "../app/screen";
@@ -277,14 +278,35 @@ export function Shell(props: ShellProps) {
    * to the renderer. The `missing[]` channel the client already maintains is
    * what carries the loss to the screen (§1.3 property 3).
    */
-  createEffect(() => {
+  /**
+   * The channel the current layer is scoped to, or `null`.
+   *
+   * A memo, and that is load-bearing rather than tidiness. The effect below
+   * calls `setState` to publish the fetched snapshot; if it tracked `state()`
+   * directly it would re-run on its own write, call `ensureMessages` again
+   * (idempotent, so it resolves immediately), `setState` again — and because
+   * every write is a fresh object the signal always compares unequal, so the
+   * loop never settles. That is a microtask spin that starves the renderer:
+   * the frame paints once and then never updates, which looks exactly like a
+   * timeline that failed to load. Depending on the **id** means the effect
+   * re-runs only when the operator actually moves to a different channel.
+   */
+  const currentChannelId = createMemo(() => {
     const layer = current(state().stack);
-    if (layer.kind !== "channel" || !layer.channelId) return;
-    const channelId = layer.channelId;
+    return layer.kind === "channel" ? (layer.channelId ?? null) : null;
+  });
+
+  createEffect(() => {
+    const channelId = currentChannelId();
+    if (!channelId) return;
     void props.client
       .ensureMessages(channelId)
       .then(() =>
-        setState((s) => ({ ...s, snapshot: props.client.getSnapshot() })),
+        // `untrack` for the same reason the memo exists: this write must not
+        // be a dependency of the effect performing it.
+        untrack(() =>
+          setState((s) => ({ ...s, snapshot: props.client.getSnapshot() })),
+        ),
       )
       .catch(() => {});
   });

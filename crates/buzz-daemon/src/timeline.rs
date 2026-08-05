@@ -257,6 +257,17 @@ pub struct TimelineRow {
     pub event: serde_json::Value,
     /// The `39005` overlay bound to this row, when the relay sent one.
     pub thread: Option<ThreadSummary>,
+    /// Whether this row is **non-conversational** — system, job, or
+    /// huddle-started (§3.1), which render as their own dimmed rows.
+    ///
+    /// Carried on the row rather than left for the client to derive, because
+    /// deriving it means knowing which kinds are conversational, and kinds are
+    /// daemon vocabulary (§6.4 — the TUI's `check-boundary.sh` fails the build
+    /// on a bare kind integer in `src/`). Without it a 40099 `dm_created`
+    /// renders as its raw JSON payload in the middle of a conversation, which
+    /// is what the M3 live walk caught.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub system: bool,
 }
 
 /// How a page was assembled — the honest answer to "did the extension work?".
@@ -451,6 +462,7 @@ pub fn parse_window_response(
             let id = event.get("id").and_then(serde_json::Value::as_str);
             TimelineRow {
                 thread: id.and_then(|id| summaries.get(id).cloned()),
+                system: event_kind(event).is_some_and(|k| !is_conversational_unread_kind(k)),
                 event: event.clone(),
             }
         })
@@ -552,6 +564,7 @@ pub fn assemble_downgraded_page(events: &[serde_json::Value], requested_limit: u
             });
             TimelineRow {
                 thread,
+                system: event_kind(event).is_some_and(|k| !is_conversational_unread_kind(k)),
                 event: (*event).clone(),
             }
         })
@@ -688,6 +701,39 @@ mod tests {
                 "{absent} is Wave 4, not Wave 1"
             );
         }
+    }
+
+    /// **M3 regression.** A non-conversational row must say so on the wire.
+    ///
+    /// §3.1 gives system/job/huddle kinds "their own dimmed rows", and the TUI's
+    /// renderer implements exactly that — but it can only act on a flag,
+    /// because deriving one would mean knowing which kinds are conversational,
+    /// and kinds are daemon vocabulary (§6.4; the TUI's `check-boundary.sh`
+    /// fails the build on a bare kind integer in `src/`).
+    ///
+    /// Without the flag the M3 live walk rendered a 40099 `dm_created` as its
+    /// raw JSON payload — `{"actor":"5282…","participants":[…]}` — wrapped
+    /// across three lines in the middle of a conversation.
+    #[test]
+    fn a_non_conversational_row_is_marked_system() {
+        let system = serde_json::json!({
+            "id": id(9),
+            "kind": 40099,
+            "pubkey": "aa".repeat(32),
+            "created_at": 1_700_000_100u64,
+            "content": r#"{"type":"dm_created"}"#,
+            "tags": [["h", CHANNEL]],
+        });
+        let page = assemble_downgraded_page(&[message(1, 1_700_000_090), system], 50);
+        assert_eq!(page.rows.len(), 2);
+        assert!(
+            !page.rows[0].system,
+            "a kind-9 message is conversational and must not be dimmed"
+        );
+        assert!(
+            page.rows[1].system,
+            "a 40099 is a system row; without this it renders as raw JSON"
+        );
     }
 
     /// §2.4's global invariant: no filter leaves the daemon without `kinds`.

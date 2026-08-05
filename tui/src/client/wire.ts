@@ -407,6 +407,13 @@ export function decodeTimelineRow(
     ...(num(thread, "reply_count") !== undefined
       ? { replyCount: num(thread, "reply_count") }
       : {}),
+    // The daemon classifies the row (`timeline::TimelineRow.system`) because
+    // classifying it here would mean knowing which kinds are conversational,
+    // and kinds are daemon vocabulary — `check-boundary.sh` fails the build on
+    // a bare kind integer in `src/`. Without the flag a 40099 `dm_created`
+    // rendered its raw JSON payload in the middle of a conversation, which is
+    // what the M3 live walk caught.
+    ...(bool(row, "system") ? { system: true } : {}),
   };
 }
 
