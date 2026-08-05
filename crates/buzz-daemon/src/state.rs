@@ -117,6 +117,14 @@ impl std::fmt::Debug for AppState {
 impl AppState {
     /// Build the state for a configured daemon.
     pub fn new(config: Config, identity: Option<Identity>) -> crate::Result<Self> {
+        // Before anything that can reach TLS. Two paths do — the websocket in
+        // [`crate::wire`] and the HTTPS bridge in [`crate::rest`] — and doing
+        // it in either one alone leaves the other exposed: a **keyless** daemon
+        // never starts the relay loop at all (§2.5 makes that a supported
+        // state), so a provider installed only there would be absent for every
+        // REST call such a daemon makes. This constructor is the one place both
+        // paths pass through.
+        crate::wire::install_crypto_provider();
         let rest = RestClient::new(&config.identity.relay_url)?;
         // The read-state client id identifies *this daemon process* in the
         // 30078 blob, so a second client squatting the slot is detectable

@@ -870,13 +870,19 @@ pub async fn run(state: AppState, mut commands: tokio::sync::mpsc::Receiver<Wire
 
 /// Install `ring` as the process-level rustls `CryptoProvider`.
 ///
-/// **Called at the top of [`run`], not from `main`.** A daemon that only ever
-/// installs this in its binary entry point still panics from a library caller —
-/// which is exactly how the live tests found it: `tests/live_relay.rs` drives
-/// `run` directly, and every test that reached a `wss://` connect aborted with
-/// `Could not automatically determine the process-level CryptoProvider`. Putting
-/// it here covers both callers, because the connect is *this* function's
-/// responsibility either way.
+/// Called from [`crate::state::AppState::new`] **and** from the top of [`run`].
+/// Neither alone is sufficient, and the redundancy is the point:
+///
+/// - `main` alone is not enough. A library caller — which is exactly what
+///   `tests/live_relay.rs` is — never runs it, and that is how this bug was
+///   found: every live test that reached a `wss://` connect aborted with
+///   `Could not automatically determine the process-level CryptoProvider`.
+/// - [`run`] alone is not enough either. A **keyless** daemon never starts the
+///   relay loop (§2.5 makes that a supported, visible state), so the HTTPS
+///   bridge in [`crate::rest`] would still reach TLS with no provider.
+///
+/// `AppState::new` is the one constructor both paths pass through; [`run`]
+/// keeps its own call so the loop is correct in isolation.
 ///
 /// The failure it prevents is not subtle and not rare: `reqwest`'s rustls
 /// feature pulls `aws-lc-rs` through `hyper-rustls`, `buzz-acp`/`buzz-dev-mcp`
@@ -889,7 +895,7 @@ pub async fn run(state: AppState, mut commands: tokio::sync::mpsc::Receiver<Wire
 /// embedded in a process that already installed one (or a test binary running
 /// several of these in sequence) must not treat that as a failure. The
 /// post-condition is "a provider is installed", not "this call installed it".
-fn install_crypto_provider() {
+pub(crate) fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 

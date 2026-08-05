@@ -241,8 +241,8 @@ impl Identity {
 
     /// The signing keys, cloned, for the NIP-42 handshake.
     ///
-    /// The one exception to [`Self::keys`]'s crate-internal rule, and it is
-    /// narrow by construction: `buzz_ws_client::NostrWsConnection::connect_
+    /// The one exception to the crate-internal `keys()` accessor's rule, and it
+    /// is narrow by construction: `buzz_ws_client::NostrWsConnection::connect_
     /// authenticated` takes `&Keys` by value-of-reference and there is no way
     /// to hand it a borrow that outlives this struct's lock guard. §2.5's
     /// boundary is that key material never crosses a **process** edge — this
