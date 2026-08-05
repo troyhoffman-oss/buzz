@@ -31,6 +31,11 @@
 import { render } from "@opentui/solid";
 import type { DaemonClient } from "./client/daemon-client";
 import { FixtureClient } from "./client/fixture-client";
+import {
+  REPLAY_TICK_MS,
+  replayUntilFromEnv,
+  startFixtureReplay,
+} from "./client/fixture-replay";
 import { UdsClient } from "./client/uds-client";
 import {
   listIdentities,
@@ -284,7 +289,32 @@ async function main(): Promise<void> {
   if (fixture) {
     // No daemon binary is needed on this path and none is looked for: a fixture
     // run must work on a machine that has never installed one.
-    await boot(new FixtureClient(await Bun.file(fixture).text()), "");
+    const client = new FixtureClient(await Bun.file(fixture).text());
+
+    // §5.4 is "an initial state snapshot, **then the event stream**", and the
+    // second half had no driver: `advanceTo` existed, was correct, and was
+    // called by nothing outside `test/helpers`. So every multi-line scenario
+    // rendered its snapshot and froze — invisibly, because a snapshot is most
+    // of the file and the resulting frame looks complete. `fixture-replay.ts`
+    // records what that cost this lane. The interval stops itself once the
+    // scenario can produce nothing further, so a single-line scenario
+    // (`seeded-basic`, `empty`, `keyless-daemon`) pays one tick and no more.
+    // Resolved once and named: calling the parser twice inside a ternary would
+    // read as cheap and is not — it can *throw*, and a guard that evaluates its
+    // own condition twice is one refactor away from the two calls disagreeing.
+    const until = replayUntilFromEnv(process.env);
+    const replay = startFixtureReplay(client, {
+      ...(until !== undefined ? { until } : {}),
+    });
+    const timer = setInterval(() => {
+      if (replay.tick()) clearInterval(timer);
+    }, REPLAY_TICK_MS);
+    // Never hold the process open on account of the replay: the renderer owns
+    // the lifetime, and a live interval on a drained scenario would keep a
+    // finished `buzz-tui` from exiting.
+    timer.unref?.();
+
+    await boot(client, "");
     return;
   }
 

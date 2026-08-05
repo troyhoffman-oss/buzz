@@ -63,6 +63,11 @@ class Pane {
     cols: number,
     rows: number,
     binary: string | undefined,
+    /**
+     * Freeze the scenario's replay clock at this offset — see
+     * {@link Scenario.until}.
+     */
+    until: number | undefined,
   ) {
     this.session = `buzz-w2-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
     this.stateDir = join(
@@ -101,6 +106,7 @@ class Pane {
       String(rows),
       `XDG_STATE_HOME=${this.stateDir} ` +
         `BUZZ_TUI_FIXTURE=${join(FIXTURES, `${fixture}.jsonl`)} ` +
+        (until === undefined ? "" : `BUZZ_TUI_FIXTURE_UNTIL=${until} `) +
         "BUZZ_TUI_FIXED_TIME=2026-08-04T14:12:00Z BUZZ_TUI_NO_ANIM=1 " +
         "BUZZ_TUI_THEME=dark TZ=UTC LANG=C.UTF-8 " +
         `${command}; sleep 600`,
@@ -218,6 +224,19 @@ interface Scenario {
   readonly title: string;
   readonly fixture: string;
   readonly steps: readonly Step[];
+  /**
+   * Freeze the scenario's replay clock at this offset in ms
+   * (`BUZZ_TUI_FIXTURE_UNTIL`), for a state that is **transient** in the
+   * fixture.
+   *
+   * Only needed when the frame under capture is one the scenario passes
+   * *through*. `settle()` waits for the pane to stop changing, so a state that
+   * heals on its own can never be what settles — the capture would record the
+   * recovery every time, or race. Bounding the replay clock makes the transient
+   * a resting state, which is the same move `BUZZ_TUI_FIXED_TIME` already makes
+   * for the render clock.
+   */
+  readonly until?: number;
 }
 
 /**
@@ -451,23 +470,45 @@ const SCENARIOS: readonly Scenario[] = [
       },
     ],
   },
+  // The degraded connection — the state §1.3 property 3 calls the highest-stakes
+  // screen in the product: "a chat client that *looks* idle while its socket is
+  // dead is the worst failure mode".
+  //
+  // This scenario was previously drafted, removed as unlandable, and the removal
+  // reasoned from a false premise. The note read: the fixture is degraded from
+  // 500 ms to 2000 ms, so the frame is "a window this harness cannot land in
+  // deterministically". The window was real; what was not real is that the
+  // harness had ever been *in* it. Nothing in the shipped binary advanced a
+  // fixture's replay clock at all (`advanceTo` had no caller outside
+  // `test/helpers/`), so under `BUZZ_TUI_FIXTURE` every scenario froze on its
+  // snapshot line. The pane did not race between `◌ retry 2` and `◉ live` — it
+  // never left `◉ live`, and would not have after any wait.
+  //
+  // `src/client/fixture-replay.ts` is the driver, and `BUZZ_TUI_FIXTURE_UNTIL`
+  // below is what makes a transient capturable rather than raced: the replay
+  // clock stops at 1000 ms, inside the degraded span, so the frame is a resting
+  // state that `settle()` converges on and two runs produce the same bytes.
+  //
+  // Worth stating plainly, because it also revises what the other captures in
+  // this set are evidence *of*: `08-drawer` and `10-agents` name the
+  // `agent-stream` fixture but were taken before its stream could arrive, so
+  // they record its snapshot only.
+  {
+    id: "13-reconnect",
+    title: "RECONNECT — the relay dropped, and the chrome says so",
+    fixture: "reconnect",
+    until: 1_000,
+    steps: [
+      {
+        key: "(boot)",
+        expect: "◌ retry 2",
+        note:
+          "§2.6 — a distinct glyph and the attempt number, in the warning " +
+          "token: waiting, not broken",
+      },
+    ],
+  },
 ];
-
-// A `reconnect` scenario was drafted here and removed rather than left flaky.
-// The fixture transitions to `reconnecting` at 500 ms and back to `connected`
-// at 2000 ms, so the degraded frame exists for a second and a half — a window
-// this harness cannot land in deterministically, because `settle()` waits for
-// the pane to *stop changing* and the pane is mid-recovery for exactly that
-// span. A capture that sometimes shows `◌ retry 2` and sometimes `◉ live` is
-// not evidence of anything.
-//
-// The state is covered where it can be asserted rather than raced:
-// `test/unit/render-parts.test.ts` pins that every non-connected state gets a
-// distinct glyph (§2.6), and `test/unit/emptystate.test.ts` pins that each one
-// produces its own reason string. Both are stronger than a screenshot; what a
-// capture would add is the *colour*, and `connectionStyle` is a total function
-// over the same eight states with three tones, which the keyless frame above
-// already demonstrates on its `⚠ keyless` segment.
 
 /**
  * The two widths, co-equal.
@@ -488,9 +529,30 @@ async function main(): Promise<void> {
   const outdir = args[0];
   const binaryFlag = args.indexOf("--binary");
   const binary = binaryFlag >= 0 ? args[binaryFlag + 1] : undefined;
+  const onlyFlag = args.indexOf("--only");
+  const only = onlyFlag >= 0 ? args[onlyFlag + 1] : undefined;
   if (!outdir) {
     console.error(
-      "usage: bun run scripts/polish-capture-w2.ts <outdir> [--binary <path>]",
+      "usage: bun run scripts/polish-capture-w2.ts <outdir> " +
+        "[--binary <path>] [--only <scenario-id>]",
+    );
+    process.exit(1);
+  }
+
+  // `--only` re-captures one frame without disturbing the others. Adding a
+  // scenario to a set that already exists should not mean re-running the whole
+  // set — the other twelve would be rewritten by a different binary build than
+  // the one that produced them, which silently breaks the property the set is
+  // for: that its frames are comparable to each other and to the `before-*`
+  // directories beside them. It also leaves `WALKTHROUGH.md` alone, since a
+  // transcript of one scenario is not the transcript the file is meant to hold.
+  const selected = only
+    ? SCENARIOS.filter((s) => s.id === only)
+    : [...SCENARIOS];
+  if (selected.length === 0) {
+    console.error(
+      `no scenario with id ${JSON.stringify(only)}; known ids: ` +
+        SCENARIOS.map((s) => s.id).join(", "),
     );
     process.exit(1);
   }
@@ -511,7 +573,7 @@ async function main(): Promise<void> {
     "",
   ];
 
-  for (const scenario of SCENARIOS) {
+  for (const scenario of selected) {
     transcript.push(
       `## ${scenario.title}`,
       "",
@@ -523,7 +585,13 @@ async function main(): Promise<void> {
       const dir = join(outdir, `captures-${width.label}`);
       mkdirSync(dir, { recursive: true });
 
-      const pane = new Pane(scenario.fixture, width.cols, width.rows, binary);
+      const pane = new Pane(
+        scenario.fixture,
+        width.cols,
+        width.rows,
+        binary,
+        scenario.until,
+      );
       try {
         const keylog: string[] = [];
         for (const step of scenario.steps) {
@@ -570,6 +638,15 @@ async function main(): Promise<void> {
     }
   }
 
+  if (only) {
+    // A partial run must not overwrite the full set's transcript with a
+    // one-scenario version — a `WALKTHROUGH.md` that silently lost eleven
+    // frames is a worse artifact than none.
+    console.log(
+      `captured ${only} only; ${join(outdir, "WALKTHROUGH.md")} left as-is`,
+    );
+    return;
+  }
   writeFileSync(join(outdir, "WALKTHROUGH.md"), transcript.join("\n"));
   console.log(`wrote ${join(outdir, "WALKTHROUGH.md")}`);
 }
