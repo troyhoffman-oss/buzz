@@ -800,6 +800,7 @@ impl PendingPublish {
 /// exit is a keyless daemon, which has nothing to authenticate with and logs
 /// that it is not starting.
 pub async fn run(state: AppState, mut commands: tokio::sync::mpsc::Receiver<WireCommand>) {
+    install_crypto_provider();
     let Some(creds) = Credentials::load(&state).await else {
         tracing::warn!(
             "no identity loaded: the relay loop is not starting, and GET /health \
@@ -865,6 +866,31 @@ pub async fn run(state: AppState, mut commands: tokio::sync::mpsc::Receiver<Wire
         fail_expired(&mut pending);
         tokio::time::sleep(delay).await;
     }
+}
+
+/// Install `ring` as the process-level rustls `CryptoProvider`.
+///
+/// **Called at the top of [`run`], not from `main`.** A daemon that only ever
+/// installs this in its binary entry point still panics from a library caller —
+/// which is exactly how the live tests found it: `tests/live_relay.rs` drives
+/// `run` directly, and every test that reached a `wss://` connect aborted with
+/// `Could not automatically determine the process-level CryptoProvider`. Putting
+/// it here covers both callers, because the connect is *this* function's
+/// responsibility either way.
+///
+/// The failure it prevents is not subtle and not rare: `reqwest`'s rustls
+/// feature pulls `aws-lc-rs` through `hyper-rustls`, `buzz-acp`/`buzz-dev-mcp`
+/// pull `ring`, and a workspace build unifies both. With two providers enabled
+/// rustls refuses to auto-select and panics at `ClientConfig::builder()`, which
+/// for this crate is the NIP-42 handshake — so the daemon would abort on its
+/// first connect, in production, with a message about crate features.
+///
+/// `let _ =` is deliberate: a second install returns `Err`, and a daemon
+/// embedded in a process that already installed one (or a test binary running
+/// several of these in sequence) must not treat that as a failure. The
+/// post-condition is "a provider is installed", not "this call installed it".
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 /// The signing material the loop needs, pulled out of the loaded identity once.

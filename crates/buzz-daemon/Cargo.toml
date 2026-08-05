@@ -22,6 +22,19 @@ buzz-core = { workspace = true }
 buzz-sdk = { workspace = true }
 buzz-ws-client = { workspace = true }
 
+# Explicit rustls with the `ring` provider, so the daemon can install a
+# process-level `CryptoProvider` before its first `wss://` connect.
+#
+# Not optional and not cosmetic: `reqwest`'s rustls feature pulls `aws-lc-rs`
+# through `hyper-rustls` while `buzz-acp`/`buzz-dev-mcp` pull `ring`, and a
+# workspace build unifies both. With two providers enabled rustls refuses to
+# auto-select one and **panics** at `ClientConfig::builder()` — which for this
+# crate is the NIP-42 handshake, i.e. every connect. `buzz-cli`, `buzz-acp`,
+# `buzz-admin`, `buzz-dev-mcp`, and `buzz-backend-kubernetes` each carry this
+# same dependency for the same reason; the daemon was the one binary that
+# opened a websocket without it.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
 # Nostr. `nip49` is the ncryptsec (NIP-49) identity format of DESIGN.md §2.5
 # [D-8]; `nip44` is the observer-frame envelope of §2.5's guard chain; `nip98`
 # is the HTTP-bridge auth the relay's REST surface expects.
