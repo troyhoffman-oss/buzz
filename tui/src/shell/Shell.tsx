@@ -296,9 +296,31 @@ export function Shell(props: ShellProps) {
     return layer.kind === "channel" ? (layer.channelId ?? null) : null;
   });
 
-  createEffect(() => {
+  /**
+   * The channel to load, **and** the invalidation epoch it was loaded under.
+   *
+   * The epoch is what makes "same channel, re-fetch it" expressible. A
+   * `stream.reset` drops every loaded timeline while the operator is still
+   * standing in one — the channel id does not change, so an effect keyed on the
+   * id alone does not re-run, and the body renders blank permanently. Reading
+   * the epoch through the snapshot signal is what ties the two together: the
+   * reset triggers a stream frame, the frame re-reads the snapshot, and this
+   * memo then compares unequal.
+   */
+  const timelineRequest = createMemo(() => {
     const channelId = currentChannelId();
-    if (!channelId) return;
+    // Depend on the snapshot so this re-evaluates when a frame lands, which is
+    // when an invalidation becomes observable.
+    void state().snapshot;
+    return channelId
+      ? `${channelId}#${props.client.messagesGeneration()}`
+      : null;
+  });
+
+  createEffect(() => {
+    const request = timelineRequest();
+    if (!request) return;
+    const channelId = request.slice(0, request.lastIndexOf("#"));
     void props.client
       .ensureMessages(channelId)
       .then(() =>

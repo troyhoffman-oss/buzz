@@ -69,4 +69,17 @@ export interface DaemonClient {
    * must not re-query the relay each time.
    */
   ensureMessages(channelId: string): Promise<void>;
+
+  /**
+   * A counter that changes whenever loaded timelines are invalidated.
+   *
+   * Exists because `ensureMessages` is idempotent and the consumer that drives
+   * it is keyed on the *current channel*: after a `stream.reset` the pages are
+   * stale but the channel has not changed, so nothing would re-run and the
+   * timeline would render blank permanently. Depending on this alongside the
+   * channel id makes "the same channel, but re-fetch it" expressible.
+   *
+   * Constant on a transport that never invalidates (the fixture one).
+   */
+  messagesGeneration(): number;
 }

@@ -407,6 +407,16 @@ export function decodeTimelineRow(
     ...(num(thread, "reply_count") !== undefined
       ? { replyCount: num(thread, "reply_count") }
       : {}),
+    // The NIP-10 parent, and it is the field the thread view is built from:
+    // `buildThread` (`layers/thread.ts:60`) indexes replies by `replyTo`, and
+    // `channelMessages` (`app/screen.ts:247`) filters roots by its absence. The
+    // daemon supplies it (`timeline::TimelineRow.reply_to`) because the parent
+    // lives in an `e` tag and NIP-10 tag vocabulary is daemon knowledge (§6.4).
+    // Without it every thread renders as a root with no replies, no matter how
+    // many the page carried — silently.
+    ...(str(row, "reply_to")
+      ? { replyTo: str(row, "reply_to") as string }
+      : {}),
     // The daemon classifies the row (`timeline::TimelineRow.system`) because
     // classifying it here would mean knowing which kinds are conversational,
     // and kinds are daemon vocabulary — `check-boundary.sh` fails the build on

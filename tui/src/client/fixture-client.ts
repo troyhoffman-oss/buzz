@@ -285,4 +285,12 @@ export class FixtureClient implements DaemonClient {
    * become timing-dependent while still never exercising a real error path.
    */
   async ensureMessages(_channelId: string): Promise<void> {}
+
+  /**
+   * Constant: a scenario's messages are never invalidated, so nothing keyed on
+   * this ever needs to re-run.
+   */
+  messagesGeneration(): number {
+    return 0;
+  }
 }

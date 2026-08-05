@@ -435,6 +435,13 @@ fn apply_timeline_event(inner: &mut Inner, event: &nostr::Event, kind: u32) -> I
             "channel_id": channel_id,
             "event": json,
             "local_id": local_id,
+            // `root` is already in hand from the topic decision above and was
+            // simply not forwarded. The client cannot recompute it — the parent
+            // is in an `e` tag and NIP-10 tag vocabulary is daemon knowledge
+            // (§6.4) — so without this a live reply folds into the channel body
+            // as a top-level row and never appears in its thread, which is the
+            // same defect the history page had.
+            "reply_to": root,
         }),
     );
     let mut topics = vec![topic.to_string()];
@@ -1188,10 +1195,26 @@ async fn hydrate_channels(state: &AppState, last: &mut Option<Instant>) -> Optio
 /// construction. `#d` is deliberately *not* constrained: slot ids rotate when a
 /// squatter is detected (`ReadState::rotate_slot`), and a filter pinned to the
 /// current id would silently miss the frontier written under the previous one.
+///
+/// **`#t = read-state` is what makes the `limit` safe, and its absence was a
+/// defect.** Kind 30078 is NIP-78 *application data*, not a read-state kind:
+/// `desktop/src/shared/constants/kinds.ts:44-48` gives the same integer to
+/// `KIND_CHANNEL_SECTIONS`, `KIND_CHANNEL_MUTES`, `KIND_CHANNEL_STARS`, and
+/// `KIND_CHANNEL_SORT`. All are NIP-44-encrypted to self by the same identity,
+/// so all decrypt cleanly here and all compete for the [`MAX_SLOTS`] budget of
+/// 8. Preference blobs are edited interactively and the relay orders
+/// newest-first, so on a real desktop user they are *likely* to be newer than
+/// the read-state slots — and the frontier is then never read at all, silently
+/// reproducing the exact "restart resurrects every message as unread" symptom
+/// this walk exists to fix. `readStateManager.ts:462` has always constrained
+/// `#t`; the daemon's filter simply did not.
+///
+/// [`MAX_SLOTS`]: crate::readstate::MAX_SLOTS
 pub fn read_state_filter(self_pubkey: &str) -> serde_json::Value {
     serde_json::json!({
         "kinds": [buzz_core::kind::KIND_READ_STATE],
         "authors": [self_pubkey],
+        "#t": [crate::readstate::READ_STATE_TOPIC_TAG],
         "limit": crate::readstate::MAX_SLOTS,
     })
 }
@@ -1745,7 +1768,19 @@ fn build_read_state_event(
         nostr::Kind::Custom(buzz_core::kind::KIND_READ_STATE as u16),
         content,
     )
-    .tags([nostr::Tag::identifier(d_tag.to_string())]);
+    .tags([
+        nostr::Tag::identifier(d_tag.to_string()),
+        // The `t` tag the desktop has always written
+        // (`readStateManager.ts:685`) and always filtered on (`:462`), and
+        // which this writer omitted. Without it the daemon's own slots are
+        // invisible to `read_state_filter`'s `#t` constraint *and* to the
+        // desktop's — so a frontier this daemon published could not be read
+        // back by either, and a filter without `#t` competes with every other
+        // NIP-78 blob under kind 30078 for an 8-event budget. Both halves have
+        // to move together: tagging without filtering fixes nothing, and
+        // filtering without tagging hides this daemon's own writes.
+        nostr::Tag::hashtag(crate::readstate::READ_STATE_TOPIC_TAG),
+    ]);
     identity.sign_event(builder)
 }
 

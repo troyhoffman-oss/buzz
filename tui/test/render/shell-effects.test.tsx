@@ -76,6 +76,10 @@ class RecordingClient implements DaemonClient {
     this.messageLoads.push(channelId);
     return this.inner.ensureMessages(channelId);
   }
+
+  messagesGeneration(): number {
+    return this.inner.messagesGeneration();
+  }
 }
 
 /** Mount the Shell with a recording client and return both. */

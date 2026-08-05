@@ -241,6 +241,28 @@ describe("messages", () => {
       ).toBeUndefined();
     });
 
+    /**
+     * **M3 regression.** `replyTo` is what the thread view is built from —
+     * `buildThread` indexes by it and `channelMessages` filters roots by its
+     * absence — and the daemon is the only party that can supply it, because
+     * the parent lives in an `e` tag and NIP-10 tag vocabulary is banned from
+     * `src/` (§6.4). Dropping it here rendered every thread as a root with no
+     * replies, silently.
+     */
+    test("a reply's root is carried, and a root has none", () => {
+      const first = events[0] as Record<string, unknown>;
+      const root = "ab".repeat(32);
+      expect(
+        decodeTimelineRow(
+          { event: first, thread: null, reply_to: root },
+          channelId,
+        )?.replyTo,
+      ).toBe(root);
+      expect(
+        decodeTimelineRow({ event: first, thread: null }, channelId)?.replyTo,
+      ).toBeUndefined();
+    });
+
     test("a row with no event id is dropped, like a message with none", () => {
       expect(
         decodeTimelineRow(

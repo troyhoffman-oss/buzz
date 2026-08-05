@@ -136,6 +136,8 @@ export class UdsClient implements DaemonClient {
    * loop has already set the flag back to true.
    */
   private streamGeneration = 0;
+  /** Bumped by {@link invalidateMessages}; read by {@link messagesGeneration}. */
+  private messagesEpoch = 0;
   private closed = false;
 
   /** The attached daemon's `/health`, for capability gating (§2.3 [D-1]). */
@@ -267,9 +269,18 @@ export class UdsClient implements DaemonClient {
       // Timelines are **not** fetched at boot. One page per channel on a
       // machine with forty of them is forty relay round trips before the first
       // frame paints, for thirty-nine timelines nobody is looking at.
-      // `loadMessages` fills this on descent; §2.3 [D-1]'s floor is the boot
+      // `ensureMessages` fills this on descent; §2.3 [D-1]'s floor is the boot
       // set, and a timeline is not in it.
-      messages: {},
+      //
+      // **Carried across a re-hydrate rather than blanked.** `hydrate` also
+      // runs from `refresh()`, which `stream.reset` calls — and blanking here
+      // emptied the timeline of the channel the operator is *currently looking
+      // at*, with nothing to refill it: the Shell's load effect is keyed on the
+      // channel id (`Shell.tsx`), which has not changed, so it does not re-run.
+      // The screen went blank and stayed blank until the operator navigated
+      // away and back. Invalidation on reset is `invalidateMessages`'s job, and
+      // it is explicit precisely so this path does not have to guess.
+      messages: this.snapshot?.messages ?? {},
       transcripts,
       usage,
       mentionCandidates: [],
@@ -299,10 +310,34 @@ export class UdsClient implements DaemonClient {
    * timeline: an empty channel and an unreachable relay must not render the
    * same, which is §1.3 property 3 and the M2-1 defect by name.
    */
+  /**
+   * Drop every loaded timeline, so the next {@link ensureMessages} re-fetches.
+   *
+   * The counterpart to `ensureMessages`' idempotence check: that check is what
+   * keeps `←` `→` from re-querying the relay, and it is therefore also what
+   * would pin a **stale** page in place forever after a `stream.reset`. One
+   * explicit invalidation point is better than making the cache guess, and it
+   * is the reason `hydrate` can safely carry `messages` across a refresh.
+   *
+   * `messagesEpoch` is bumped so a consumer keyed on the current channel can
+   * tell that a re-fetch is owed even though the channel itself did not change
+   * — which is precisely the case a reset creates.
+   */
+  invalidateMessages(): void {
+    this.messagesEpoch += 1;
+    this.snapshot = { ...this.snapshot, messages: {} };
+  }
+
+  /** See {@link invalidateMessages}. */
+  messagesGeneration(): number {
+    return this.messagesEpoch;
+  }
+
   async ensureMessages(channelId: string): Promise<void> {
     // Idempotent per the interface contract: `←` `→` between two channels is a
     // common gesture and must not re-query the relay on each pass. The live
     // tail keeps the loaded page current, so a second fetch would buy nothing.
+    // `invalidateMessages` is what re-opens this gate after a `stream.reset`.
     if (this.snapshot.messages[channelId] !== undefined) return;
     const body = await this.get(
       `/channel/${encodeURIComponent(channelId)}/message`,
@@ -482,6 +517,14 @@ export class UdsClient implements DaemonClient {
       // The frame is emitted either way: the screens must learn the stream
       // reset even if the re-fetch that follows it failed, because the
       // alternative is a client that silently keeps rendering pre-gap state.
+      //
+      // Timelines are invalidated **before** the re-fetch, not by it: `hydrate`
+      // carries `messages` across so an ordinary refresh cannot blank the
+      // screen, so a reset — which is exactly the case where the pages *are*
+      // stale — has to say so explicitly. Done first so that even if `refresh`
+      // rejects, the stale pages are gone rather than silently retained behind
+      // `ensureMessages`' idempotence check.
+      this.invalidateMessages();
       void this.refresh()
         .catch(() => {})
         .finally(() => this.emit(frame));

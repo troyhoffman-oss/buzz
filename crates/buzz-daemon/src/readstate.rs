@@ -16,6 +16,21 @@ pub const MAX_SLOT_BYTES: usize = 32 * 1024;
 /// Maximum number of slots before the oldest contexts are pruned.
 pub const MAX_SLOTS: usize = 8;
 
+/// The `t` tag every read-state event carries, and every read-state query
+/// constrains on.
+///
+/// Kind 30078 is NIP-78 *application data*, shared with at least four other
+/// features (`desktop/src/shared/constants/kinds.ts:44-48` — sections, mutes,
+/// stars, sort). The `t` tag is what makes `read-state` a distinguishable
+/// subset of it, and it must appear on **both** halves: a query without it
+/// competes with every other NIP-78 blob for the [`MAX_SLOTS`] budget, and an
+/// event without it is invisible to any query that has it.
+///
+/// Verbatim from `readStateManager.ts:685` (`["t", "read-state"]`) and `:462`
+/// (`"#t": ["read-state"]`), so the daemon and the desktop read each other's
+/// slots.
+pub const READ_STATE_TOPIC_TAG: &str = "read-state";
+
 /// Maximum tracked contexts across all slots.
 pub const MAX_CONTEXTS: usize = 10_000;
 

@@ -376,6 +376,69 @@ describe("the event stream (§2.6 link A, [D-5])", () => {
     client.close();
   });
 
+  /**
+   * **M3 regression.** A reset must re-open `ensureMessages`' idempotence gate,
+   * and an *ordinary* refresh must not blank the timeline.
+   *
+   * Two halves of one bug. `hydrate` used to write `messages: {}`, and
+   * `refresh()` calls `hydrate` — so a reset emptied the timeline of the
+   * channel the operator was standing in, while the Shell's load effect (keyed
+   * on the channel id, which did not change) did not re-run. The body went
+   * blank and stayed blank until the operator navigated away and back.
+   *
+   * Fixing that by carrying `messages` across a refresh would have created the
+   * opposite bug — a stale page pinned forever behind the idempotence check —
+   * so invalidation is now explicit and the generation counter is what lets a
+   * consumer keyed on the current channel notice it.
+   */
+  test("a reset invalidates timelines; an ordinary refresh preserves them", async () => {
+    const fake = start();
+    const channelId = "11111111-1111-1111-1111-111111111111";
+    fake.routes[`/channel/${channelId}/message`] = {
+      messages: [
+        {
+          event: {
+            id: "aa".repeat(32),
+            pubkey: "bb".repeat(32),
+            created_at: 1_700_000_100,
+            content: "hello",
+          },
+          thread: null,
+        },
+      ],
+      aux: [],
+      has_more: false,
+    };
+    const client = await UdsClient.connect({ socket: fake.socket });
+
+    await client.ensureMessages(channelId);
+    const loaded = client.getSnapshot().messages[channelId];
+    expect(loaded).toBeDefined();
+    const generation = client.messagesGeneration();
+
+    // An ordinary re-hydrate must not lose the page: nothing would refill it.
+    await client.refresh();
+    expect(client.getSnapshot().messages[channelId]).toBeDefined();
+    expect(client.messagesGeneration()).toBe(generation);
+
+    // An invalidation drops it *and* moves the generation, which is the signal
+    // "same channel, fetch it again".
+    client.invalidateMessages();
+    expect(client.getSnapshot().messages[channelId]).toBeUndefined();
+    expect(client.messagesGeneration()).toBeGreaterThan(generation);
+
+    // And the gate is genuinely re-opened.
+    const requestsBefore = fake.requested.filter((p) =>
+      p.includes("/message"),
+    ).length;
+    await client.ensureMessages(channelId);
+    expect(
+      fake.requested.filter((p) => p.includes("/message")).length,
+    ).toBeGreaterThan(requestsBefore);
+
+    client.close();
+  });
+
   test("resubscribing does not leave a second read loop running", async () => {
     // Found in self-review, confirmed by counting connections before the fix.
     //

@@ -268,6 +268,16 @@ pub struct TimelineRow {
     /// is what the M3 live walk caught.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub system: bool,
+    /// The NIP-10 root this row replies to, or `None` when it is top-level.
+    ///
+    /// Same reasoning as [`Self::system`]: the parent lives in an `e` tag, and
+    /// NIP-10 tag vocabulary is daemon knowledge (§6.4). Without it the client
+    /// has no way to tell a reply from a root, and **every thread renders
+    /// empty** — `buildThread` (`tui/src/layers/thread.ts:60`) indexes replies
+    /// by exactly this field, so an absent one yields a root with no children
+    /// no matter how many replies the page carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 /// How a page was assembled — the honest answer to "did the extension work?".
@@ -463,6 +473,7 @@ pub fn parse_window_response(
             TimelineRow {
                 thread: id.and_then(|id| summaries.get(id).cloned()),
                 system: event_kind(event).is_some_and(|k| !is_conversational_unread_kind(k)),
+                reply_to: reply_root(event),
                 event: event.clone(),
             }
         })
@@ -565,6 +576,7 @@ pub fn assemble_downgraded_page(events: &[serde_json::Value], requested_limit: u
             TimelineRow {
                 thread,
                 system: event_kind(event).is_some_and(|k| !is_conversational_unread_kind(k)),
+                reply_to: reply_root(event),
                 event: (*event).clone(),
             }
         })
@@ -733,6 +745,62 @@ mod tests {
         assert!(
             page.rows[1].system,
             "a 40099 is a system row; without this it renders as raw JSON"
+        );
+    }
+
+    /// **M3 regression.** A reply must carry its NIP-10 parent on the row.
+    ///
+    /// The parent lives in an `e` tag, and NIP-10 tag vocabulary is daemon
+    /// knowledge (§6.4) — so a client that cannot read tags cannot derive it.
+    /// Without `reply_to` the TUI's `buildThread` (`layers/thread.ts:60`)
+    /// indexes nothing and **every thread renders as a root with no replies**,
+    /// however many the page carried.
+    /// **Which path carries a reply row matters**, and the first draft of this
+    /// test got it wrong in a way worth recording. `assemble_downgraded_page`
+    /// filters replies out entirely (`reply_root(e).is_none()`), because the
+    /// standard filter cannot say `top_level: true` and the daemon has to do it
+    /// by hand — so a reply can never *be* a row there, and asserting that it
+    /// carries a root was asserting an unreachable state. `parse_window_response`
+    /// is the path that does not filter: it trusts the relay's `top_level`, and
+    /// a relay that serves a reply as a row is exactly where the field is read.
+    #[test]
+    fn a_reply_carries_its_root_and_a_root_carries_none() {
+        let root = id(1);
+
+        // The downgrade path: replies are folded away, and the surviving root
+        // must not claim a parent.
+        let downgraded = assemble_downgraded_page(
+            &[
+                message(1, 1_700_000_100),
+                reply(2, &root, 1_700_000_110, &"bb".repeat(32)),
+            ],
+            50,
+        );
+        assert_eq!(downgraded.rows.len(), 1, "the downgrade folds replies away");
+        assert_eq!(
+            downgraded.rows[0].reply_to, None,
+            "a root replies to nothing"
+        );
+
+        // The NIP-CW path: whatever the relay serves as a row becomes a row,
+        // and a reply among them must name the root it hangs from — that is the
+        // only way the client can thread it.
+        let page = parse_window_response(
+            &[
+                bounds_event(&expected_bounds_binding(CHANNEL, None), false, None),
+                message(1, 1_700_000_100),
+                reply(2, &root, 1_700_000_110, &"bb".repeat(32)),
+            ],
+            CHANNEL,
+            None,
+        )
+        .expect("a well-formed window");
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.rows[0].reply_to, None);
+        assert_eq!(
+            page.rows[1].reply_to.as_deref(),
+            Some(root.as_str()),
+            "a reply must name its root, or the thread view has nothing to index"
         );
     }
 
