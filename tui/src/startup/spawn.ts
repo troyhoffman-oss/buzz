@@ -80,6 +80,59 @@ export type AttachOutcome =
   | { readonly kind: "failed"; readonly reason: string };
 
 /**
+ * Refuse a socket whose **parent directory** is group- or world-writable.
+ *
+ * §2.5 and §6.5 both require this of the client, and the reason is the one hole
+ * peercred cannot see:
+ *
+ * > `ssh -L` creates the local socket with the process umask, not `0600` — and
+ * > a draft example put it in `/tmp`, a world-writable directory. Anyone on the
+ * > laptop who can connect to it gets a fully authenticated Buzz session
+ * > including observer plaintext, and **no daemon-side peercred check can see
+ * > them** (the connection is made by the local sshd/ssh process, so peercred
+ * > reports the SSH login's own uid and passes).
+ *
+ * So the check has to be here, client-side, before the first request. It
+ * mirrors `config::assert_socket_dir_is_private` on the daemon side, and the
+ * duplication is deliberate: the two ends are different processes on different
+ * machines, and only the laptop end can inspect the laptop's directory.
+ *
+ * Throws rather than returning a boolean, because there is exactly one right
+ * response and a caller that could ignore it would be a caller that eventually
+ * does.
+ */
+export function assertSocketDirIsPrivate(socket: string): void {
+  const dir = dirOf(socket);
+  let mode: number;
+  try {
+    mode = statSync(dir).mode;
+  } catch {
+    // A missing directory is not an unsafe one — it is a socket that does not
+    // exist, which the liveness probe reports honestly a moment later.
+    return;
+  }
+  if ((mode & 0o022) !== 0) {
+    // The mode is formatted rather than written as a literal, and the remedy
+    // spells its mode from the same constant. §6.4's digit scan is blunt on
+    // purpose — it fails on any bare 4-digit-or-longer integer — and it
+    // flagged a literal `0700` in this very message. That is a false positive
+    // in the narrow sense, and the right response is still to satisfy the gate
+    // rather than to widen it: the alternative precedent ("this one is fine")
+    // is exactly how `OBSERVER_FRAME = 24200` got through once already.
+    const octal = (bits: number): string => bits.toString(8).padStart(3, "0");
+    throw new Error(
+      `refusing to connect to ${socket}: its directory ${dir} is ` +
+        `group- or world-writable (mode ${octal(mode & 0o777)}). ` +
+        "Anyone who can write there can substitute a socket and read this " +
+        `session. Use an owner-only directory: mkdir -p -m ${octal(PRIVATE_DIR_MODE)} ${dir}`,
+    );
+  }
+}
+
+/** Owner-only directory mode, per §2.5's `0700` posture. */
+const PRIVATE_DIR_MODE = 0o700;
+
+/**
  * Probe a socket by connecting to it (§2.3's liveness rule).
  *
  * Returns `true` for **connected-but-erroring** as well as for a clean

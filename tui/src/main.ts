@@ -39,7 +39,12 @@ import {
 } from "./onboarding/provision";
 import { Root } from "./shell/Root";
 import { type TuiConfig, configPath } from "./startup/paths";
-import { attachOrSpawn, findDaemonBinary, socketIsLive } from "./startup/spawn";
+import {
+  assertSocketDirIsPrivate,
+  attachOrSpawn,
+  findDaemonBinary,
+  socketIsLive,
+} from "./startup/spawn";
 
 /**
  * The clock — §5.3 determinism requirement 1.
@@ -288,10 +293,51 @@ async function main(): Promise<void> {
   // could start it.
   const explicitSocket = process.env.BUZZ_DAEMON_SOCKET;
   if (explicitSocket) {
-    await boot(
-      await UdsClient.connect({ socket: explicitSocket, now: resolveClock() }),
-      "",
-    );
+    // §2.5/§6.5: **refuse a socket whose parent directory is group- or
+    // world-writable.** This is the one hole peercred cannot cover — the
+    // forwarded connection is made by the local ssh process, so the daemon
+    // sees the SSH login's uid and passes, while anyone who can write that
+    // directory on the laptop can substitute a socket and read the whole
+    // session including observer plaintext.
+    // **The permission check is its own try, before the connect.** A first
+    // draft handled both in one block and asked "is the socket live?" to
+    // choose the message — which meant a world-writable directory holding a
+    // *dead* socket reported "nothing is listening" and the security refusal
+    // never reached the operator. A refusal that a second, unrelated condition
+    // can mask is not a refusal.
+    try {
+      assertSocketDirIsPrivate(explicitSocket);
+    } catch (error) {
+      console.error(
+        `buzz-tui: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      process.exit(1);
+    }
+
+    // The connect's own failure needs translating: Bun surfaces an unreachable
+    // socket as `Was there a typo in the url or port? path:
+    // "http://buzz-daemon/health"`, which names an HTTP URL the operator never
+    // typed and says nothing about the socket that is actually missing —
+    // §1.3 property 2's dead end, on the flagship remote path (§6.5).
+    try {
+      await boot(
+        await UdsClient.connect({
+          socket: explicitSocket,
+          now: resolveClock(),
+        }),
+        "",
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(
+        (await socketIsLive(explicitSocket))
+          ? `buzz-tui: ${detail}`
+          : `buzz-tui: nothing is listening on ${explicitSocket}. ` +
+              "If this is an ssh -L forward, check the tunnel is up; " +
+              "if it is a local daemon, it is not running.",
+      );
+      process.exit(1);
+    }
     return;
   }
 

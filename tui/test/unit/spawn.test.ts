@@ -14,7 +14,9 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   rmSync,
   utimesSync,
@@ -26,6 +28,7 @@ import {
   SPAWN_DEADLINE_MS,
   SPAWN_POLL_INTERVAL_MS,
   SpawnLock,
+  assertSocketDirIsPrivate,
   findDaemonBinary,
   socketIsLive,
 } from "../../src/startup/spawn";
@@ -94,6 +97,56 @@ describe("liveness is probed on the socket, never on a pid (§2.3)", () => {
 
     expect(existsSync(socket)).toBe(true);
     expect(await socketIsLive(socket)).toBe(false);
+  });
+});
+
+describe("§2.5/§6.5: an unsafe socket directory is refused client-side", () => {
+  test("a world-writable parent is refused, naming the remedy", () => {
+    // The one hole peercred cannot cover. `ssh -L` creates the local socket
+    // with the process umask, so a world-writable parent hands a fully
+    // authenticated session — observer plaintext included — to anyone else on
+    // the laptop, and the daemon sees only the SSH login's own uid.
+    const dir = scratch();
+    const forward = join(dir, "fwd");
+    mkdirSync(forward, { mode: 0o777 });
+    chmodSync(forward, 0o777);
+    expect(() => assertSocketDirIsPrivate(join(forward, "x.sock"))).toThrow(
+      /group- or world-writable/,
+    );
+    // The message has to carry the fix, or it is a dead end (§1.3 property 2).
+    expect(() => assertSocketDirIsPrivate(join(forward, "x.sock"))).toThrow(
+      /mkdir -p -m 700/,
+    );
+  });
+
+  test("a group-writable parent is refused too", () => {
+    // `0770` is the mode a shared-group setup produces, and it is exactly as
+    // exploitable as `0777` on a box with more than one account.
+    const dir = scratch();
+    const forward = join(dir, "grp");
+    mkdirSync(forward, { mode: 0o770 });
+    chmodSync(forward, 0o770);
+    expect(() => assertSocketDirIsPrivate(join(forward, "x.sock"))).toThrow();
+  });
+
+  test("a 0700 parent is accepted", () => {
+    const dir = scratch();
+    const forward = join(dir, "ok");
+    mkdirSync(forward, { mode: 0o700 });
+    chmodSync(forward, 0o700);
+    expect(() =>
+      assertSocketDirIsPrivate(join(forward, "x.sock")),
+    ).not.toThrow();
+  });
+
+  test("a missing directory is not treated as unsafe", () => {
+    // "Does not exist" is a different fact from "is unsafe", and reporting the
+    // second for the first would send an operator hunting a permissions
+    // problem that is really a typo. The liveness probe reports it honestly a
+    // moment later.
+    expect(() =>
+      assertSocketDirIsPrivate(join(scratch(), "nope", "x.sock")),
+    ).not.toThrow();
   });
 });
 

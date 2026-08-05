@@ -98,17 +98,22 @@ class Pane {
       String(cols),
       "-y",
       String(rows),
-      `${exported} ${command}`,
+      // **The trailing `sleep` is load-bearing, and the obvious alternative
+      // does not work.** A test whose subject is a *failure message* must be
+      // able to capture the pane after the process exits. `remain-on-exit on`
+      // looks like the answer and is not: tmux **clears the pane** on death
+      // and replaces it with `Pane is dead (status 1, …)`, so the message the
+      // test exists to read is gone — and it looks like the app printed
+      // nothing, which is exactly the bug being tested for.
+      //
+      // Keeping the *shell* alive keeps the already-written stderr on screen,
+      // because nothing has repainted over it. The session is killed in
+      // `afterEach` either way, so the sleep never outlives the test.
+      `${exported} ${command}; sleep 300`,
     ]);
 
     // `-x/-y` at creation is not enough on a box already running tmux.
     this.tmux(["set-option", "-t", this.session, "window-size", "manual"]);
-    // **Keep the pane after the command exits.** Without this, a test whose
-    // subject is a *failure message* cannot see it: the process prints the
-    // reason, exits, tmux reaps the pane, and `capture-pane` fails with
-    // "can't find pane" — which reads as a harness bug rather than as the
-    // successful failure it is. `remain-on-exit` freezes the last frame.
-    this.tmux(["set-option", "-t", this.session, "remain-on-exit", "on"]);
     this.tmux([
       "resize-window",
       "-t",
@@ -451,6 +456,54 @@ describe("§2.3 attach and spawn, against a real daemon", () => {
     expect(frame.toLowerCase()).toContain("passphrase");
     expect(frame).not.toContain("timed out");
   }, 180_000);
+
+  /**
+   * §2.5/§6.5's client-side socket-directory refusal, end to end.
+   *
+   * A unit test covers the predicate; this covers the *wiring* — that
+   * `BUZZ_DAEMON_SOCKET` consults it before connecting, and that the refusal
+   * reaches the operator rather than being swallowed.
+   *
+   * The second case is the one that matters and it is a regression: a first
+   * draft handled the permission failure and the connect failure in one block
+   * and chose the message by asking "is the socket live?". A world-writable
+   * directory holding a *dead* socket therefore reported "nothing is
+   * listening" — the security refusal masked by an unrelated condition.
+   */
+  test("an unsafe socket directory is refused, and the refusal is not masked", async () => {
+    machine = new Machine();
+    const forward = join(machine.root, "fwd");
+    Bun.spawnSync(["mkdir", "-m", "777", "-p", forward]);
+    const socket = join(forward, "x.sock");
+    await Bun.write(socket, "");
+    // Nothing is listening on it, which is exactly the state that masked the
+    // refusal before the fix.
+
+    const p = launch(machine, { BUZZ_DAEMON_SOCKET: socket });
+    const frame = await p.waitFor("buzz-tui:", 60_000);
+    expect(frame).toContain("group- or world-writable");
+    // The remedy, not just the diagnosis.
+    expect(frame).toContain("mkdir -p -m 700");
+    // And it is not the *other* message.
+    expect(frame).not.toContain("nothing is listening");
+  }, 90_000);
+
+  test("a dead socket in a safe directory says so, without a stack trace", async () => {
+    // Bun surfaces an unreachable UDS as `Was there a typo in the url or
+    // port? path: "http://buzz-daemon/health"` — an HTTP URL the operator
+    // never typed, naming nothing about the socket that is missing.
+    machine = new Machine();
+    const dir = join(machine.root, "safe");
+    Bun.spawnSync(["mkdir", "-m", "700", "-p", dir]);
+    const socket = join(dir, "y.sock");
+    await Bun.write(socket, "");
+
+    const p = launch(machine, { BUZZ_DAEMON_SOCKET: socket });
+    const frame = await p.waitFor("buzz-tui:", 60_000);
+    expect(frame).toContain("nothing is listening");
+    expect(frame).toContain("ssh -L");
+    expect(frame).not.toContain("typo in the url");
+  }, 90_000);
 
   test("a spawn that fails AFTER onboarding shows its reason on screen", async () => {
     // Found in self-review, and it was invisible in the worst way: the reason
