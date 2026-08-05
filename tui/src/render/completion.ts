@@ -273,9 +273,14 @@ function tailSpans(tail: string, candidate: MentionCandidate): Span[] {
   const style = presenceStyle(candidate.presence);
   if (!candidate.isAgent || style === null) return [styled(tail, META)];
   const token = presenceMark(candidate);
-  // `   ${displayName}` precedes the ` ${mark}` the label appended.
-  const at = 3 + candidate.displayName.length + 1;
-  if (tail.slice(at, at + token.length) !== token) return [styled(tail, META)];
+  // The label put `   ${displayName} ${mark}` here, so the whole run up to and
+  // including the mark is checked — not just the mark. Checking the mark alone
+  // would accept a `detail` that happened to right-align a `⬤` into that exact
+  // column on a row whose display name had been truncated away, and tint a
+  // glyph that is reporting something else entirely.
+  const lead = `   ${candidate.displayName} `;
+  const at = lead.length;
+  if (!tail.startsWith(`${lead}${token}`)) return [styled(tail, META)];
   const spans: Span[] = [styled(tail.slice(0, at), META), styled(token, style)];
   const rest = tail.slice(at + token.length);
   if (rest.length > 0) spans.push(styled(rest, META));
