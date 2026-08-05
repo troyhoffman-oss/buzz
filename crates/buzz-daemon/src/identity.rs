@@ -543,15 +543,44 @@ pub async fn load_identity(
     Ok(Identity::from_keys(keys, auth_tag))
 }
 
+/// Characters of a pubkey used as a filename stem — §2.5's `<pubkey8>`.
+pub const PUBKEY_STEM_LEN: usize = 8;
+
+/// The `<pubkey8>` filename stem for `pubkey`, safely.
+///
+/// # Why this is not `&pubkey[..8]`
+///
+/// Because that **panics** on a non-ASCII pubkey, and a pubkey reaches these
+/// functions from a JSON line on stdin — `identity set-auth-tag`'s request body
+/// and `--identity` on argv — neither of which has validated it as hex yet.
+/// Confirmed reachable before this fix:
+///
+/// ```text
+/// $ echo '{"pubkey":"日本語テストです","tag":"x"}' | buzz-daemon identity set-auth-tag
+/// thread 'main' panicked at identity.rs:554:
+///   end byte index 8 is not a char boundary; it is inside '語'
+/// ```
+///
+/// A panic is the wrong answer twice over. It is an unhelpful failure for a
+/// typo, and §1.3 property 2 forbids the dead end — but more importantly the
+/// same helper is called from the **serving** path, where a panic inside a
+/// request handler is a daemon that dies holding the observer archive.
+///
+/// Taking characters rather than bytes also keeps the stem meaning what its
+/// name says: eight *characters* of the identity, for every input.
+pub fn pubkey_stem(pubkey: &str) -> String {
+    pubkey.chars().take(PUBKEY_STEM_LEN).collect()
+}
+
 /// Path of the ncryptsec blob for `pubkey` (§2.5):
 /// `~/.local/share/buzz/identity/<pubkey8>.ncryptsec`.
 pub fn ncryptsec_path_for(identity_dir: &Path, pubkey: &str) -> PathBuf {
-    identity_dir.join(format!("{}.ncryptsec", &pubkey[..pubkey.len().min(8)]))
+    identity_dir.join(format!("{}.ncryptsec", pubkey_stem(pubkey)))
 }
 
 /// Path of the NIP-OA auth tag beside the ncryptsec (§2.5).
 pub fn authtag_path_for(identity_dir: &Path, pubkey: &str) -> PathBuf {
-    identity_dir.join(format!("{}.authtag", &pubkey[..pubkey.len().min(8)]))
+    identity_dir.join(format!("{}.authtag", pubkey_stem(pubkey)))
 }
 
 #[cfg(test)]

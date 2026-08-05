@@ -309,7 +309,11 @@ pub(crate) fn provision_with_log_n(
     if path.exists() {
         return Err(DaemonError::IdentityDecrypt(format!(
             "an identity for {} is already provisioned at {}",
-            &pubkey[..8],
+            // Through the shared helper even though `pubkey` here is derived
+            // hex and provably safe to slice. One rule beats a per-site
+            // audit: the next author adding a message like this copies the
+            // line next to it, not the reasoning behind it.
+            crate::identity::pubkey_stem(&pubkey),
             path.display()
         )));
     }
@@ -353,14 +357,8 @@ pub fn is_provisioned(identity_dir: &Path, pubkey: &str) -> bool {
 /// `0700` directory whose whole posture is uniform and an exception would be
 /// one more thing to reason about.
 pub fn pubkey_path_for(identity_dir: &Path, pubkey: &str) -> PathBuf {
-    identity_dir.join(format!(
-        "{}.pub",
-        &pubkey[..pubkey.len().min(PUBKEY_STEM_LEN)]
-    ))
+    identity_dir.join(format!("{}.pub", crate::identity::pubkey_stem(pubkey)))
 }
-
-/// Characters of a pubkey used as a filename stem, from §2.5's `<pubkey8>`.
-const PUBKEY_STEM_LEN: usize = 8;
 
 /// Every provisioned identity in `identity_dir`, as **full pubkeys**, sorted.
 ///
@@ -692,6 +690,46 @@ mod tests {
             provisioned_identities(tmp.path()),
             vec![outcome.pubkey[..8].to_string()]
         );
+    }
+
+    /// A non-ASCII pubkey must not panic.
+    ///
+    /// Regression, and it was a **reachable** panic rather than a theoretical
+    /// one: `&pubkey[..8]` on a multibyte string is a char-boundary panic, and
+    /// a pubkey arrives from a JSON line on stdin before anything has checked
+    /// it is hex. Confirmed against the built binary before the fix:
+    ///
+    /// ```text
+    /// $ echo '{"pubkey":"日本語テストです","tag":"x"}' | buzz-daemon identity set-auth-tag
+    /// thread 'main' panicked: end byte index 8 is not a char boundary
+    /// ```
+    ///
+    /// The same helpers are on the serving path, where a panic in a handler is
+    /// a daemon that dies holding the observer archive.
+    #[test]
+    fn a_multibyte_pubkey_does_not_panic_the_path_helpers() {
+        let tmp = dir();
+        for pubkey in ["日本語テストです", "é", "", "🔑🔑🔑"] {
+            let _ = pubkey_path_for(tmp.path(), pubkey);
+            let _ = ncryptsec_path_for(tmp.path(), pubkey);
+            let _ = authtag_path_for(tmp.path(), pubkey);
+            assert!(!is_provisioned(tmp.path(), pubkey));
+        }
+        // And the write path, which is what the stdin request reaches.
+        write_auth_tag(tmp.path(), "日本語テストです", "[\"auth\"]").expect("write");
+    }
+
+    /// The stem is eight **characters**, not eight bytes — so the name means
+    /// the same thing for every input rather than silently shortening.
+    #[test]
+    fn the_stem_is_eight_characters() {
+        use crate::identity::pubkey_stem;
+        assert_eq!(pubkey_stem(&"a".repeat(64)), "aaaaaaaa");
+        // Eight characters of a longer multibyte string — the case that used
+        // to panic, since byte 8 lands inside '語'.
+        assert_eq!(pubkey_stem("日本語テストですよ長い"), "日本語テストです");
+        assert_eq!(pubkey_stem("short"), "short");
+        assert_eq!(pubkey_stem(""), "");
     }
 
     /// A **corrupt** sidecar falls back to the stem rather than being trusted.

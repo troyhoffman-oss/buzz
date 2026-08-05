@@ -119,6 +119,22 @@ export class UdsClient implements DaemonClient {
   private cursor = 0;
   /** Aborts the in-flight `/event` read on unsubscribe or teardown. */
   private streamAbort: AbortController | null = null;
+  /**
+   * Which read loop is the current one.
+   *
+   * Bumped by {@link stopStream}, so a loop that was asleep on the backoff
+   * ladder when it was stopped notices on waking and exits instead of
+   * reconnecting. Without it, unsubscribe-then-resubscribe leaves the *old*
+   * loop alive alongside the new one: both hold an `/event` connection, both
+   * write to `this.cursor`, and every frame is delivered to every listener
+   * twice. Measured before the fix — a stream that closes immediately produced
+   * six connections where a single loop makes at most three.
+   *
+   * A plain `streaming: boolean` does not work here, because the loop that must
+   * exit is the one *inside* `await sleep(...)`, and by the time it wakes a new
+   * loop has already set the flag back to true.
+   */
+  private streamGeneration = 0;
   private closed = false;
 
   /** The attached daemon's `/health`, for capability gating (§2.3 [D-1]). */
@@ -296,6 +312,8 @@ export class UdsClient implements DaemonClient {
   private stopStream(): void {
     this.streamAbort?.abort();
     this.streamAbort = null;
+    // Retires whichever loop is running, including one asleep on the ladder.
+    this.streamGeneration += 1;
   }
 
   /**
@@ -312,8 +330,18 @@ export class UdsClient implements DaemonClient {
    *    seq; advancing on it would rewind the cursor to 0 and replay the ring.
    */
   private async readStream(): Promise<void> {
+    // Claimed at entry and re-checked after every await. A loop whose
+    // generation has been retired exits rather than reconnecting — see
+    // {@link streamGeneration} for the duplicate-delivery bug that causes.
+    this.streamGeneration += 1;
+    const generation = this.streamGeneration;
+    const retired = (): boolean =>
+      this.closed ||
+      this.listeners.size === 0 ||
+      this.streamGeneration !== generation;
+
     let attempt = 0;
-    while (!this.closed && this.listeners.size > 0) {
+    while (!retired()) {
       const abort = new AbortController();
       this.streamAbort = abort;
       try {
@@ -334,26 +362,37 @@ export class UdsClient implements DaemonClient {
           throw new Error(`GET /event: ${response.status}`);
         }
         attempt = 0;
-        await this.consume(response.body);
+        await this.consume(response.body, generation);
       } catch (error) {
         // An abort is this client closing the stream on purpose, not a failure.
         if (abort.signal.aborted) return;
         void error;
       }
-      if (this.closed || this.listeners.size === 0) return;
+      if (retired()) return;
       attempt += 1;
       await sleep(backoffMs(attempt));
     }
   }
 
   /** Decode complete ndjson lines out of a byte stream. */
-  private async consume(body: ReadableStream<Uint8Array>): Promise<void> {
+  private async consume(
+    body: ReadableStream<Uint8Array>,
+    generation: number,
+  ): Promise<void> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
+      // A retired loop stops delivering immediately rather than draining what
+      // is already buffered: after an unsubscribe those frames belong to a
+      // listener set that no longer wants them, and after a `close()` they
+      // would arrive at a client the caller believes is shut down.
+      if (this.streamGeneration !== generation) {
+        await reader.cancel().catch(() => {});
+        return;
+      }
       buffer += decoder.decode(value, { stream: true });
       let newline = buffer.indexOf("\n");
       while (newline >= 0) {
@@ -386,7 +425,16 @@ export class UdsClient implements DaemonClient {
       // than presenting a silently gapped timeline — and reset the cursor
       // first, or the re-subscribe would ask for the same dead seq again.
       this.cursor = 0;
-      void this.refresh().then(() => this.emit(frame));
+      // The `catch` is load-bearing, not defensive noise. `refresh` throws on
+      // any non-404, and this runs fire-and-forget from a stream reader — an
+      // unhandled rejection under Bun's default can take the process down,
+      // turning "the daemon restarted while I was away" into a lost session.
+      // The frame is emitted either way: the screens must learn the stream
+      // reset even if the re-fetch that follows it failed, because the
+      // alternative is a client that silently keeps rendering pre-gap state.
+      void this.refresh()
+        .catch(() => {})
+        .finally(() => this.emit(frame));
       return;
     }
 

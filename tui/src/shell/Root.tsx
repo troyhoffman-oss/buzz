@@ -50,13 +50,22 @@ export interface RootProps {
   ) => Promise<DaemonClient>;
   readonly now: () => number;
   readonly onQuit: () => void;
-  /** Surfaced when the post-onboarding connect fails. */
-  readonly onFatal: (message: string) => void;
 }
 
 /** The application root. */
 export function Root(props: RootProps) {
   const [client, setClient] = createSignal<DaemonClient | null>(props.client);
+  /**
+   * A post-onboarding connect failure, rendered on the wizard's error line.
+   *
+   * **Rendered rather than printed.** The renderer owns the terminal by this
+   * point, so `console.error` + `process.exit` produces a dead pane with the
+   * reason nowhere on screen — confirmed in a PTY against a daemon that
+   * provisions and then refuses to bind: the frame read `setup › done` and
+   * `Pane is dead (status 1)`, with no cause anywhere. That is the dead end
+   * §1.3 property 2 forbids, reached through the one path nothing tested.
+   */
+  const [failure, setFailure] = createSignal<string | null>(null);
 
   return (
     <Show
@@ -65,6 +74,7 @@ export function Root(props: RootProps) {
         <Wizard
           daemonBinary={props.daemonBinary}
           onQuit={props.onQuit}
+          fatal={failure()}
           onComplete={(result) => {
             void props
               .connect(
@@ -77,10 +87,7 @@ export function Root(props: RootProps) {
               )
               .then(setClient)
               .catch((error: unknown) => {
-                // A connect failure after a *successful* provision is not the
-                // wizard's to render: the identity exists and the answers are
-                // on disk, so the remedy is relaunching, not re-answering.
-                props.onFatal(
+                setFailure(
                   error instanceof Error ? error.message : String(error),
                 );
               });

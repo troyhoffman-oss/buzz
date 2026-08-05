@@ -452,6 +452,60 @@ describe("§2.3 attach and spawn, against a real daemon", () => {
     expect(frame).not.toContain("timed out");
   }, 180_000);
 
+  test("a spawn that fails AFTER onboarding shows its reason on screen", async () => {
+    // Found in self-review, and it was invisible in the worst way: the reason
+    // went to `console.error` while the renderer owned the terminal, so the
+    // operator got a frame reading `setup › done` and `Pane is dead (status
+    // 1)` with no cause anywhere. Every other failure path prints *before* the
+    // renderer starts, which is why nothing caught this one.
+    //
+    // Driven with a daemon that provisions correctly and then refuses to bind,
+    // because that is exactly the shape of the real cases (`EADDRINUSE`, an
+    // unsafe runtime directory) — the identity is written, and only the serve
+    // step fails.
+    if (!daemonBinary) throw new Error("buzz-daemon was not built; cannot run");
+    machine = new Machine();
+
+    const shim = join(machine.root, "refuses-to-serve");
+    await Bun.write(
+      shim,
+      [
+        "#!/bin/sh",
+        'case "$1" in',
+        `  identity|socket-path) exec ${daemonBinary} "$@" ;;`,
+        '  *) echo "simulated: cannot bind socket" >&2; exit 1 ;;',
+        "esac",
+        "",
+      ].join("\n"),
+    );
+    Bun.spawnSync(["chmod", "+x", shim]);
+
+    const p = launch(machine, { BUZZ_DAEMON_BIN: shim });
+    await p.waitFor("Welcome to Buzz", 60_000);
+    p.send("Enter");
+    await p.waitFor("Which relay?");
+    p.type(RELAY);
+    p.send("Enter");
+    await p.waitFor("Create an identity");
+    p.send("Enter");
+    await p.waitFor("Choose a passphrase");
+    p.type(PASSPHRASE);
+    p.send("Enter");
+    await p.waitFor("Type it again");
+    p.type(PASSPHRASE);
+    p.send("Enter");
+    await p.waitFor("What is this community called?");
+    p.type("doomed");
+    p.send("Enter");
+
+    // The daemon's own words, and the remedy — the identity is already on
+    // disk, so relaunching is the whole fix and re-answering would mint a
+    // second identity beside the first.
+    const frame = await p.waitFor("cannot bind socket", 120_000);
+    expect(frame).toContain("relaunch");
+    expect(frame).not.toContain(PASSPHRASE);
+  }, 300_000);
+
   /**
    * The **compiled** binary walks onboarding and spawns a daemon.
    *

@@ -58,6 +58,18 @@ export interface WizardProps {
   readonly onQuit: () => void;
   /** Pre-fills, for a re-run after a partial setup. */
   readonly defaults?: { relayUrl?: string; communityName?: string };
+  /**
+   * A failure that happened **after** provisioning succeeded — the daemon
+   * spawn or the attach.
+   *
+   * Rendered on the flow's error line rather than printed, because the
+   * renderer owns the terminal at that point (see `shell/Root.tsx`). It is a
+   * prop rather than flow state because the flow is *finished*: the identity
+   * exists and the answers are on disk, so the remedy is relaunching, and
+   * re-entering the wizard's state machine would invite re-answering into a
+   * second identity.
+   */
+  readonly fatal?: string | null;
 }
 
 /** Normalize an OpenTUI key event, mirroring `Shell.tsx`'s `toKeyPress`. */
@@ -140,8 +152,18 @@ export function Wizard(props: WizardProps) {
 
   const lines = createMemo(() => {
     const { width, height } = dimensions();
+    // A post-onboarding failure overrides whatever step the flow ended on, and
+    // names the remedy — the identity and the answers are already on disk, so
+    // relaunching is the whole fix and re-answering would mint a second
+    // identity beside the first.
+    const shown = props.fatal
+      ? {
+          ...state(),
+          error: `${props.fatal} — your identity is saved; relaunch buzz-tui to retry`,
+        }
+      : state();
     return fitsOnboarding(width, height)
-      ? renderOnboarding(state(), width, height)
+      ? renderOnboarding(shown, width, height)
       : renderOnboardingFloor(width, height);
   });
 

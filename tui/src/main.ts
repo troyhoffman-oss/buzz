@@ -153,13 +153,10 @@ async function boot(
           writeConfig(configPath(), config);
           return attach(config, daemonBinary, passphrase);
         },
-        onFatal: (message) => {
-          // The identity exists and the answers are on disk by this point, so
-          // the remedy is relaunching rather than re-answering. Exit rather
-          // than sitting on a screen that cannot make progress.
-          console.error(`buzz-tui: ${message}`);
-          process.exit(1);
-        },
+        // Deliberately absent: `Root` renders the failure on the wizard's own
+        // error line rather than exiting. Exiting here would print to a stderr
+        // the renderer owns, which a PTY run showed producing a dead pane with
+        // the reason nowhere on screen.
       }),
     {
       // **`exitOnCtrlC` must be off.** OpenTUI's default is to exit the process
@@ -221,8 +218,15 @@ async function attach(
       // §2.3: "Spawn failure is a first-class outcome, not a timeout." The
       // reason is the child's own last stderr line — a wrong passphrase says
       // so, rather than reporting a five-second wait.
-      console.error(`buzz-tui: ${outcome.reason}`);
-      process.exit(1);
+      //
+      // **Thrown, not printed-and-exited.** This function is called from two
+      // places with different terminal ownership: before the renderer starts
+      // (where stderr is ours) and from inside it after onboarding (where it
+      // is not). A PTY run showed the second case producing a dead pane
+      // reading `setup › done` with the reason nowhere on screen — the dead
+      // end §1.3 property 2 forbids, arriving through the one path that had no
+      // test. Each caller now surfaces it the way its own context allows.
+      throw new Error(outcome.reason);
     }
   }
 
@@ -306,8 +310,19 @@ async function main(): Promise<void> {
   // `null` is the first-run state: the renderer opens on the wizard, and the
   // connect happens inside it once there is an identity to connect as. The
   // attach for a *configured* machine happens here, **before** the renderer
-  // starts, so its passphrase prompt still owns stdout.
-  await boot(config ? await attach(config, daemonBinary) : null, daemonBinary);
+  // starts, so its passphrase prompt and its failure message still own stdout.
+  let client: DaemonClient | null = null;
+  if (config) {
+    try {
+      client = await attach(config, daemonBinary);
+    } catch (error) {
+      console.error(
+        `buzz-tui: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      process.exit(1);
+    }
+  }
+  await boot(client, daemonBinary);
 }
 
 await main();

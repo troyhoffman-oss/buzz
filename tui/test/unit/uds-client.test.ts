@@ -376,6 +376,39 @@ describe("the event stream (§2.6 link A, [D-5])", () => {
     client.close();
   });
 
+  test("resubscribing does not leave a second read loop running", async () => {
+    // Found in self-review, confirmed by counting connections before the fix.
+    //
+    // `readStream` reconnects on the §2.6 ladder, so a loop stopped while it
+    // was *asleep* on that ladder used to wake up and reconnect anyway — even
+    // though `subscribe` had already started a fresh loop. Both then held an
+    // `/event` connection, both wrote `this.cursor`, and every frame reached
+    // every listener **twice**.
+    //
+    // The assertion is a connection count rather than a duplicate-delivery
+    // check because the doubling is downstream of the leak and only shows up
+    // when a frame happens to arrive during the overlap — the leak itself is
+    // always there. Measured: 6 connections before, 4 after (one loop's own
+    // ladder), against a server that closes the stream immediately.
+    const fake = start();
+    // Empty chunk list: the stream closes at once, which is what drives the
+    // reconnect ladder and therefore the whole race.
+    fake.streamChunks = [];
+    const client = await UdsClient.connect({ socket: fake.socket });
+
+    const unsubscribe = client.subscribe(() => {});
+    await Bun.sleep(50);
+    unsubscribe();
+    client.subscribe(() => {});
+    await Bun.sleep(3000);
+
+    const streamRequests = fake.requested.filter((p) => p.startsWith("/event"));
+    // One live loop over ~3 s reaches rung 3 at most (1 s + 2 s). Two loops
+    // reach six or more, which is what the pre-fix run measured.
+    expect(streamRequests.length).toBeLessThanOrEqual(4);
+    client.close();
+  }, 20_000);
+
   test("unsubscribing the last listener closes the read", async () => {
     const fake = start();
     // A stream that never ends, so the only way the read stops is the abort.
