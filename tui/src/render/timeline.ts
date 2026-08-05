@@ -56,6 +56,7 @@ import {
   UNREAD_DIVIDER,
 } from "./palette";
 import {
+  type Span,
   type SpanStyle,
   type StyledRow,
   fillRow,
@@ -164,6 +165,58 @@ export function threadSuffix(message: Message): string {
 function reactionStrip(message: Message): string | null {
   if (!message.reactions || message.reactions.length === 0) return null;
   return message.reactions.map((r) => `${r.emoji}${r.count}`).join("  ");
+}
+
+/**
+ * The author header: `matt                                            14:09`.
+ *
+ * Three attributions on one row, and each answers a different question the eye
+ * asks when it lands on a header: *who* (the name), *what kind of who* (agent
+ * or human), and *when* (the stamp, which recedes because it is the thing you
+ * read last). §3.1 spends a whole row on this every time the speaker changes,
+ * and the M3 capture drew all three at one weight — so the row that exists to
+ * announce a speaker change announced it no louder than the text below it.
+ *
+ * `alignRight` still produces the string. The spans are cut out of it by
+ * display column rather than the layout being rebuilt in span form, for the
+ * reason `render/span.ts` gives: two implementations of the same arithmetic
+ * drift, and the one that drifts silently is the one nothing asserts. Cutting
+ * the finished row means the text is `alignRight`'s by construction — a wrong
+ * boundary here can only mis-colour, never mis-draw.
+ */
+function authorHeader(message: Message, cols: number): StyledRow {
+  const presence = message.author.isAgent ? " ⬤" : "";
+  const stamp = clock(message.ts);
+  const cell = `${message.author.name}${presence}`;
+  const text = `  ${alignRight(cell, stamp, cols - 2)}`;
+  const nameStyle = message.author.isAgent ? AGENT : AUTHOR;
+
+  // Below the stamp's own width `alignRight` abandons the label and clips the
+  // stamp itself, so there is no name left to attribute and the whole row is
+  // one metadata fragment.
+  if (cols - 2 <= displayWidth(stamp)) return padRow([styled(text, META)], cols);
+
+  // The stamp is `alignRight`'s right-hand segment, placed whole at the end,
+  // and `HH:MM` is ASCII — so its code-unit length is also its column count.
+  const label = text.slice(2, text.length - stamp.length);
+  const fits = displayWidth(cell) <= cols - 2 - displayWidth(stamp) - 1;
+
+  const spans: Span[] = [plain("  ")];
+  if (fits && presence.length > 0) {
+    // Untruncated, so the label is exactly `name + presence`: the glyph reports
+    // *live*, which is a state and not part of the name, and colouring it with
+    // the name would sink the one ambient signal a fleet operator scans for.
+    spans.push(styled(message.author.name, nameStyle));
+    spans.push(styled(presence, LIVE));
+    spans.push(plain(label.slice(cell.length)));
+  } else {
+    // Truncated (or no glyph): the alignment gap rides the name's style, which
+    // draws nothing — a foreground on spaces is invisible — and keeps the
+    // ellipsis in the name's colour, where it belongs.
+    spans.push(styled(label, nameStyle));
+  }
+  spans.push(styled(stamp, META));
+  return padRow(spans, cols);
 }
 
 /**
@@ -340,46 +393,8 @@ export function renderTimeline(
     }
 
     if (!continuesGroup(previous, message)) {
-      const presence = message.author.isAgent ? " ⬤" : "";
-      // Whether the last twelve rows came from a person or from a fleet member
-      // is the question a Buzz operator asks most often, and it is the one the
-      // desktop answers with an avatar a terminal has no room for. It is the
-      // single content-level colour distinction this design spends (§3.10),
-      // and the header is where it costs nothing — the bodies stay neutral.
-      const nameStyle = message.author.isAgent ? AGENT : AUTHOR;
-      const time = clock(message.ts);
-      const line = alignRight(
-        `${message.author.name}${presence}`,
-        time,
-        cols - 2,
-      );
-      // Split the finished row rather than re-deriving the alignment: the gap
-      // `alignRight` computed is the layout, and computing it a second time
-      // here would be a second source of truth for the timestamp column.
-      const [left, right] = splitAt(
-        [plain(line)],
-        Math.max(0, displayWidth(line) - displayWidth(time)),
-      );
-      const leftText = rowText(left);
-      const nameWidth = displayWidth(`${message.author.name}`);
-      const [nameSpan, gapSpan] = splitAt([plain(leftText)], nameWidth);
       rows.push({
-        text: padRow(
-          [
-            plain("  "),
-            styled(rowText(nameSpan), nameStyle),
-            // The presence dot rides the gap remainder, so an agent's ⬤ is
-            // live-green while the run of spaces after it stays unstyled.
-            ...(presence
-              ? [
-                  styled(presence, LIVE),
-                  plain(rowText(gapSpan).slice(presence.length)),
-                ]
-              : [plain(rowText(gapSpan))]),
-            styled(rowText(right), META),
-          ],
-          cols,
-        ),
+        text: authorHeader(message, cols),
         messageId: message.id,
         selectable: false,
         kind: "header",
