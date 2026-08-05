@@ -319,7 +319,25 @@ export async function attachOrSpawn(
       }
     }
 
-    const child = startDaemon(request);
+    // **`Bun.spawn` throws synchronously when the binary cannot be exec'd**
+    // (`ENOENT`, a non-executable file, a bad interpreter line) rather than
+    // producing a child that exits. Letting that escape breaks this function's
+    // whole contract — every caller handles `{kind: "failed"}` and none expects
+    // a throw, so a stale `BUZZ_DAEMON_BIN` or a half-installed release would
+    // surface as an unhandled rejection instead of a sentence. Found by a unit
+    // test pointing `binary` at a path that does not exist.
+    let child: SpawnedChild;
+    try {
+      child = startDaemon(request);
+    } catch (error) {
+      return {
+        kind: "failed",
+        reason:
+          `cannot run ${request.binary}: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+
     const appeared = await waitForSocket(request.socket, child, nowMs);
     if (appeared) return { kind: "spawned", socket: request.socket };
 

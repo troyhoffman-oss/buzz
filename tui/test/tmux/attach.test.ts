@@ -560,6 +560,108 @@ describe("§2.3 attach and spawn, against a real daemon", () => {
   }, 300_000);
 
   /**
+   * §5.5's own row: "two TUIs launched within 50 ms yield exactly one daemon
+   * pid". Three, here, because a two-way race can be won by luck.
+   *
+   * This is the case §2.3 spends its longest paragraph on, and the failure it
+   * describes is not a cosmetic duplicate: two daemons on one (relay, identity)
+   * means two NIP-42 sessions, two relay-budget consumers, and two read-state
+   * publishers racing on the same 30078 `d` coordinate. The desktop already
+   * carries conflict detection for exactly that (`readStateManager.ts` rotates
+   * `slotId` when another `client_id` squats its `d`-tag), which is the
+   * evidence the hazard is real rather than theoretical.
+   *
+   * A unit test covers the lock primitive. Only this covers the thing the lock
+   * is *for* — three real processes, three real spawns, one socket.
+   *
+   * # What this proves, and what it does not
+   *
+   * Verified by sabotage rather than assumed, because a race test that cannot
+   * fail is worse than none:
+   *
+   * - Both guards removed (lock **and** post-lock re-connect) → **3 daemons**.
+   *   So the case is genuinely load-bearing.
+   * - Only the post-lock re-`connect()` removed → still **1 daemon**, test
+   *   passes.
+   *
+   * That second result is worth stating plainly: **this case does not isolate
+   * the re-connect.** The lock serializes three same-machine racers well
+   * enough on its own, so the step §2.3 spends its longest paragraph on is
+   * covered here only incidentally. The re-connect matters for the window the
+   * lock cannot close — a *loser* that acquires after the winner has already
+   * released — which needs the second contender to arrive during the winner's
+   * spawn rather than before it, and is not reliably reachable by launching
+   * three processes at once.
+   *
+   * Left as-is rather than papered over with a sleep-tuned variant that would
+   * hit the window by luck and silently stop hitting it later. The gap is
+   * stated in full in `test/unit/spawn.test.ts` ("attach never destroys a live
+   * socket"), including why closing it would cost more than it buys; this case
+   * pins the outcome operators actually experience.
+   */
+  test("three TUIs racing produce exactly one daemon (§2.3, §5.5)", async () => {
+    if (!daemonBinary) throw new Error("buzz-daemon was not built; cannot run");
+    machine = new Machine();
+
+    const provisioned = machine.run(
+      ["identity", "provision"],
+      JSON.stringify({ mode: "create", passphrase: PASSPHRASE }),
+    );
+    const pubkey = provisioned.pubkey as string;
+    const paths = machine.run([
+      "socket-path",
+      "--relay",
+      RELAY,
+      "--identity",
+      pubkey,
+    ]);
+    const socket = paths.socket as string;
+    expect(existsSync(socket)).toBe(false);
+
+    await Bun.write(
+      join(machine.root, "state", "buzz", "config.json"),
+      JSON.stringify({ relayUrl: RELAY, pubkey, communityName: "race" }),
+    );
+
+    // Launched as plain subprocesses rather than tmux panes: the property under
+    // test is about *processes*, and feeding three passphrases on stdin is
+    // exact here where three PTYs would be three sleeps.
+    const racers = [0, 1, 2].map(() => {
+      const child = Bun.spawn(["bun", "run", "src/main.ts"], {
+        cwd: CWD,
+        env: machine?.env,
+        stdin: "pipe",
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      child.stdin.write(`${PASSPHRASE}\n`);
+      void child.stdin.end();
+      return child;
+    });
+
+    try {
+      for (let i = 0; i < 400 && !existsSync(socket); i++) await Bun.sleep(100);
+      expect(existsSync(socket)).toBe(true);
+      // Let any loser that was going to spawn a second daemon do so.
+      await Bun.sleep(3000);
+
+      const found = Bun.spawnSync([
+        "pgrep",
+        "-f",
+        `buzz-daemon --socket ${socket}`,
+      ]);
+      const pids = new TextDecoder()
+        .decode(found.stdout)
+        .split("\n")
+        .filter((l) => l.trim().length > 0);
+      expect(pids).toHaveLength(1);
+    } finally {
+      for (const racer of racers) racer.kill();
+      Bun.spawnSync(["pkill", "-f", `buzz-daemon --socket ${socket}`]);
+    }
+  }, 300_000);
+
+  /**
    * The **compiled** binary walks onboarding and spawns a daemon.
    *
    * `scripts/smoke.sh` already proves the artifact renders, but only against

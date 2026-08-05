@@ -29,6 +29,7 @@ import {
   SPAWN_POLL_INTERVAL_MS,
   SpawnLock,
   assertSocketDirIsPrivate,
+  attachOrSpawn,
   findDaemonBinary,
   socketIsLive,
 } from "../../src/startup/spawn";
@@ -202,6 +203,114 @@ describe("the spawn lock (§2.3)", () => {
     utimesSync(path, recent, recent);
     expect(SpawnLock.acquire(path, Date.now())).toBeNull();
   });
+});
+
+describe("attach never destroys a live socket (§2.3)", () => {
+  /**
+   * A live socket is attached to and left alone.
+   *
+   * # What this covers, stated accurately
+   *
+   * This exercises the **pre-lock** fast path — `connect()` succeeds, so
+   * `attachOrSpawn` returns before touching the lock. That is the ~1 ms path
+   * §2.3 opens with, and it is worth pinning: the assertion that the socket
+   * still exists afterwards is what would catch an "unlink stale socket" step
+   * that ran before probing.
+   *
+   * It is **not** a test of the post-lock re-`connect()`, and an earlier draft
+   * of this comment claimed it was. Sabotage settled it: with that branch
+   * replaced by `if (false && …)` this test still passes, because it never
+   * reaches the branch.
+   *
+   * # Why the post-lock re-connect has no test here
+   *
+   * Reaching it requires the socket to be **dead at the first probe and live
+   * by the time the lock is acquired** — the window where a loser takes the
+   * lock after the winner released it. Both probes are inside one async
+   * function with no seam between them, so hitting that window needs either
+   * dependency injection into `attachOrSpawn` or a sleep tuned to land inside
+   * a few hundred microseconds.
+   *
+   * Neither is worth it. Injection would exist only for the test and would
+   * make the production path a shape nothing else uses; a tuned sleep would
+   * hit the window by luck now and silently stop hitting it on a faster
+   * machine, which is the worst outcome available — a green test that stopped
+   * testing. What is recorded instead:
+   *
+   * - `startup/spawn.ts` argues the branch's necessity where it lives.
+   * - Sabotaging **both** guards makes the three-racer T2 case produce
+   *   3 daemons, so the pair is provably load-bearing.
+   * - Sabotaging only this one leaves both suites green, which is the honest
+   *   coverage gap and is stated rather than hidden.
+   */
+  test("a live socket is attached to, and is not unlinked", async () => {
+    const dir = scratch();
+    const socket = join(dir, "daemon.sock");
+    const lock = join(dir, "daemon.lock");
+    const server = Bun.serve({
+      unix: socket,
+      fetch: () => Response.json({ status: "ok" }),
+    });
+    cleanup.push(() => server.stop(true));
+
+    const outcome = await attachOrSpawn({
+      // A binary that would fail loudly if it were ever reached — so a
+      // regression here cannot pass by spawning something harmless.
+      binary: "/nonexistent/buzz-daemon",
+      socket,
+      lock,
+      relayUrl: "wss://relay.invalid",
+      pubkey: "aa".repeat(32),
+      passphrase: "",
+    });
+
+    expect(outcome.kind).toBe("attached");
+    // The socket survives. Unlinking a *live* socket is the damage §2.3's
+    // probe-before-unlink ordering exists to prevent: the running daemon keeps
+    // going with nothing listening at its path, and the next launch starts a
+    // second one on the same (relay, identity).
+    expect(existsSync(socket)).toBe(true);
+    expect(await socketIsLive(socket)).toBe(true);
+    // No lock was taken on the fast path, so nothing was left behind to block
+    // the next launch.
+    expect(existsSync(lock)).toBe(false);
+  }, 30_000);
+
+  test("a dead socket IS spawned over, and a bad binary is a clean failure", async () => {
+    // The other half — without it the test above would be satisfiable by an
+    // implementation that never spawns at all.
+    //
+    // It also pins a defect this test found: `Bun.spawn` **throws
+    // synchronously** when the binary cannot be exec'd, rather than producing
+    // a child that exits. That escaped `attachOrSpawn`'s `{kind: "failed"}`
+    // contract entirely, so a stale `BUZZ_DAEMON_BIN` would have surfaced as
+    // an unhandled rejection instead of a sentence.
+    const dir = scratch();
+    const socket = join(dir, "daemon.sock");
+    const lock = join(dir, "daemon.lock");
+    writeFileSync(socket, "");
+
+    const outcome = await attachOrSpawn({
+      binary: "/nonexistent/buzz-daemon",
+      socket,
+      lock,
+      relayUrl: "wss://relay.invalid",
+      pubkey: "aa".repeat(32),
+      passphrase: "",
+    });
+
+    // The spawn was attempted and failed, because the binary does not exist —
+    // which is the point: it got past the attach branch.
+    expect(outcome.kind).toBe("failed");
+    // …and it failed *through the contract*, naming the binary, rather than by
+    // throwing. The message is what an operator with a stale `BUZZ_DAEMON_BIN`
+    // sees, so it has to name the path they need to fix.
+    if (outcome.kind !== "failed") throw new Error("unreachable");
+    expect(outcome.reason).toContain("/nonexistent/buzz-daemon");
+    // The stale socket was unlinked (it was confirmed dead first) and the lock
+    // released, so a failed spawn leaves nothing blocking the next attempt.
+    expect(existsSync(lock)).toBe(false);
+  }, 30_000);
 });
 
 describe("the spawn deadline is measured, not guessed", () => {
