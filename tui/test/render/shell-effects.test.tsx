@@ -97,10 +97,48 @@ async function mount(sendFails = false) {
 }
 
 /**
+ * Drive renders until `predicate` holds, or fail naming what was awaited.
+ *
+ * The Shell's effects are async and the key handler deliberately does not await
+ * them (a rethrow from a key handler is an unhandled rejection, which under
+ * Bun can take the process down — see `Shell.tsx`'s `perform`). So every
+ * assertion in this file has to wait for a drain that publishes no completion
+ * signal.
+ *
+ * A **fixed** `Bun.sleep(20)` is a guess about scheduler latency, and the guess
+ * is false on a loaded machine: at load 50+ on 16 cores the microtask that
+ * records the call has simply not run yet, so the suite goes red against a
+ * product that is green. That is the worst class of test failure — it costs a
+ * bisect to learn there was never a defect, and it trains the next author to
+ * dismiss a real one.
+ *
+ * Polling the condition with a deadline is the same assertion minus the
+ * assumption. It returns as fast as the 20 ms version ever did — the first
+ * iteration usually holds — and it survives the slow case instead of
+ * fabricating a regression from it.
+ */
+async function settleUntil(
+  t: Awaited<ReturnType<typeof mount>>["t"],
+  predicate: () => boolean,
+  what: string,
+  timeoutMs = 15_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    await t.renderOnce();
+    if (predicate()) return;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await Bun.sleep(5);
+  }
+}
+
+/**
  * Compose `text` in the mentioned channel and press `⏎`.
  *
  * `→` from boot teleports into the channel of the top mention (§4.4), which is
- * the shortest route to a layer whose composer posts.
+ * the shortest route to a layer whose composer posts. Returns with the key
+ * pressed and **nothing awaited**: which drained effect the test is waiting on
+ * is the test's business, and it says so through {@link settleUntil}.
  */
 async function composeAndSend(
   t: Awaited<ReturnType<typeof mount>>["t"],
@@ -111,16 +149,13 @@ async function composeAndSend(
   await t.mockInput.typeText(text);
   await t.renderOnce();
   t.mockInput.pressEnter();
-  // The send is async and the key handler does not await it, so give the
-  // microtask queue a turn before asserting on what the client saw.
-  await Bun.sleep(20);
-  await t.renderOnce();
 }
 
 test("the Shell calls client.send when ⏎ is pressed with composer text", async () => {
   const { client, t } = await mount();
 
   await composeAndSend(t, "ship it");
+  await settleUntil(t, () => client.sends.length > 0, "client.send");
 
   // The assertion is on the *call*, not on `state.pending`. A reducer test
   // cannot distinguish "decided to send" from "sent", and that is exactly the
@@ -134,6 +169,14 @@ test("a rejected send restores the text rather than losing it silently", async (
   const { client, t } = await mount(true);
 
   await composeAndSend(t, "will fail");
+  // Two drains deep: the send must be *attempted*, and the rejection must have
+  // been caught and the text written back. Waiting on the restored frame rather
+  // than on the call is what makes this the assertion it claims to be.
+  await settleUntil(
+    t,
+    () => t.captureCharFrame().includes("will fail"),
+    "the rejected text to be restored",
+  );
 
   expect(client.sends).toHaveLength(1);
   // A cleared composer plus a message that never arrived is indistinguishable
@@ -160,10 +203,11 @@ test("descending into a channel asks the client for its timeline", async () => {
   const { client, t } = await mount();
 
   t.mockInput.pressArrow("right");
-  await t.renderOnce();
-  // The effect is async and the render does not await it.
-  await Bun.sleep(20);
-  await t.renderOnce();
+  await settleUntil(
+    t,
+    () => client.messageLoads.length > 0,
+    "client.ensureMessages",
+  );
 
   expect(client.messageLoads.length).toBeGreaterThan(0);
   expect(client.messageLoads[0]).toBeTruthy();
