@@ -284,6 +284,16 @@ export interface Snapshot {
   readonly usage: Readonly<Record<string, Usage>>;
   readonly mentionCandidates: readonly MentionCandidate[];
   readonly readMarkers?: Readonly<Record<string, string>>;
+  /**
+   * Endpoints this daemon answered `404` for — `UdsClient.missing`.
+   *
+   * Carried on the snapshot rather than read off the client because it is what
+   * makes an empty list legible (§1.3 property 3): "no channels" and "the
+   * channels endpoint is not mounted" must not look the same, and the screens
+   * are where that distinction has to be drawn. Absent for a transport that
+   * mounts everything, which is the fixture case.
+   */
+  readonly missing?: readonly string[];
 }
 
 /**

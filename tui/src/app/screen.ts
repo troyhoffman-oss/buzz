@@ -44,6 +44,8 @@ import { buildHomeRows, renderHome, type HomeRow } from "../layers/home";
 import { buildThread, renderThread } from "../layers/thread";
 import { localSearch, parseQuery, renderResults } from "../layers/search";
 import { FOCUS_GLYPH, POSITION_GLYPH } from "../render/bands";
+import { type EmptyContext, emptyStateRows } from "../render/emptystate";
+import { pad } from "../render/width";
 import { type BottomBand, renderFrame } from "../shell/frame";
 import { MIN_COLS, MIN_ROWS, isBelowFloor } from "../shell/tiers";
 import {
@@ -216,6 +218,20 @@ function channelMessages(state: AppState) {
     .sort((a, b) => a.ts - b.ts);
 }
 
+/**
+ * What an empty list needs to explain itself (§1.3 property 3).
+ *
+ * Both halves come off the snapshot rather than being re-derived from the
+ * absence of rows, because the absence is exactly what cannot tell the three
+ * causes apart — see `render/emptystate.ts`.
+ */
+function emptyContext(state: AppState): EmptyContext {
+  return {
+    connection: state.snapshot.session.connection,
+    missing: state.snapshot.missing ?? [],
+  };
+}
+
 function renderBody(state: AppState, cols: number, now: number): Body {
   const layer = current(state.stack);
   const focused = composerOwnsFocus(state);
@@ -233,6 +249,27 @@ function renderBody(state: AppState, cols: number, now: number): Body {
     }
     case "channels": {
       const rows = channelRows(state);
+      // Two different emptinesses, and conflating them is the bug §1.3
+      // property 3 describes. A filter that matched nothing is a statement
+      // about the *query* — the list is fine, your three letters missed — and
+      // it must not accuse the transport. Only an empty source list can be
+      // caused by the daemon.
+      if (state.snapshot.channels.length === 0) {
+        const rendered = emptyStateRows(
+          "channels",
+          "/channel",
+          emptyContext(state),
+          cols,
+        );
+        return { rows: rendered, anchor: "top", count: 0 };
+      }
+      if (rows.length === 0) {
+        return {
+          rows: [pad("  no channels match", cols)],
+          anchor: "top",
+          count: 0,
+        };
+      }
       const rendered = renderChannels(rows, layer.selection, cols, focused);
       return {
         rows: rendered,
@@ -243,6 +280,15 @@ function renderBody(state: AppState, cols: number, now: number): Body {
     }
     case "agents": {
       const agents = sortFleet(state.snapshot.agents);
+      if (agents.length === 0) {
+        const rendered = emptyStateRows(
+          "agents",
+          "/agent/fleet",
+          emptyContext(state),
+          cols,
+        );
+        return { rows: rendered, anchor: "top", count: 0 };
+      }
       const rendered = renderFleet(agents, layer.selection, cols, now, focused);
       return {
         rows: rendered,

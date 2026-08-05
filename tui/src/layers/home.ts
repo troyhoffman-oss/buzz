@@ -76,6 +76,23 @@ export type HomeZone = "community" | "attention" | "places";
 /** The PLACES rows of the §1 map. Preview-gated rows are absent, not disabled. */
 export type PlaceId = "channels" | "agents" | "settings" | "me";
 
+/**
+ * The tag a not-yet-shipped destination carries — DESIGN.md §3.7.
+ *
+ * > The palette renders unshipped commands **greyed with a `Wave 2` tag**
+ * > rather than hiding them, which teaches the roadmap instead of teaching
+ * > absence.
+ *
+ * Applied here to a *row* for the same reason it is applied to a command: the
+ * alternative is a row that looks live and swallows `→`.
+ */
+export const WAVE_2_TAG = "Wave 2";
+
+/** Whether `→` on this place has a layer to descend into (§4.1.3). */
+export function placeIsShipped(place: PlaceId): boolean {
+  return place === "channels" || place === "agents";
+}
+
 /** State home renders from. */
 export interface HomeState {
   readonly communities: readonly Community[];
@@ -157,13 +174,25 @@ export function buildHomeRows(state: HomeState): HomeRow[] {
     label: "Agents",
     status: state.agentsWorking > 0 ? `${state.agentsWorking} working` : "",
   });
+  // §4.1.3 puts the settings screen and the self-profile out of Wave 1 ("no
+  // settings screen beyond `:set theme`, `:set leader`, and `:set mouse`"), so
+  // neither row has a layer to descend into yet. They are still *rendered*,
+  // carrying the same `Wave 2` tag §3.7 gives an unshipped palette command:
+  //
+  // > The palette renders unshipped commands **greyed with a `Wave 2` tag**
+  // > rather than hiding them, which teaches the roadmap instead of teaching
+  // > absence.
+  //
+  // Rendering them untagged was the actual defect — `→` landed on a row that
+  // looked exactly like `Channels` and did nothing at all, which is the silence
+  // §1.3 property 2 forbids by name.
   rows.push({
     kind: "place",
     place: "settings",
     label: "Settings",
-    status: "",
+    status: WAVE_2_TAG,
   });
-  rows.push({ kind: "place", place: "me", label: "Me", status: "" });
+  rows.push({ kind: "place", place: "me", label: "Me", status: WAVE_2_TAG });
 
   return rows;
 }
@@ -238,6 +267,9 @@ export function descendTarget(row: HomeRow): Layer | null {
         return { kind: "channels", crumb: "channels", selection: 0 };
       if (row.place === "agents")
         return { kind: "agents", crumb: "agents", selection: 0 };
+      // `settings` and `me` are Wave 2 (§4.1.3). `null` here is still "no
+      // descent", but the row now says so on its face via {@link WAVE_2_TAG}
+      // rather than looking identical to the two rows above it.
       return null;
     default:
       return null;

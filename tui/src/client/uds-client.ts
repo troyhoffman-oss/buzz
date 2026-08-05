@@ -267,6 +267,10 @@ export class UdsClient implements DaemonClient {
       transcripts,
       usage,
       mentionCandidates: [],
+      // Copied, not aliased: `missing` keeps growing as later requests 404, and
+      // a snapshot that mutated underneath a render would make the same frame
+      // disagree with itself.
+      missing: [...this.missing],
     };
   }
 
