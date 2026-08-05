@@ -42,7 +42,15 @@ interface Prompt {
   readonly title: string;
   /** One or two lines of context under the question. */
   readonly body: readonly string[];
-  /** Placeholder shown in an empty field. */
+  /**
+   * Placeholder shown in an empty field.
+   *
+   * `""` on a **fieldless** step ({@link isFieldless}), where no field renders
+   * and a placeholder would be copy that reads as live and never appears. A
+   * PTY run caught exactly that: the welcome screen carried "press enter to
+   * begin", which was invisible on screen and therefore unassertable — the
+   * affordance is in {@link Prompt.hints}, where it does render.
+   */
   readonly placeholder: string;
   /** Key hints for the bottom band. */
   readonly hints: readonly string[];
@@ -68,7 +76,7 @@ const PROMPTS: Record<OnboardingStep, Prompt> = {
       "Your key is generated (or imported) locally and stored",
       "encrypted on this machine. It is never sent anywhere.",
     ],
-    placeholder: "press enter to begin",
+    placeholder: "",
     hints: ["⏎ begin", "ctrl+c quit"],
   },
   relay: {

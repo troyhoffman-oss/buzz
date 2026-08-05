@@ -16,6 +16,23 @@ const SCRIPT = new URL("../../scripts/check-boundary.sh", import.meta.url)
 const CWD = new URL("../../", import.meta.url).pathname;
 const PROBE_DIR = `${CWD}src/__boundary_probe__`;
 
+/**
+ * Per-case timeout for the gate.
+ *
+ * The script is a per-file `awk` comment-stripper followed by four `grep -r`
+ * passes, so its cost grows with `src/` — and every case here spawns a whole
+ * run. Measured at ~1.6 s standalone once the transport and onboarding modules
+ * landed, but `bun test` runs cases concurrently and three parallel copies
+ * contend, which pushed them past the 5 s default and produced three
+ * simultaneous "timed out" failures that read as a *gate* regression rather
+ * than a scheduling one.
+ *
+ * Raised rather than the script made lazy: a boundary gate that skips files to
+ * stay fast is a boundary gate with a hole, and the standalone run (which is
+ * what CI executes) is comfortably inside its own budget.
+ */
+const GATE_TIMEOUT_MS = 30_000;
+
 /** Run the gate with one probe file present. Returns its exit code. */
 function runWithProbe(name: string, contents: string): number {
   mkdirSync(PROBE_DIR, { recursive: true });
@@ -32,7 +49,7 @@ describe("clean source passes", () => {
   test("the real src/ tree holds no protocol knowledge", () => {
     const result = Bun.spawnSync(["bash", SCRIPT], { cwd: CWD });
     expect(result.exitCode).toBe(0);
-  });
+  }, GATE_TIMEOUT_MS);
 
   test("a same-prefixed unrelated package is not a protocol import", () => {
     // The import rule must anchor on the package root plus a subpath or quote,
@@ -44,7 +61,7 @@ describe("clean source passes", () => {
         'import { Widget } from "nostrich-ui";\nexport const w = Widget;\n',
       ),
     ).toBe(0);
-  });
+  }, GATE_TIMEOUT_MS);
 
   test("ordinary front-end code does not trip the gate", () => {
     // Topic names, small numbers, and a string that merely contains comment
@@ -59,13 +76,13 @@ describe("clean source passes", () => {
         ].join("\n"),
       ),
     ).toBe(0);
-  });
+  }, GATE_TIMEOUT_MS);
 });
 
 describe("violations are caught", () => {
   test("a bare event kind", () => {
     expect(runWithProbe("kind.ts", "export const k = 40002;\n")).toBe(1);
-  });
+  }, GATE_TIMEOUT_MS);
 
   test("a kind on a constant not named 'kind'", () => {
     // Regression: the gate once matched only `kind`-adjacent numbers, so
@@ -75,7 +92,7 @@ describe("violations are caught", () => {
     expect(
       runWithProbe("named.ts", "export const OBSERVER_FRAME = 24200;\n"),
     ).toBe(1);
-  });
+  }, GATE_TIMEOUT_MS);
 
   test("the kind-scan exemption is exact-path, not prefix or glob", () => {
     // `src/time/units.ts` is exempted from rule 2 so `1000` has one auditable
@@ -84,7 +101,7 @@ describe("violations are caught", () => {
     // "one file of time constants" into a place kinds could be parked, which is
     // the false negative the blanket digit rule exists to prevent.
     expect(runWithProbe("units.ts", "export const k = 40002;\n")).toBe(1);
-  });
+  }, GATE_TIMEOUT_MS);
 
   test("a kind on a line after a URL literal", () => {
     // Regression: the comment stripper used `sub(/\/\/.*$/, "")`, which
@@ -99,13 +116,13 @@ describe("violations are caught", () => {
         ].join("\n"),
       ),
     ).toBe(1);
-  });
+  }, GATE_TIMEOUT_MS);
 
   test("a raw nsec reference", () => {
     expect(
       runWithProbe("nsec.ts", 'export const body = { nsec: "x" };\n'),
     ).toBe(1);
-  });
+  }, GATE_TIMEOUT_MS);
 
   test("an actual bech32 nsec literal", () => {
     // Regression, and the worst false negative this gate has had: the rule was
@@ -119,7 +136,7 @@ describe("violations are caught", () => {
         'export const k = "nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqq";\n',
       ),
     ).toBe(1);
-  });
+  }, GATE_TIMEOUT_MS);
 
   test("an ncryptsec literal", () => {
     // §2.5 puts `ncryptsec1` in the daemon's redactor superset; the encrypted
@@ -127,7 +144,7 @@ describe("violations are caught", () => {
     expect(
       runWithProbe("encrypted.ts", 'export const k = "ncryptsec1abc";\n'),
     ).toBe(1);
-  });
+  }, GATE_TIMEOUT_MS);
 
   test("a protocol package imported without being declared", () => {
     // Regression: rule 1 scanned only package.json, so a transitive,
@@ -139,7 +156,7 @@ describe("violations are caught", () => {
         'import { getPublicKey } from "nostr-tools";\nexport const p = getPublicKey;\n',
       ),
     ).toBe(1);
-  });
+  }, GATE_TIMEOUT_MS);
 
   test("a protocol package imported by subpath", () => {
     expect(
@@ -148,17 +165,17 @@ describe("violations are caught", () => {
         'import { schnorr } from "@noble/curves/secp256k1";\nexport const s = schnorr;\n',
       ),
     ).toBe(1);
-  });
+  }, GATE_TIMEOUT_MS);
 
   test("a cursor decode", () => {
     expect(
       runWithProbe("cursor.ts", "export const d = (c: string) => atob(c);\n"),
     ).toBe(1);
-  });
+  }, GATE_TIMEOUT_MS);
 
   test("a literal hex colour", () => {
     expect(runWithProbe("colour.ts", 'export const c = "#ff00aa";\n')).toBe(1);
-  });
+  }, GATE_TIMEOUT_MS);
 });
 
 describe("comments do not trip the gate", () => {
@@ -177,11 +194,11 @@ describe("comments do not trip the gate", () => {
         ].join("\n"),
       ),
     ).toBe(0);
-  });
+  }, GATE_TIMEOUT_MS);
 
   test("a line comment is stripped too", () => {
     expect(
       runWithProbe("line.ts", "export const ok = true; // kind 40002\n"),
     ).toBe(0);
-  });
+  }, GATE_TIMEOUT_MS);
 });

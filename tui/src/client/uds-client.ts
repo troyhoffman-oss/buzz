@@ -195,20 +195,29 @@ export class UdsClient implements DaemonClient {
       .map((row) => decodeAgent(row, nowMs))
       .filter((a): a is Agent => a !== undefined);
 
-    // Per-agent activity is one request each, and only for agents the fleet
-    // actually reported — an unbounded fan-out over a directory would be a
-    // request storm on a box with many idle agents.
+    // Per-agent activity and usage, one request each and **only for agents the
+    // fleet actually reported** — an unbounded fan-out over a directory would
+    // be a request storm on a box with many idle agents.
+    //
+    // Two endpoints rather than one because they are two endpoints: `/activity`
+    // returns `{frames}` and nothing else (`api.rs`'s `agent_activity`), and
+    // usage lives on `/metric`. An earlier draft read a `usage` field off the
+    // activity body, which would have decoded to `undefined` forever and shown
+    // every agent as reporting nothing — silently, since §3.4.1's null rule
+    // makes "not reported" a legitimate rendering.
     const transcripts: Record<string, TranscriptRow[]> = {};
     const usage: Record<string, Usage> = {};
     await Promise.all(
       agents.map(async (agent) => {
-        const activity = await this.get(`/agent/${agent.pubkey}/activity`);
-        if (!activity) return;
+        const [activity, metric] = await Promise.all([
+          this.get(`/agent/${agent.pubkey}/activity`),
+          this.get(`/agent/${agent.pubkey}/metric`),
+        ]);
         const rows = asArray(activity, "frames")
           .map(decodeTranscriptRow)
           .filter((r): r is TranscriptRow => r !== undefined);
         if (rows.length > 0) transcripts[agent.pubkey] = rows;
-        const decoded = decodeUsage(asObject(activity)?.usage);
+        const decoded = decodeUsage(asObject(metric)?.metric ?? metric);
         if (decoded) usage[agent.pubkey] = decoded;
       }),
     );

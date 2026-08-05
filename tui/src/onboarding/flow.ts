@@ -194,6 +194,35 @@ function clearSecrets(state: OnboardingState): OnboardingState {
   return { ...state, secret: { imported: "", passphrase: "", unlock: "" } };
 }
 
+/**
+ * The secret field a step governs, or `null` for a step that stores nothing
+ * secret.
+ *
+ * `passphraseConfirm` maps to `passphrase` even though it never *writes* one:
+ * it governs that value, and the operator leaving it has abandoned that value.
+ * Deriving the mapping here rather than inside {@link commitInput}'s switch is
+ * what fixes a defect the escape test caught — `commitInput` fell through to
+ * its `default` for `passphraseConfirm`, so `esc` off the confirm screen left
+ * the stored passphrase live behind a field that rendered as empty. It was
+ * invisible in every other way: the next `⏎` compared against a value the
+ * operator could not see and had not just typed.
+ */
+function secretFieldFor(
+  step: OnboardingStep,
+): keyof OnboardingState["secret"] | null {
+  switch (step) {
+    case "identityImport":
+      return "imported";
+    case "importUnlock":
+      return "unlock";
+    case "passphrase":
+    case "passphraseConfirm":
+      return "passphrase";
+    default:
+      return null;
+  }
+}
+
 /** Store a step's edited value into whichever field that step owns. */
 function commitInput(
   state: OnboardingState,
@@ -212,8 +241,20 @@ function commitInput(
     case "passphrase":
       return { ...state, secret: { ...state.secret, passphrase: value } };
     default:
+      // Including `passphraseConfirm`, which compares rather than stores. See
+      // {@link secretFieldFor} for why leaving it here is safe now.
       return state;
   }
+}
+
+/** Wipe the one secret field a step governs, if it governs one. */
+function clearSecretFor(
+  state: OnboardingState,
+  step: OnboardingStep,
+): OnboardingState {
+  const field = secretFieldFor(step);
+  if (!field) return state;
+  return { ...state, secret: { ...state.secret, [field]: "" } };
 }
 
 /** Move to `step` with an empty field. */
@@ -360,10 +401,7 @@ export function applyOnboardingKey(
     // Stepping back off a secret field clears it. Keeping it would mean a
     // passphrase surviving in memory for a step the operator explicitly left,
     // and would silently pre-fill a field that renders as empty.
-    const cleared = isSecretStep(state.step)
-      ? commitInput(state, state.step, "")
-      : state;
-    return goTo(cleared, back);
+    return goTo(clearSecretFor(state, state.step), back);
   }
 
   if (state.step === "identityChoice") {

@@ -32,13 +32,12 @@ import { render } from "@opentui/solid";
 import type { DaemonClient } from "./client/daemon-client";
 import { FixtureClient } from "./client/fixture-client";
 import { UdsClient } from "./client/uds-client";
-import { Wizard } from "./onboarding/Wizard";
 import {
   listIdentities,
   resolveSocketPaths,
   writeConfig,
 } from "./onboarding/provision";
-import { Shell } from "./shell/Shell";
+import { Root } from "./shell/Root";
 import { type TuiConfig, configPath } from "./startup/paths";
 import { attachOrSpawn, findDaemonBinary, socketIsLive } from "./startup/spawn";
 
@@ -129,11 +128,39 @@ async function promptPassphrase(pubkeyPrefix: string): Promise<string> {
   return line;
 }
 
-/** Boot the app against a connected client. */
-async function runShell(client: DaemonClient): Promise<void> {
+/**
+ * Boot the one renderer.
+ *
+ * `client: null` starts on the onboarding screen; anything else starts on the
+ * app. **One `render()` call either way** — it never returns, so a second would
+ * build a second `CliRenderer` over a terminal the first still owns, and
+ * OpenTUI throws from its own constructor with a stack that reads as a crash.
+ * A PTY run found exactly that; `shell/Root.tsx` records the reasoning.
+ */
+async function boot(
+  client: DaemonClient | null,
+  daemonBinary: string,
+): Promise<void> {
   const clock = resolveClock();
   await render(
-    () => Shell({ client, now: clock, onQuit: () => process.exit(0) }),
+    () =>
+      Root({
+        client,
+        daemonBinary,
+        now: clock,
+        onQuit: () => process.exit(0),
+        connect: async (config, passphrase) => {
+          writeConfig(configPath(), config);
+          return attach(config, daemonBinary, passphrase);
+        },
+        onFatal: (message) => {
+          // The identity exists and the answers are on disk by this point, so
+          // the remedy is relaunching rather than re-answering. Exit rather
+          // than sitting on a screen that cannot make progress.
+          console.error(`buzz-tui: ${message}`);
+          process.exit(1);
+        },
+      }),
     {
       // **`exitOnCtrlC` must be off.** OpenTUI's default is to exit the process
       // on `ctrl+c` before any key handler runs, which silently defeats §5.5's
@@ -149,29 +176,6 @@ async function runShell(client: DaemonClient): Promise<void> {
   );
 }
 
-/** Run the first-run wizard, returning the config it wrote. */
-async function runOnboarding(daemonBinary: string): Promise<TuiConfig> {
-  return new Promise<TuiConfig>((resolve) => {
-    void render(
-      () =>
-        Wizard({
-          daemonBinary,
-          onQuit: () => process.exit(0),
-          onComplete: (result) => {
-            const config: TuiConfig = {
-              relayUrl: result.relayUrl,
-              pubkey: result.pubkey,
-              communityName: result.communityName,
-            };
-            writeConfig(configPath(), config);
-            resolve(config);
-          },
-        }),
-      { exitOnCtrlC: false },
-    );
-  });
-}
-
 /**
  * The §2.3 sequence: resolve → connect → health → attach, else spawn.
  *
@@ -185,6 +189,13 @@ async function runOnboarding(daemonBinary: string): Promise<TuiConfig> {
 async function attach(
   config: TuiConfig,
   daemonBinary: string,
+  /**
+   * A passphrase already in hand, from the wizard that just collected it.
+   *
+   * §2.5's one-prompt rule. When absent, the prompt below runs — and it can,
+   * because in that branch OpenTUI has not started and stdout is still ours.
+   */
+  known?: string,
 ): Promise<UdsClient> {
   const paths = await resolveSocketPaths(
     daemonBinary,
@@ -193,7 +204,8 @@ async function attach(
   );
 
   if (!(await socketIsLive(paths.socket))) {
-    const passphrase = await promptPassphrase(config.pubkey.slice(0, 8));
+    const passphrase =
+      known ?? (await promptPassphrase(config.pubkey.slice(0, 8)));
     const outcome = await attachOrSpawn({
       binary: daemonBinary,
       socket: paths.socket,
@@ -231,21 +243,21 @@ function idleTimeoutFromEnv(): number | undefined {
 }
 
 /**
- * Resolve the config, onboarding when there is none.
+ * Resolve the config, or `null` when this machine needs onboarding.
  *
  * The one subtlety: an identity can exist without a config — provisioned by
  * another front end, or by a run that crashed after writing the blob.
  * Onboarding in that case would mint a **second** identity beside the first,
  * so an existing identity plus a `BUZZ_RELAY_URL` adopts rather than re-asks.
  */
-async function resolveConfig(daemonBinary: string): Promise<TuiConfig> {
+async function resolveConfig(daemonBinary: string): Promise<TuiConfig | null> {
   const existing = await readConfig();
   if (existing) return existing;
 
   const identities = await listIdentities(daemonBinary);
   const pubkey = identities[0];
   const relayUrl = process.env.BUZZ_RELAY_URL;
-  if (!pubkey || !relayUrl) return runOnboarding(daemonBinary);
+  if (!pubkey || !relayUrl) return null;
 
   const adopted: TuiConfig = {
     relayUrl,
@@ -261,7 +273,9 @@ async function main(): Promise<void> {
   // by whatever config or daemon happens to exist on the machine.
   const fixture = process.env.BUZZ_TUI_FIXTURE;
   if (fixture) {
-    await runShell(new FixtureClient(await Bun.file(fixture).text()));
+    // No daemon binary is needed on this path and none is looked for: a fixture
+    // run must work on a machine that has never installed one.
+    await boot(new FixtureClient(await Bun.file(fixture).text()), "");
     return;
   }
 
@@ -270,11 +284,9 @@ async function main(): Promise<void> {
   // could start it.
   const explicitSocket = process.env.BUZZ_DAEMON_SOCKET;
   if (explicitSocket) {
-    await runShell(
-      await UdsClient.connect({
-        socket: explicitSocket,
-        now: resolveClock(),
-      }),
+    await boot(
+      await UdsClient.connect({ socket: explicitSocket, now: resolveClock() }),
+      "",
     );
     return;
   }
@@ -291,7 +303,11 @@ async function main(): Promise<void> {
   }
 
   const config = await resolveConfig(daemonBinary);
-  await runShell(await attach(config, daemonBinary));
+  // `null` is the first-run state: the renderer opens on the wizard, and the
+  // connect happens inside it once there is an identity to connect as. The
+  // attach for a *configured* machine happens here, **before** the renderer
+  // starts, so its passphrase prompt still owns stdout.
+  await boot(config ? await attach(config, daemonBinary) : null, daemonBinary);
 }
 
 await main();

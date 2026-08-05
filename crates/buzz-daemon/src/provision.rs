@@ -203,15 +203,11 @@ fn decode_secret(secret: &str, unlock: Option<&str>) -> Result<Keys> {
 /// there: this blob is not a backup of a key held somewhere else, it *is* the
 /// identity. A blob that cannot be reopened is an account the operator has
 /// permanently lost, discovered at next launch rather than now.
-fn seal(keys: &Keys, passphrase: &str) -> Result<String> {
+fn seal(keys: &Keys, passphrase: &str, log_n: u8) -> Result<String> {
     assert_writable_log_n()?;
-    let encrypted = EncryptedSecretKey::new(
-        keys.secret_key(),
-        passphrase,
-        IDENTITY_LOG_N,
-        KeySecurity::Unknown,
-    )
-    .map_err(|e| DaemonError::IdentityDecrypt(format!("encrypt identity: {e}")))?;
+    let encrypted =
+        EncryptedSecretKey::new(keys.secret_key(), passphrase, log_n, KeySecurity::Unknown)
+            .map_err(|e| DaemonError::IdentityDecrypt(format!("encrypt identity: {e}")))?;
     let blob = encrypted
         .to_bech32()
         .map_err(|e| DaemonError::IdentityDecrypt(format!("encode identity: {e}")))?;
@@ -271,6 +267,34 @@ fn write_private(path: &Path, contents: &str) -> Result<()> {
 /// the operator wrote down, and re-importing under the same one is a no-op
 /// worth naming rather than performing.
 pub fn provision(request: &ProvisionRequest, identity_dir: &Path) -> Result<ProvisionOutcome> {
+    provision_with_log_n(request, identity_dir, IDENTITY_LOG_N)
+}
+
+/// [`provision`] at an explicit scrypt cost.
+///
+/// # Why this is `pub(crate)` and not `pub`
+///
+/// Because a *product* caller choosing its own cost is exactly the mistake
+/// [`IDENTITY_LOG_N`] exists to prevent, and [`provision`] is the only entry
+/// point on the binary's path. This variant exists for **tests**, and the
+/// reason is measured rather than stylistic: scrypt at log-n 18 takes ~1.4 s
+/// optimized and **~105 s in a debug build**, which is what `cargo test` runs.
+/// Twelve provisioning cases at that cost put the crate's suite at 476 s —
+/// slow enough that the suite stops being run, which costs far more coverage
+/// than a lower KDF cost in a test does.
+///
+/// The cost is a **parameter, not a `cfg(test)` branch**: a branch would mean
+/// the production path and the tested path differ, and the one thing these
+/// tests are for is proving the artifact this code writes is the artifact
+/// startup can read. Every case still exercises the real NIP-49 encode,
+/// decode, and bech32 round trip; only the KDF work factor changes, and
+/// [`what_provisioning_writes_is_what_startup_can_read`] pins the production
+/// constant separately.
+pub(crate) fn provision_with_log_n(
+    request: &ProvisionRequest,
+    identity_dir: &Path,
+    log_n: u8,
+) -> Result<ProvisionOutcome> {
     check_passphrase(request.passphrase())?;
 
     let (keys, created) = match request {
@@ -294,7 +318,7 @@ pub fn provision(request: &ProvisionRequest, identity_dir: &Path) -> Result<Prov
     // the allocator may hand to something else. It is ciphertext rather than
     // key material, but it is ciphertext of the whole identity and costs
     // nothing to treat carefully.
-    let blob = Zeroizing::new(seal(&keys, request.passphrase())?);
+    let blob = Zeroizing::new(seal(&keys, request.passphrase(), log_n)?);
     write_private(&path, &blob)?;
     // After the blob, so a crash between the two leaves an identity that is
     // merely hard to enumerate rather than a sidecar pointing at nothing.
@@ -394,6 +418,30 @@ pub fn write_auth_tag(identity_dir: &Path, pubkey: &str, raw: &str) -> Result<Pa
 mod tests {
     use super::*;
 
+    /// scrypt cost for the cases below.
+    ///
+    /// **Measured, not chosen for taste.** At the production [`IDENTITY_LOG_N`]
+    /// of 18 a single seal-and-verify is ~105 s in a debug build — which is what
+    /// `cargo test` runs — and the dozen cases here took the whole crate's suite
+    /// from ~5 s to **476 s**. A suite that slow stops being run, which costs
+    /// more coverage than a lower work factor in a test ever could.
+    ///
+    /// What this does *not* weaken: every case still exercises the real NIP-49
+    /// encrypt, decrypt, bech32 encode, and header-`log_n` read. Only the KDF
+    /// iteration count changes, and it changes *through the same parameter the
+    /// production path passes* rather than through a `cfg(test)` branch — a
+    /// branch would mean the tested path and the shipped path are different
+    /// code, and proving they are the same is what these tests are for.
+    ///
+    /// [`what_provisioning_writes_is_what_startup_can_read`] pins the production
+    /// constant separately, so lowering this cannot hide a bad `IDENTITY_LOG_N`.
+    const TEST_LOG_N: u8 = 8;
+
+    /// [`provision`] at [`TEST_LOG_N`].
+    fn cheap(request: &ProvisionRequest, identity_dir: &Path) -> Result<ProvisionOutcome> {
+        provision_with_log_n(request, identity_dir, TEST_LOG_N)
+    }
+
     fn dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("temp dir")
     }
@@ -401,7 +449,7 @@ mod tests {
     #[test]
     fn create_writes_a_blob_that_reopens_to_the_same_pubkey() {
         let tmp = dir();
-        let outcome = provision(
+        let outcome = cheap(
             &ProvisionRequest::Create {
                 passphrase: "correct horse battery".into(),
             },
@@ -424,7 +472,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = dir();
         let nested = tmp.path().join("identity");
-        let outcome = provision(
+        let outcome = cheap(
             &ProvisionRequest::Create {
                 passphrase: "correct horse battery".into(),
             },
@@ -458,7 +506,7 @@ mod tests {
         let tmp = dir();
         let source = Keys::generate();
         let nsec = source.secret_key().to_bech32().unwrap();
-        let outcome = provision(
+        let outcome = cheap(
             &ProvisionRequest::Import {
                 secret: nsec,
                 passphrase: "correct horse battery".into(),
@@ -475,7 +523,7 @@ mod tests {
     fn import_accepts_bare_hex() {
         let tmp = dir();
         let source = Keys::generate();
-        let outcome = provision(
+        let outcome = cheap(
             &ProvisionRequest::Import {
                 secret: source.secret_key().to_secret_hex(),
                 passphrase: "correct horse battery".into(),
@@ -498,14 +546,14 @@ mod tests {
         let backup = EncryptedSecretKey::new(
             source.secret_key(),
             "desktop backup phrase",
-            IDENTITY_LOG_N,
+            TEST_LOG_N,
             KeySecurity::Unknown,
         )
         .unwrap()
         .to_bech32()
         .unwrap();
 
-        let outcome = provision(
+        let outcome = cheap(
             &ProvisionRequest::Import {
                 secret: backup,
                 passphrase: "a different tui phrase".into(),
@@ -530,7 +578,7 @@ mod tests {
         let backup = EncryptedSecretKey::new(
             source.secret_key(),
             "phrase",
-            IDENTITY_LOG_N,
+            TEST_LOG_N,
             KeySecurity::Unknown,
         )
         .unwrap()
@@ -546,7 +594,7 @@ mod tests {
         let backup = EncryptedSecretKey::new(
             source.secret_key(),
             "phrase",
-            IDENTITY_LOG_N,
+            TEST_LOG_N,
             KeySecurity::Unknown,
         )
         .unwrap()
@@ -570,7 +618,7 @@ mod tests {
     #[test]
     fn a_short_passphrase_is_refused_before_anything_is_written() {
         let tmp = dir();
-        let err = provision(
+        let err = cheap(
             &ProvisionRequest::Create {
                 passphrase: "short".into(),
             },
@@ -596,16 +644,21 @@ mod tests {
             passphrase: phrase.into(),
             unlock: None,
         };
-        provision(&request("correct horse battery"), tmp.path()).expect("first");
-        let err = provision(&request("a different phrase"), tmp.path()).unwrap_err();
+        cheap(&request("correct horse battery"), tmp.path()).expect("first");
+        let err = cheap(&request("a different phrase"), tmp.path()).unwrap_err();
         assert!(err.to_string().contains("already provisioned"), "{err}");
     }
 
+    /// The enumeration returns **full** pubkeys, which is what the socket-path
+    /// preimage of §2.2 needs — the blob's filename carries only eight
+    /// characters and NIP-49 is ciphertext, so without the `.pub` sidecar the
+    /// remaining 56 are unrecoverable and a launcher could tell *that* an
+    /// identity exists but never *which*.
     #[test]
-    fn provisioned_identities_lists_stems_and_is_empty_before_first_run() {
+    fn provisioned_identities_lists_full_pubkeys_and_is_empty_before_first_run() {
         let tmp = dir();
         assert!(provisioned_identities(&tmp.path().join("never-created")).is_empty());
-        let outcome = provision(
+        let outcome = cheap(
             &ProvisionRequest::Create {
                 passphrase: "correct horse battery".into(),
             },
@@ -614,9 +667,51 @@ mod tests {
         .unwrap();
         assert_eq!(
             provisioned_identities(tmp.path()),
-            vec![outcome.pubkey[..8].to_string()]
+            vec![outcome.pubkey.clone()]
         );
         assert!(is_provisioned(tmp.path(), &outcome.pubkey));
+    }
+
+    /// A blob whose sidecar is missing — hand-copied from another machine, or
+    /// written by a build predating the sidecar — is reported by its **stem**
+    /// rather than dropped. Reporting nothing would make that operator's
+    /// identity invisible to a flow whose whole job is noticing it, and they
+    /// would be onboarded into a second identity beside their first.
+    #[test]
+    fn a_blob_without_a_sidecar_still_lists_by_stem() {
+        let tmp = dir();
+        let outcome = cheap(
+            &ProvisionRequest::Create {
+                passphrase: "correct horse battery".into(),
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        std::fs::remove_file(pubkey_path_for(tmp.path(), &outcome.pubkey)).unwrap();
+        assert_eq!(
+            provisioned_identities(tmp.path()),
+            vec![outcome.pubkey[..8].to_string()]
+        );
+    }
+
+    /// A **corrupt** sidecar falls back to the stem rather than being trusted.
+    /// A socket path derived from a truncated preimage names a daemon that
+    /// looks right and shares nothing with the real one.
+    #[test]
+    fn a_corrupt_sidecar_is_not_trusted() {
+        let tmp = dir();
+        let outcome = cheap(
+            &ProvisionRequest::Create {
+                passphrase: "correct horse battery".into(),
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        std::fs::write(pubkey_path_for(tmp.path(), &outcome.pubkey), "not-a-pubkey").unwrap();
+        assert_eq!(
+            provisioned_identities(tmp.path()),
+            vec![outcome.pubkey[..8].to_string()]
+        );
     }
 
     /// The outcome is what crosses the process boundary to the TUI, so the
@@ -624,7 +719,7 @@ mod tests {
     #[test]
     fn the_outcome_carries_no_key_material() {
         let tmp = dir();
-        let outcome = provision(
+        let outcome = cheap(
             &ProvisionRequest::Create {
                 passphrase: "correct horse battery".into(),
             },

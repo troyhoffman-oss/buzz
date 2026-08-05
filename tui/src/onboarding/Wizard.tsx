@@ -32,9 +32,27 @@ import {
 export interface WizardProps {
   /** Path of the `buzz-daemon` binary that does the protocol work. */
   readonly daemonBinary: string;
-  /** Called once provisioning succeeds; the caller then boots the app. */
+  /**
+   * Called once provisioning succeeds; the caller then boots the app.
+   *
+   * **Carries the passphrase**, and that is deliberate rather than sloppy.
+   * §2.5: "The TUI prompts **once**, holds the passphrase in a zeroizing buffer
+   * for the duration of the startup fan-out, feeds each spawn's stdin, and
+   * zeroizes." The wizard has just collected it and the daemon spawn that
+   * immediately follows needs it; re-prompting would make a first run type the
+   * same passphrase **three** times — twice into the wizard and once more at a
+   * prompt — for no security gain, since the value has not left the process.
+   *
+   * A PTY run caught the alternative, and it was worse than annoying: the
+   * prompt is written to stdout while OpenTUI owns the screen, so it landed
+   * *inside* the rendered frame (`setup › donepassphrase for identity …`).
+   */
   readonly onComplete: (
-    result: ProvisionResult & { relayUrl: string; communityName: string },
+    result: ProvisionResult & {
+      relayUrl: string;
+      communityName: string;
+      passphrase: string;
+    },
   ) => void;
   /** Called on `ctrl+c`. */
   readonly onQuit: () => void;
@@ -101,13 +119,15 @@ export function Wizard(props: WizardProps) {
   ): Promise<void> {
     try {
       const result = await runProvision(props.daemonBinary, effect);
-      // Secrets are wiped **before** the caller runs, so the passphrase is not
-      // live in this component while the daemon spawn is in flight.
+      // The wizard's own copy of the secrets is wiped here; the passphrase then
+      // travels once, by value, to the caller that spawns the daemon (§2.5's
+      // one-prompt fan-out). Nothing secret remains in this component.
       setState((s) => onboardingSucceeded(s));
       props.onComplete({
         ...result,
         relayUrl: effect.relayUrl,
         communityName: effect.communityName,
+        passphrase: effect.passphrase,
       });
     } catch (error) {
       const message =
