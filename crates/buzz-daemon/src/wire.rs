@@ -361,14 +361,34 @@ pub fn apply_relay_event(
     };
 
     match outcome {
-        // Delivered. The watermark key is the `h` tag when there is one and the
-        // subscription otherwise: a watermark is per-channel for channel
-        // traffic and per-subscription for everything else, and mixing the two
-        // would let a busy channel advance the observer subscription's replay
-        // window past frames it never delivered.
+        // Delivered. The watermark key is the **subscription's own channel** —
+        // the id after `ch:` — and nothing else.
+        //
+        // It used to be `channel_of(event).unwrap_or(subscription_id)`, i.e.
+        // the `h` tag when present. That reads as equivalent and is not:
+        // **44100/44101 membership notifications carry an `h` tag naming the
+        // channel** (`buzz-relay/src/handlers/side_effects.rs:914`), so a
+        // membership event delivered on `member` advanced *that channel's*
+        // timeline watermark to the membership event's `created_at` — a
+        // timestamp with nothing to do with the channel's messages.
+        //
+        // Worst on the path directly above: a fresh join registers the channel
+        // at `last_seen: 0`, and the same call then moved it to now. The next
+        // `plan_subscriptions` therefore emitted `since: now - SKEW` instead of
+        // no `since` at all, and `CHANNEL_TAIL_LIMIT` was silently suppressed —
+        // you join a channel and its timeline is empty, with no error anywhere.
+        // The relay re-emits 44100 to every member on unarchive
+        // (`side_effects.rs:1608`), so one unarchive did this to everybody.
+        //
+        // Deriving the key from the subscription rather than from the payload
+        // is also the same rule the routing above already follows, and for the
+        // same reason: what a frame *is* is decided by which subscription
+        // delivered it, never by re-reading intent out of its tags.
         Ingested::Applied(_) => {
-            let key = channel_of(event).unwrap_or_else(|| subscription_id.to_string());
-            inner.session.subscriptions.observe(&key, created_at);
+            let key = subscription_id
+                .strip_prefix(SUB_CHANNEL_PREFIX)
+                .unwrap_or(subscription_id);
+            inner.session.subscriptions.observe(key, created_at);
         }
         // Dropped: un-dedupe it so a resubscribe can re-deliver it, and leave
         // the watermark where it was so the replay window still reaches back
@@ -532,9 +552,36 @@ fn apply_membership_event(inner: &mut Inner, event: &nostr::Event, created_at: u
     // Registering here is what makes the next `plan_subscriptions` include the
     // channel, and the REQ itself is paced out by the loop rather than sent
     // from this pure function.
+    //
+    // **Only for a join, and only for this identity.** The filter is
+    // `{kinds:[44100,44101], #p:[self]}` — it carries no `#h` scope and both
+    // kinds land here — so the unconditional form subscribed on *removal* too:
+    // being removed from a channel registered a permanent live tail on it, one
+    // the relay answers `CLOSED restricted:` to on every reconnect forever
+    // (`Subscriptions::subscribe` is `or_insert` with no cap, and
+    // `unsubscribe` has no production caller). A removal must do the opposite,
+    // and does.
     if let Some(channel_id) = channel_of(event).or_else(|| tag_value(event, "d")) {
         if uuid::Uuid::parse_str(&channel_id).is_ok() {
-            inner.session.subscriptions.subscribe(channel_id);
+            if kind_of(event) == crate::channels::KIND_MEMBER_REMOVED {
+                // Only when *we* were the one removed. A 44101 can also reach
+                // this daemon for a peer leaving a channel it is still in — the
+                // `#p` filter matches on the notification's target, but a relay
+                // is free to fan out more broadly, and dropping our own tail
+                // because somebody else left would be a silent blackout of a
+                // live channel. A keyless daemon has no self to compare against
+                // and therefore unsubscribes from nothing, which is right: it
+                // has no relay loop either.
+                let is_self = inner
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| tags_pubkey(event, &identity.pubkey));
+                if is_self {
+                    inner.session.subscriptions.unsubscribe(&channel_id);
+                }
+            } else {
+                inner.session.subscriptions.subscribe(channel_id);
+            }
         }
     }
 
@@ -869,6 +916,9 @@ pub async fn run(state: AppState, mut commands: tokio::sync::mpsc::Receiver<Wire
     // When the cold-start walk last succeeded. `None` means never, which is what
     // makes the first walk run immediately rather than one interval late.
     let mut last_discovery: Option<Instant> = None;
+    // Read-state is hydrated once per process, not per reconnect: after the
+    // first merge the in-memory map is ahead of or equal to the relay's.
+    let mut read_state_hydrated = false;
 
     loop {
         set_state(&state, ConnectionState::Connecting).await;
@@ -898,6 +948,11 @@ pub async fn run(state: AppState, mut commands: tokio::sync::mpsc::Receiver<Wire
         // registry, so ordering is the whole of the fix: hydrating afterwards
         // would open tails on the previous set and wait for the next reconnect.
         hydrate_channels(&state, &mut last_discovery).await;
+        // Before the tails open, so the unread counts the first frames land on
+        // are computed against the real frontier rather than against an empty
+        // one. The other order shows every message as unread for the width of
+        // one query and then silently corrects itself, which reads as a bug.
+        hydrate_read_state(&state, &mut read_state_hydrated).await;
 
         // A session ends by returning; the ladder and the pending publishes
         // survive it. Everything the connection owns is dropped here, so a
@@ -1127,6 +1182,102 @@ async fn hydrate_channels(state: &AppState, last: &mut Option<Instant>) -> Optio
     }
 }
 
+/// The filter that reads this identity's own read-state slots back (kind 30078).
+///
+/// Author-scoped to self and kind-explicit, so it satisfies §2.4's invariant by
+/// construction. `#d` is deliberately *not* constrained: slot ids rotate when a
+/// squatter is detected (`ReadState::rotate_slot`), and a filter pinned to the
+/// current id would silently miss the frontier written under the previous one.
+pub fn read_state_filter(self_pubkey: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kinds": [buzz_core::kind::KIND_READ_STATE],
+        "authors": [self_pubkey],
+        "limit": crate::readstate::MAX_SLOTS,
+    })
+}
+
+/// Read this identity's read-state frontier back off the relay at cold start.
+///
+/// **Without this a restart resurrects every message as unread**, and the
+/// second failure is worse than the first: the daemon *publishes* 30078 slots
+/// but never *queried* them, so the first `mark` after a restart wrote a
+/// frontier built from an empty map into the same `d` coordinate — overwriting
+/// the multi-device frontier on the relay with a nearly-empty one. Read-state is
+/// a CRDT whose merge is max-wins precisely so devices cannot rewind each other;
+/// skipping the read turned this daemon into the device that could.
+///
+/// Runs once per process rather than per reconnect: after the first merge the
+/// in-memory map is ahead of or equal to the relay's, and re-reading would
+/// re-decrypt every slot to learn nothing. `merge` is max-wins, so a re-read
+/// would be harmless — it is just waste.
+///
+/// Failure is not fatal, for the same reason [`hydrate_channels`]'s is not: a
+/// daemon that refused to start its loop because one query failed is worse than
+/// one whose unread counts are stale for a reconnect.
+async fn hydrate_read_state(state: &AppState, done: &mut bool) -> Option<usize> {
+    if *done {
+        return None;
+    }
+    let identity = state.identity_snapshot().await.ok()?;
+    let filter = read_state_filter(&identity.pubkey);
+    let events = match state.rest.query(&identity, &filter).await {
+        Ok(events) => events,
+        Err(err) => {
+            tracing::warn!(%err, "read-state hydration failed; unread counts start from empty");
+            return None;
+        }
+    };
+
+    // Decrypt outside the lock. NIP-44 over up to `MAX_SLOTS` blobs is real
+    // work, and doing it under the daemon's single mutex would stall every
+    // socket client for its duration — the rule `submit` and `hydrate_channels`
+    // both follow.
+    let keys = identity.signing_keys()?;
+    let mut blobs = Vec::new();
+    for event in &events {
+        let Some(content) = event.get("content").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Ok(plaintext) =
+            nostr::nips::nip44::decrypt(keys.secret_key(), &keys.public_key(), content)
+        else {
+            // A slot this identity cannot decrypt is not this identity's slot.
+            // Skipped rather than failed: one unreadable blob must not cost the
+            // frontier carried by the others.
+            continue;
+        };
+        if let Ok(blob) = serde_json::from_str::<crate::readstate::ReadStateBlob>(&plaintext) {
+            blobs.push(blob);
+        }
+    }
+
+    *done = true;
+    let mut inner = state.lock().await;
+    // Every decryptable blob is merged, including one written by a *different*
+    // client id. That is not an oversight: max-wins is convergent precisely so
+    // any device's markers can be folded in safely, and refusing another
+    // client's frontier would reintroduce the rewind this function exists to
+    // prevent. What slot ownership decides is where this daemon *writes*
+    // (`slot_is_squatted` drives `rotate_slot` on the publish path), not what it
+    // is allowed to read.
+    let merged = blobs
+        .iter()
+        .filter(|blob| inner.read_state.merge(blob))
+        .count();
+    // **`merge` does not set `dirty`; only `mark` does** (`readstate.rs:197`
+    // vs `:222`) — verified, because if it did, hydration would arm the
+    // read-state debounce and a cold start would publish a frontier nobody
+    // asked it to. That is a third write path, and the "exactly two" property
+    // this module's header states does not admit one.
+    tracing::info!(
+        slots = events.len(),
+        merged,
+        contexts = inner.read_state.len(),
+        "cold-start read-state hydration"
+    );
+    Some(merged)
+}
+
 /// Fail every publish past its deadline, so loss is never silent (§2.7).
 fn fail_expired(pending: &mut Vec<PendingPublish>) {
     pending.retain_mut(|item| {
@@ -1188,6 +1339,17 @@ async fn session_loop(
 
         // ── One paced REQ per tick, which is what keeps a 48-channel
         // resubscribe from bursting past the relay's ~50-frames/5 s admission.
+        //
+        // **No `continue` after sending.** An earlier revision had one, and
+        // because `TICK == REQ_PACING_INTERVAL` the pacing condition is true on
+        // essentially every tick while the queue is non-empty — so a resubscribe
+        // of N channels meant N consecutive ticks that did nothing else. During
+        // that window `drain_publishes` did not run (so a pending publish was
+        // not merely delayed, its `PUBLISH_DEADLINE` went *unmeasured*), the
+        // rate-limit gate could not disarm (exactly when a relay is most likely
+        // to have armed it), and the liveness probe could not fire. The timer
+        // above is what paces the REQs; skipping the rest of the body was never
+        // part of that and only starved it.
         if last_paced.elapsed() >= crate::session::REQ_PACING_INTERVAL {
             last_paced = Instant::now();
             if let Some(req) = queue.pop_front() {
@@ -1200,7 +1362,6 @@ async fn session_loop(
                 }
                 let mut inner = state.lock().await;
                 mark_subscription_active(&mut inner, &req.subscription_id);
-                continue;
             }
         }
 
@@ -2215,6 +2376,158 @@ mod tests {
         assert_eq!(
             inner.session.subscriptions.resubscribe_since(CHANNEL),
             Some(NOW as u64 - crate::session::SINCE_SKEW_SECS)
+        );
+    }
+
+    /// **M3 regression.** Read-state hydration must not arm the publish
+    /// debounce.
+    ///
+    /// The gate on the second write path is `ReadState::is_dirty`, and the
+    /// module header's "exactly two write paths" property rests on nothing else
+    /// setting it. `merge` does not (`readstate.rs:197` sets no flag; only
+    /// `mark` at `:222` does) — but that is a property of another module, so it
+    /// is pinned here rather than assumed. If it ever changed, a cold start
+    /// would publish a frontier nobody asked it to, over the live relay, on
+    /// every daemon launch.
+    #[tokio::test]
+    async fn merging_a_frontier_does_not_arm_the_publish_debounce() {
+        let state = AppState::new(config(), None).expect("state");
+        let mut inner = state.lock().await;
+        assert!(!inner.read_state.is_dirty());
+
+        let blob = crate::readstate::ReadStateBlob {
+            v: 1,
+            client_id: "another-device".into(),
+            contexts: [("channel:abc".to_string(), 1_785_000_000_u64)]
+                .into_iter()
+                .collect(),
+        };
+        assert!(inner.read_state.merge(&blob), "the frontier moved");
+        assert!(
+            !inner.read_state.is_dirty(),
+            "hydration is not a local edit; arming the debounce here would make \
+             a cold start publish, which is a third write path"
+        );
+    }
+
+    /// The read-state filter must be scoped to self and must not pin `#d`.
+    ///
+    /// Slot ids rotate when a squatter is detected
+    /// (`ReadState::rotate_slot`), so a filter pinned to the *current* id
+    /// silently misses the frontier written under the previous one — and the
+    /// symptom is indistinguishable from having no frontier at all.
+    #[tokio::test]
+    async fn the_read_state_filter_is_self_scoped_and_slot_agnostic() {
+        let me = "aa".repeat(32);
+        let filter = read_state_filter(&me);
+        crate::search::assert_explicit_kinds(&filter, "read-state").expect("explicit kinds");
+        assert_eq!(filter["authors"], serde_json::json!([me]));
+        assert!(
+            filter.get("#d").is_none(),
+            "pinning the slot id would miss a rotated slot's frontier"
+        );
+    }
+
+    /// **M3 regression.** A membership event must not move a *channel's*
+    /// timeline watermark.
+    ///
+    /// 44100/44101 carry an `h` tag naming the channel
+    /// (`buzz-relay/src/handlers/side_effects.rs:914`), and the watermark key
+    /// used to be that tag. So a join advanced the channel's `since` to the
+    /// join's own `created_at` — and since the same call had just registered
+    /// the channel at `last_seen: 0`, the very next `plan_subscriptions` asked
+    /// for `since: now - SKEW` instead of the full `CHANNEL_TAIL_LIMIT` tail.
+    /// You joined a channel and its timeline was empty, silently.
+    #[tokio::test]
+    async fn a_join_does_not_advance_the_channels_timeline_watermark() {
+        let state = AppState::new(config(), None).expect("state");
+        let mut inner = state.lock().await;
+
+        let author = Keys::generate();
+        let joined = EventBuilder::new(Kind::Custom(44_100), "")
+            .tags([
+                Tag::parse(["h", CHANNEL]).unwrap(),
+                Tag::public_key(author.public_key()),
+            ])
+            .custom_created_at(nostr::Timestamp::from_secs(NOW as u64))
+            .sign_with_keys(&author)
+            .expect("sign");
+        apply_relay_event(&mut inner, SUB_MEMBERSHIP, &joined, NOW);
+
+        assert_eq!(
+            inner.session.subscriptions.resubscribe_since(CHANNEL),
+            Some(0),
+            "a membership notification is not channel traffic; the tail must \
+             open with no `since` so CHANNEL_TAIL_LIMIT is what bounds it"
+        );
+        // The membership subscription's own replay window *does* advance —
+        // that half was always right and must not regress with the fix.
+        assert_eq!(
+            inner.session.subscriptions.membership_replay_since(None),
+            Some(NOW as u64)
+        );
+    }
+
+    /// **M3 regression.** Being removed from a channel must drop its tail, not
+    /// register one.
+    ///
+    /// The membership filter is `{kinds:[44100,44101], #p:[self]}` and both
+    /// kinds landed in the same unconditional `subscribe`. So a removal
+    /// *registered* a permanent live tail on a channel the relay would answer
+    /// `CLOSED restricted:` to on every reconnect forever — `subscribe` is an
+    /// `or_insert` with no cap and `unsubscribe` had no production caller.
+    #[tokio::test]
+    async fn a_removal_unsubscribes_rather_than_subscribing() {
+        let me = Keys::generate();
+        let identity = crate::identity::Identity::new(
+            me.public_key().to_hex(),
+            zeroize::Zeroizing::new(me.secret_key().to_secret_bytes().to_vec()),
+            None,
+        );
+        let state = AppState::new(config(), Some(identity)).expect("state");
+        let mut inner = state.lock().await;
+
+        let relay = Keys::generate();
+        let removed = EventBuilder::new(Kind::Custom(44_101), "")
+            .tags([
+                Tag::parse(["h", CHANNEL]).unwrap(),
+                Tag::public_key(me.public_key()),
+            ])
+            .custom_created_at(nostr::Timestamp::from_secs(NOW as u64))
+            .sign_with_keys(&relay)
+            .expect("sign");
+
+        inner.session.subscriptions.subscribe(CHANNEL);
+        apply_relay_event(&mut inner, SUB_MEMBERSHIP, &removed, NOW);
+        assert!(
+            inner
+                .session
+                .subscriptions
+                .resubscribe_since(CHANNEL)
+                .is_none(),
+            "our own removal must drop the tail"
+        );
+
+        // A *peer's* removal from a channel we are still in must not touch it.
+        // Dropping the tail there would be a silent blackout of a live channel.
+        let peer = Keys::generate();
+        let peer_left = EventBuilder::new(Kind::Custom(44_101), "")
+            .tags([
+                Tag::parse(["h", CHANNEL]).unwrap(),
+                Tag::public_key(peer.public_key()),
+            ])
+            .custom_created_at(nostr::Timestamp::from_secs(NOW as u64 + 1))
+            .sign_with_keys(&relay)
+            .expect("sign");
+        inner.session.subscriptions.subscribe(CHANNEL);
+        apply_relay_event(&mut inner, SUB_MEMBERSHIP, &peer_left, NOW);
+        assert!(
+            inner
+                .session
+                .subscriptions
+                .resubscribe_since(CHANNEL)
+                .is_some(),
+            "somebody else leaving must not close our tail"
         );
     }
 

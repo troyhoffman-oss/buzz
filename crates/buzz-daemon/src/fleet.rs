@@ -105,6 +105,15 @@ pub fn sort_fleet(rows: &mut [FleetRow]) {
 /// making progress.
 pub const REPEATED_TOOL_CALL_THRESHOLD: u32 = 3;
 
+/// Turn metrics retained per agent before the oldest is evicted.
+///
+/// Every consumer reads either `last()` (the token counts) or a fold over the
+/// retained window (the cost sum), so a bound costs nothing but the age of the
+/// cost figure. Unbounded is not a defensible alternative for a daemon whose
+/// documented deployment watches a fleet for days: `GET /agent/fleet` iterates
+/// this vector for every agent while holding the state mutex.
+pub const MAX_METRICS_PER_AGENT: usize = 512;
+
 /// Per-agent accumulator the fleet reduces over.
 ///
 /// Folded from the observer frames the daemon already decrypts and the 44200
@@ -123,7 +132,8 @@ pub struct AgentAccumulator {
     pub turn_started_at: Option<i64>,
     /// Whether the agent is awaiting an answer to an ask card.
     pub awaiting_answer: bool,
-    /// Metrics accumulated this session, newest last.
+    /// Metrics accumulated this session, newest last, capped at
+    /// [`MAX_METRICS_PER_AGENT`].
     pub metrics: Vec<crate::metric::TurnMetric>,
     /// The consecutive-identical-tool-call run, as a `(signature, count)` pair.
     repeat: Option<(String, u32)>,
@@ -187,8 +197,24 @@ impl AgentAccumulator {
         }
     }
 
-    /// Fold one 44200 turn metric in.
+    /// Fold one 44200 turn metric in, oldest evicted past the cap.
+    ///
+    /// Bounded because this was an unbounded `Vec` with no eviction and no
+    /// production `clear`, pushed on every 44200 for the life of the process —
+    /// and `GET /agent/fleet` iterates every agent's whole vector **under the
+    /// daemon's single mutex**, so the cost of the leak was paid by every other
+    /// socket client on every fleet read.
+    ///
+    /// Evicting the *oldest* is what keeps both consumers correct: `reduce_agent`
+    /// reads `last()` for the token counts, which the cap cannot touch, and sums
+    /// `cost_usd` across the retained window. The cost figure therefore becomes
+    /// "the last `MAX_METRICS_PER_AGENT` turns" rather than "the session", which
+    /// at 512 turns is a distinction no operator will meet before the daemon
+    /// restarts — and the honest alternative, an unbounded process, is not one.
     pub fn observe_metric(&mut self, metric: crate::metric::TurnMetric) {
+        if self.metrics.len() >= MAX_METRICS_PER_AGENT {
+            self.metrics.remove(0);
+        }
         self.metrics.push(metric);
     }
 
@@ -563,6 +589,35 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(reduce_agent("pk", &agent, NOW).tokens_per_min, None);
+    }
+
+    /// **M3 regression.** The metric accumulator is bounded.
+    ///
+    /// It was an unbounded `Vec` with no eviction and no production `clear`,
+    /// pushed on every 44200 for the life of the process — and `GET
+    /// /agent/fleet` iterates every agent's whole vector **under the daemon's
+    /// single mutex**, so a long-lived daemon watching a busy fleet made every
+    /// other socket client pay for the leak on every fleet read.
+    ///
+    /// The cap must not cost the reduction its correctness: `reduce_agent`
+    /// reads `last()`, which eviction-from-the-front cannot touch.
+    #[test]
+    fn the_metric_accumulator_is_bounded_and_keeps_the_newest() {
+        let mut agent = AgentAccumulator::default();
+        for i in 0..(MAX_METRICS_PER_AGENT + 50) {
+            agent.observe_metric(TurnMetric {
+                tokens_in: Some(i as u64),
+                tokens_out: Some(1),
+                ..Default::default()
+            });
+        }
+        assert_eq!(agent.metrics.len(), MAX_METRICS_PER_AGENT);
+        assert_eq!(
+            agent.metrics.last().and_then(|m| m.tokens_in),
+            Some((MAX_METRICS_PER_AGENT + 49) as u64),
+            "eviction takes the oldest, so the newest metric — the one every \
+             consumer reads — survives"
+        );
     }
 
     /// §5.2 / §3.4.1: "cost suppressed as a single figure when >1 model in
