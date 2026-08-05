@@ -19,6 +19,12 @@ import { initialState } from "../../src/app/state";
 import { withDefaultSelection } from "../../src/app/dispatch";
 import { emptyStateRows } from "../../src/render/emptystate";
 import type { Snapshot } from "../../src/client/types";
+import {
+  WAVE_2_TAG,
+  buildHomeRows,
+  descendTarget,
+  placeIsShipped,
+} from "../../src/layers/home";
 import { FIXED_NOW, Session } from "../helpers/drive";
 
 /** A snapshot with nothing in it — the shape a live Wave-1 daemon returns. */
@@ -188,6 +194,29 @@ describe("the list layers render it — measured against a live daemon", () => {
     expect(text).toContain("not connected to the relay");
   });
 
+  test("[G8] exactly one focus glyph survives an empty list", () => {
+    // Found by counting glyphs in the live captures after the first fix
+    // landed: L1 CHANNELS and L1 AGENTS rendered **zero** `❯`. The rule is
+    // "the list owns it while the composer is empty" — and a list with no rows
+    // has nowhere to put it. Zero is worse than two here: it says the keyboard
+    // goes nowhere, on the exact screen someone is trying to type into.
+    for (const layer of ["channels", "agents"] as const) {
+      const text = screenAt(layer, emptySnapshot());
+      const glyphs = text.split("").filter((c) => c === "\u276f").length;
+      expect(glyphs).toBe(1);
+    }
+  });
+
+  test("[G8] holds on a populated list too — the fallback is not always-on", () => {
+    // The inverse. A fallback that fired unconditionally would put `❯` on the
+    // composer *and* leave the list marking a row, which is the two-glyph
+    // failure the same rule forbids.
+    const s = Session.open("seeded-basic");
+    s.goTo("Channels").key("right");
+    expect(s.focusGlyphCount()).toBe(1);
+    expect(s.focusRow()).not.toContain("filter channels");
+  });
+
   test("a filter that matches nothing does not accuse the transport", () => {
     // Two different emptinesses. A query that missed is a statement about the
     // query; blaming the relay for it would send the operator to debug a
@@ -218,6 +247,30 @@ describe("§4.1.3 — an unshipped destination is tagged, never silent", () => {
     const rows = s.text().split("\n");
     expect(rows.find((r) => r.includes("Channels"))).not.toContain("Wave 2");
     expect(rows.find((r) => r.includes("Agents"))).not.toContain("Wave 2");
+  });
+
+  test("the tag and the descent come from one predicate, for every place", () => {
+    // The drift guard. Two hand-maintained lists — one deciding which rows get
+    // the tag, one deciding which rows descend — would eventually disagree,
+    // and the bad direction is silent: a row tagged `Wave 2` that descends
+    // anyway teaches the roadmap wrong. Swept over every PlaceId rather than
+    // spot-checked, so a fifth place cannot be added to only one of them.
+    const rows = buildHomeRows({
+      communities: [],
+      attention: [],
+      channels: [],
+      agentsWorking: 0,
+      collapsedGroups: new Set(),
+      collapsedZones: new Set(),
+    });
+    const places = rows.filter((r) => r.kind === "place");
+    expect(places.length).toBeGreaterThan(0);
+    for (const row of places) {
+      if (row.kind !== "place") continue;
+      const shipped = placeIsShipped(row.place);
+      expect(row.status === WAVE_2_TAG).toBe(!shipped);
+      expect(descendTarget(row) !== null).toBe(shipped);
+    }
   });
 
   test("→ on a Wave-2 place stays put rather than descending", () => {

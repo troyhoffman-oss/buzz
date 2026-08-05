@@ -71,7 +71,37 @@ import type { AppState } from "./state";
 export function composerOwnsFocus(state: AppState): boolean {
   if (state.drawer || state.messageSelect) return false;
   if (isChatLayer(current(state.stack).kind)) return true;
+  // **An empty picker list cannot hold the glyph.** [G8] says there is exactly
+  // one `❯` on screen and that it marks where keys go; a picker layer with no
+  // rows has nowhere to put it, so leaving the rule at "the list owns it while
+  // the composer is empty" renders **zero** — measured in the live L1 CHANNELS
+  // and L1 AGENTS captures, where the daemon legitimately has nothing to list.
+  //
+  // Zero is the worse failure of the two the rule guards against: two glyphs
+  // are confusing, none says the keyboard goes nowhere, on the exact screen an
+  // operator is trying to type a filter into. Focus falls back to the composer,
+  // which is both on screen and the only thing that can still act.
+  if (pickerListIsEmpty(state)) return true;
   return state.composer.length > 0;
+}
+
+/**
+ * Whether the current picker layer has no rows at all to select.
+ *
+ * Deliberately the *source* list rather than the filtered one: typing a query
+ * that matches nothing already moves `❯` to the composer by the rule below,
+ * because the composer is non-empty. It is the unfiltered-and-still-empty case
+ * that has no owner for the glyph.
+ */
+function pickerListIsEmpty(state: AppState): boolean {
+  switch (current(state.stack).kind) {
+    case "channels":
+      return state.snapshot.channels.length === 0;
+    case "agents":
+      return state.snapshot.agents.length === 0;
+    default:
+      return false;
+  }
 }
 
 /** The rows the current layer's body renders to, plus its selection axis. */

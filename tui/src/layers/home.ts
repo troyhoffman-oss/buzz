@@ -88,7 +88,15 @@ export type PlaceId = "channels" | "agents" | "settings" | "me";
  */
 export const WAVE_2_TAG = "Wave 2";
 
-/** Whether `→` on this place has a layer to descend into (§4.1.3). */
+/**
+ * Whether `→` on this place has a layer to descend into (§4.1.3).
+ *
+ * **One predicate, two consumers** — {@link buildHomeRows} decides which rows
+ * carry {@link WAVE_2_TAG} and {@link descendTarget} decides which rows descend.
+ * Two separate lists would eventually disagree, and the disagreement is silent
+ * in the worse direction: a row that descends without a tag looks fine, a row
+ * tagged `Wave 2` that descends anyway teaches the roadmap wrong.
+ */
 export function placeIsShipped(place: PlaceId): boolean {
   return place === "channels" || place === "agents";
 }
@@ -186,13 +194,17 @@ export function buildHomeRows(state: HomeState): HomeRow[] {
   // Rendering them untagged was the actual defect — `→` landed on a row that
   // looked exactly like `Channels` and did nothing at all, which is the silence
   // §1.3 property 2 forbids by name.
-  rows.push({
-    kind: "place",
-    place: "settings",
-    label: "Settings",
-    status: WAVE_2_TAG,
-  });
-  rows.push({ kind: "place", place: "me", label: "Me", status: WAVE_2_TAG });
+  for (const [place, label] of [
+    ["settings", "Settings"],
+    ["me", "Me"],
+  ] as const) {
+    rows.push({
+      kind: "place",
+      place,
+      label,
+      status: placeIsShipped(place) ? "" : WAVE_2_TAG,
+    });
+  }
 
   return rows;
 }
@@ -263,14 +275,14 @@ export function descendTarget(row: HomeRow): Layer | null {
         selection: 0,
       };
     case "place":
-      if (row.place === "channels")
-        return { kind: "channels", crumb: "channels", selection: 0 };
-      if (row.place === "agents")
-        return { kind: "agents", crumb: "agents", selection: 0 };
-      // `settings` and `me` are Wave 2 (§4.1.3). `null` here is still "no
-      // descent", but the row now says so on its face via {@link WAVE_2_TAG}
-      // rather than looking identical to the two rows above it.
-      return null;
+      // `settings` and `me` are Wave 2 (§4.1.3), so they have no layer. `null`
+      // is still "no descent" — but the row now says so on its face via
+      // {@link WAVE_2_TAG} rather than looking identical to the two above it,
+      // and both facts come from {@link placeIsShipped} so they cannot drift.
+      if (!placeIsShipped(row.place)) return null;
+      return row.place === "channels"
+        ? { kind: "channels", crumb: "channels", selection: 0 }
+        : { kind: "agents", crumb: "agents", selection: 0 };
     default:
       return null;
   }
