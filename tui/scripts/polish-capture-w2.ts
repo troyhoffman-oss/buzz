@@ -440,30 +440,34 @@ const SCENARIOS: readonly Scenario[] = [
     ],
   },
   {
-    id: "12-reconnecting",
-    title: "CONNECTING — the relay link is down and says so",
-    fixture: "reconnect",
-    steps: [
-      {
-        key: "(boot)",
-        expect: "retry",
-        note: "§2.6 — a transient state is visually distinct from a healthy one",
-      },
-    ],
-  },
-  {
-    id: "13-keyless",
+    id: "12-keyless",
     title: "KEYLESS — a daemon with no identity must never look healthy",
     fixture: "keyless-daemon",
     steps: [
       {
         key: "(boot)",
-        expect: "keyless",
+        expect: "⚠ keyless",
         note: "§2.5 — archiving:false is a loss state and is rendered as one",
       },
     ],
   },
 ];
+
+// A `reconnect` scenario was drafted here and removed rather than left flaky.
+// The fixture transitions to `reconnecting` at 500 ms and back to `connected`
+// at 2000 ms, so the degraded frame exists for a second and a half — a window
+// this harness cannot land in deterministically, because `settle()` waits for
+// the pane to *stop changing* and the pane is mid-recovery for exactly that
+// span. A capture that sometimes shows `◌ retry 2` and sometimes `◉ live` is
+// not evidence of anything.
+//
+// The state is covered where it can be asserted rather than raced:
+// `test/unit/render-parts.test.ts` pins that every non-connected state gets a
+// distinct glyph (§2.6), and `test/unit/emptystate.test.ts` pins that each one
+// produces its own reason string. Both are stronger than a screenshot; what a
+// capture would add is the *colour*, and `connectionStyle` is a total function
+// over the same eight states with three tones, which the keyless frame above
+// already demonstrates on its `⚠ keyless` segment.
 
 /**
  * The two widths, co-equal.
