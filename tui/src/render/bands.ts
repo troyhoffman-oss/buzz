@@ -16,7 +16,9 @@
  * difference between a spine you can read and one you have to remember.
  */
 
-import { displayWidth, elideFromLeft, pad } from "./width";
+import { CHROME, FOCUS, META, PLACEHOLDER } from "./palette";
+import { type StyledRow, plain, styled } from "./span";
+import { displayWidth, elideFromLeft } from "./width";
 
 /** The one focus glyph [G8]. There is exactly one on screen, ever. */
 export const FOCUS_GLYPH = "❯";
@@ -31,17 +33,30 @@ export const POSITION_GLYPH = "▌";
  * because the current location survives and the path is what is sacrificed
  * [G10]. Eliding from the right would produce a breadcrumb that tells you where
  * you started rather than where you are.
+ *
+ * The rule cells and the crumb are **separate spans**, and that is the whole
+ * visual point of the band: the rule recedes to `borderSubtle` while the crumb
+ * sits a step brighter at `textMuted`, so "where am I" is legible at a glance
+ * without the rule competing with it. Drawing both in one colour is what made
+ * the M3 frames read as a wall — the breadcrumb was the same weight as eighty
+ * dashes beside it.
  */
-export function topRule(crumb: string, cols: number): string {
-  if (cols <= 0) return "";
+export function topRule(crumb: string, cols: number): StyledRow {
+  if (cols <= 0) return [];
   // ` <crumb> ` plus at least four rule cells on the left, so the rule still
   // reads as a rule rather than as a caption with a dash.
   const minRule = 4;
   const available = cols - minRule - 2;
-  if (available <= 0) return "─".repeat(cols);
+  if (available <= 0) return [styled("─".repeat(cols), CHROME)];
   const shown = elideFromLeft(crumb, available);
   const ruleWidth = cols - displayWidth(shown) - 3;
-  return `${"─".repeat(Math.max(0, ruleWidth))} ${shown} ─`;
+  return [
+    styled("─".repeat(Math.max(0, ruleWidth)), CHROME),
+    plain(" "),
+    styled(shown, META),
+    plain(" "),
+    styled("─", CHROME),
+  ];
 }
 
 /** A plain full-width rule — the bottom rule above the statusline. */
@@ -72,11 +87,38 @@ export interface ComposerView {
  * before you type. An unfocused composer renders its placeholder with **no
  * glyph** (§2.2), which is what keeps "exactly one `❯` on screen" true while
  * the list cursor holds it.
+ *
+ * # The three states, and why they are three colours
+ *
+ * The M3 captures rendered all three identically — `❯ message DM` and
+ * `  filter channels` and a half-typed message were the same grey text — so the
+ * composer could not tell you whether it was listening, and typed text looked
+ * exactly like the hint it replaced. Claude Code's input line answers this by
+ * having no placeholder at all (`nav/cc-research.md` §1.3: a bare `❯` with
+ * nothing after it), which it can afford because it has one input mode. Buzz's
+ * composer changes target per layer — `message #engineering`, `reply in
+ * thread`, `steer claude-1` — so the placeholder is carrying real information
+ * and deleting it would cost more than it saves.
+ *
+ * The resolution is to keep the placeholder and make it unmistakably *not*
+ * text: it renders in `textMuted`, while typed text renders at full `text`
+ * weight. Combined with the accent `❯`, the three states read at a glance:
+ *
+ * - **focused, empty** — bright `❯`, receded placeholder: "type here, here is
+ *   what this line does".
+ * - **focused, typed** — bright `❯`, full-weight text: "this is yours".
+ * - **unfocused** — no glyph, receded placeholder: "keys are going somewhere
+ *   else" (§2.2's list-owns-the-cursor case).
  */
-export function renderComposer(view: ComposerView, cols: number): string[] {
-  const body = view.text.length > 0 ? view.text : view.placeholder;
-  const prefix = view.focused ? `${FOCUS_GLYPH} ` : "  ";
-  return [pad(`${prefix}${body}`, cols)];
+export function renderComposer(view: ComposerView, cols: number): StyledRow[] {
+  const prefix = view.focused
+    ? styled(`${FOCUS_GLYPH} `, FOCUS)
+    : plain("  ");
+  const body =
+    view.text.length > 0
+      ? plain(view.text)
+      : styled(view.placeholder, PLACEHOLDER);
+  return [[prefix, body]];
 }
 
 /** The fixed height of the rules. Used by the body's height arithmetic. */

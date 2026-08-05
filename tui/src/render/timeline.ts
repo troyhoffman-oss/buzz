@@ -17,11 +17,60 @@
  * Chat is 95% of user time, so this module is where "chrome justifies every
  * row" is enforced: a grouped message costs one row, a day divider costs one,
  * and the unread divider costs one. Nothing else is spent.
+ *
+ * # Where colour is spent here, and where it deliberately is not
+ *
+ * The timeline is the largest surface in the product, which makes it the
+ * surface DESIGN §3.10's rule is really about — "neutral tones for large
+ * surfaces and chrome; high-chroma accents reserved for focus and selection".
+ * So the split is: everything §3.1 calls *chrome* is attributed (the divider
+ * rules, the author line, the diff box, the thread counts), and **message
+ * content is never coloured at all**. A body row is base text, always.
+ *
+ * That asymmetry is the point. If bodies carried colour there would be nothing
+ * left for the day divider and the `● new` anchor to stand out *against*, and
+ * the M3 captures are the evidence: one flat weight across four hundred rows is
+ * why the frames read as a wall rather than as a conversation. Colour here buys
+ * back the structure the grouping rules already computed — you can see where a
+ * day starts, where a speaker changes, whether that speaker is a person or a
+ * fleet member, and where you stopped reading — without any of it competing
+ * with the words.
  */
 
 import type { Message } from "../client/types";
 import { MS_PER_DAY, MS_PER_MINUTE } from "../time/units";
-import { alignRight, pad, truncateKeepingSuffix, wrapText } from "./width";
+import {
+  AGENT,
+  AUTHOR,
+  CHROME,
+  DIFF_ADDED,
+  DIFF_HEADER,
+  DIFF_REMOVED,
+  FOCUS,
+  HINT,
+  LIVE,
+  META,
+  SELECTED,
+  SYSTEM,
+  THREAD,
+  UNREAD_DIVIDER,
+} from "./palette";
+import {
+  type SpanStyle,
+  type StyledRow,
+  fillRow,
+  padRow,
+  plain,
+  rowText,
+  splitAt,
+  styled,
+} from "./span";
+import {
+  alignRight,
+  displayWidth,
+  truncateKeepingSuffix,
+  wrapText,
+} from "./width";
 
 /**
  * The author-grouping window, from `messageGrouping.ts`.
@@ -32,9 +81,19 @@ import { alignRight, pad, truncateKeepingSuffix, wrapText } from "./width";
  */
 export const GROUPING_WINDOW_MS = 5 * MS_PER_MINUTE;
 
-/** One rendered row of the timeline, with what it came from. */
+/**
+ * One rendered row of the timeline, with what it came from.
+ *
+ * `text` holds a {@link StyledRow} rather than a `string`, and keeps the name:
+ * every reader either paints it or projects it back with `rowText`, and a
+ * second field name for "the same row, styled" would only invite the two to
+ * drift. `rowText(row.text)` is byte-for-byte what this field used to hold —
+ * `padRow` applies the same clip-and-fill `pad` did — so the row geometry the
+ * T1 matrix and the reflow suite assert is unchanged by construction rather
+ * than by re-verification.
+ */
 export interface TimelineRow {
-  readonly text: string;
+  readonly text: StyledRow;
   /** The message this row belongs to; absent on dividers. */
   readonly messageId?: string;
   /** True when this is the row a message-select cursor should mark. */
@@ -125,10 +184,21 @@ function renderDiff(
   const diff = message.diff;
   if (!diff) return [];
   const counts = `+${diff.added} −${diff.removed}`;
+  // The box glyphs are structure and recede; the path and its counts are what
+  // you scan a diff row *for*, so they keep the header colour. Colouring the
+  // whole card one way would make the frame it draws compete with the change
+  // it contains — §3.10's chrome rule, applied at the smallest scale it has.
   const rows: TimelineRow[] = [
     {
-      text: pad(
-        `  ┌ diff · ${truncateKeepingSuffix(diff.path, counts, Math.max(1, cols - 12))}`,
+      text: padRow(
+        [
+          plain("  "),
+          styled("┌ diff · ", CHROME),
+          styled(
+            truncateKeepingSuffix(diff.path, counts, Math.max(1, cols - 12)),
+            DIFF_HEADER,
+          ),
+        ],
         cols,
       ),
       messageId: message.id,
@@ -141,8 +211,28 @@ function renderDiff(
       const sign =
         hunk.kind === "add" ? "+" : hunk.kind === "remove" ? "-" : " ";
       const lineNo = String(hunk.newLine ?? hunk.oldLine ?? "").padStart(4);
+      // The sign carries the colour, and it carries it over the *whole* hunk
+      // line. A diff is the one place in this design where colouring content
+      // is correct rather than noise: added and removed are not decoration on
+      // the text, they are what the text means, and every diff viewer an
+      // operator has ever used says so this way.
+      const style: SpanStyle =
+        hunk.kind === "add"
+          ? DIFF_ADDED
+          : hunk.kind === "remove"
+            ? DIFF_REMOVED
+            : {};
       rows.push({
-        text: pad(`  │ ${lineNo} │${sign}${hunk.text}`, cols),
+        text: padRow(
+          [
+            plain("  "),
+            styled("│ ", CHROME),
+            styled(lineNo, META),
+            styled(" │", CHROME),
+            styled(`${sign}${hunk.text}`, style),
+          ],
+          cols,
+        ),
         messageId: message.id,
         selectable: false,
         kind: "diff",
@@ -150,14 +240,22 @@ function renderDiff(
     }
   } else {
     rows.push({
-      text: pad(`  │  ${diff.hunks.length} hunks · ⏎ expand · y yank`, cols),
+      text: padRow(
+        [
+          plain("  "),
+          styled("│  ", CHROME),
+          styled(`${diff.hunks.length} hunks`, META),
+          styled(" · ⏎ expand · y yank", HINT),
+        ],
+        cols,
+      ),
       messageId: message.id,
       selectable: false,
       kind: "diff",
     });
   }
   rows.push({
-    text: pad("  └", cols),
+    text: padRow([plain("  "), styled("└", CHROME)], cols),
     messageId: message.id,
     selectable: false,
     kind: "diff",
@@ -203,9 +301,19 @@ export function renderTimeline(
     if (!previous || dayIndex(previous.ts) !== dayIndex(message.ts)) {
       const label = ` ${dayLabel(message.ts)} `;
       const bar = Math.max(0, cols - label.length - 2);
+      // The rule recedes and the date does not. Drawn in one weight — as it
+      // was — a hundred and eighteen dashes shout as loudly as the four
+      // characters that carry the information, and the divider stops reading
+      // as a label at all. This is the cheapest hierarchy in the whole
+      // timeline and the M3 captures are what it was missing.
       rows.push({
-        text: pad(
-          `  ${"─".repeat(Math.floor(bar / 2))}${label}${"─".repeat(Math.ceil(bar / 2))}`,
+        text: padRow(
+          [
+            plain("  "),
+            styled("─".repeat(Math.floor(bar / 2)), CHROME),
+            styled(label, META),
+            styled("─".repeat(Math.ceil(bar / 2)), CHROME),
+          ],
           cols,
         ),
         selectable: false,
@@ -216,7 +324,13 @@ export function renderTimeline(
     if (message.system) {
       // Non-conversational rows get their own dimmed row and never group.
       rows.push({
-        text: pad(`  ⋯ ${clock(message.ts)}  ${message.content}`, cols),
+        text: padRow(
+          [
+            plain("  "),
+            styled(`⋯ ${clock(message.ts)}  ${message.content}`, SYSTEM),
+          ],
+          cols,
+        ),
         messageId: message.id,
         selectable: true,
         kind: "meta",
@@ -227,9 +341,43 @@ export function renderTimeline(
 
     if (!continuesGroup(previous, message)) {
       const presence = message.author.isAgent ? " ⬤" : "";
+      // Whether the last twelve rows came from a person or from a fleet member
+      // is the question a Buzz operator asks most often, and it is the one the
+      // desktop answers with an avatar a terminal has no room for. It is the
+      // single content-level colour distinction this design spends (§3.10),
+      // and the header is where it costs nothing — the bodies stay neutral.
+      const nameStyle = message.author.isAgent ? AGENT : AUTHOR;
+      const time = clock(message.ts);
+      const line = alignRight(
+        `${message.author.name}${presence}`,
+        time,
+        cols - 2,
+      );
+      // Split the finished row rather than re-deriving the alignment: the gap
+      // `alignRight` computed is the layout, and computing it a second time
+      // here would be a second source of truth for the timestamp column.
+      const [left, right] = splitAt(
+        [plain(line)],
+        Math.max(0, displayWidth(line) - displayWidth(time)),
+      );
+      const leftText = rowText(left);
+      const nameWidth = displayWidth(`${message.author.name}`);
+      const [nameSpan, gapSpan] = splitAt([plain(leftText)], nameWidth);
       rows.push({
-        text: pad(
-          `  ${alignRight(`${message.author.name}${presence}`, clock(message.ts), cols - 2)}`,
+        text: padRow(
+          [
+            plain("  "),
+            styled(rowText(nameSpan), nameStyle),
+            // The presence dot rides the gap remainder, so an agent's ⬤ is
+            // live-green while the run of spaces after it stays unstyled.
+            ...(presence
+              ? [
+                  styled(presence, LIVE),
+                  plain(rowText(gapSpan).slice(presence.length)),
+                ]
+              : [plain(rowText(gapSpan))]),
+            styled(rowText(right), META),
+          ],
           cols,
         ),
         messageId: message.id,
@@ -249,7 +397,8 @@ export function renderTimeline(
     } else {
       // The message-select cursor marks the *body* row, so the `❯` sits on the
       // text you are selecting rather than on the author header above it.
-      const marker = options.selectedMessageId === message.id ? "❯ " : "  ";
+      const selected = options.selectedMessageId === message.id;
+      const marker = selected ? "❯ " : "  ";
       const suffix = threadSuffix(message);
       const wrapped = wrapText(message.content, Math.max(1, cols - 2), 0);
       wrapped.forEach((line, i) => {
@@ -258,8 +407,29 @@ export function renderTimeline(
           isLast && suffix
             ? truncateKeepingSuffix(line, suffix, cols - 2)
             : line;
+        // The thread suffix keeps its own colour inside an otherwise neutral
+        // body row: §3's list-row rule makes those counts the thing you pick a
+        // conversation *by*, so they are the one part of a body that is not
+        // content. Splitting by the suffix's width preserves the exact text
+        // `truncateKeepingSuffix` produced, gap included.
+        const carriesSuffix = isLast && suffix.length > 0 && text.endsWith(suffix);
+        const [head, tail] = carriesSuffix
+          ? splitAt([plain(text)], displayWidth(text) - displayWidth(suffix))
+          : [[plain(text)], []];
+        const body: StyledRow = [
+          i === 0 ? styled(marker, selected ? FOCUS : {}) : plain("  "),
+          plain(rowText(head)),
+          ...(carriesSuffix ? [styled(rowText(tail), THREAD)] : []),
+        ];
         rows.push({
-          text: pad(`${i === 0 ? marker : "  "}${text}`, cols),
+          // A selected message must be seen without being looked for: `❯` is
+          // two columns at the far left of a 120-column row, so on a wide
+          // terminal the eye has to hunt for it. The fill is what answers the
+          // owner's "selection is hard to see", and it is scoped to the body
+          // row the cursor actually marks.
+          text: selected
+            ? fillRow(body, cols, SELECTED)
+            : padRow(body, cols),
           messageId: message.id,
           selectable: i === 0,
           kind: "body",
@@ -270,9 +440,12 @@ export function renderTimeline(
       // and a one-row cost is cheaper than an unpickable thread.
       if (suffix && wrapped.length > 0) {
         const last = rows.at(-1);
-        if (last && !last.text.includes(suffix)) {
+        // `rowText` rather than a raw `.includes` on the field: the row holds
+        // spans now, and the question being asked is about the *text* it
+        // draws — which is exactly what the projection is for.
+        if (last && !rowText(last.text).includes(suffix)) {
           rows.push({
-            text: pad(`  ${suffix}`, cols),
+            text: padRow([plain("  "), styled(suffix, THREAD)], cols),
             messageId: message.id,
             selectable: false,
             kind: "meta",
@@ -284,7 +457,7 @@ export function renderTimeline(
     const reactions = reactionStrip(message);
     if (reactions) {
       rows.push({
-        text: pad(`  ${reactions}`, cols),
+        text: padRow([plain("  "), styled(reactions, META)], cols),
         messageId: message.id,
         selectable: false,
         kind: "meta",
@@ -294,9 +467,19 @@ export function renderTimeline(
     if (options.unreadAfterEventId === message.id) {
       const label = " ● new ";
       const bar = Math.max(0, cols - label.length - 2);
+      // §3.1 calls this "the single most-tested piece of chat chrome", and it
+      // is the one divider that is genuinely an *alert*: it marks where you
+      // stopped reading. So unlike the day divider — whose label is muted
+      // metadata — the label here carries the unread colour at full weight,
+      // while the rule around it recedes like every other rule.
       rows.push({
-        text: pad(
-          `  ${"─".repeat(2)}${label}${"─".repeat(Math.max(0, bar))}`,
+        text: padRow(
+          [
+            plain("  "),
+            styled("─".repeat(2), CHROME),
+            styled(label, UNREAD_DIVIDER),
+            styled("─".repeat(Math.max(0, bar)), CHROME),
+          ],
           cols,
         ),
         selectable: false,

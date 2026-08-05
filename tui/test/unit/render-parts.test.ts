@@ -33,9 +33,23 @@ import {
 } from "../../src/render/timeline";
 import { burnRate, usageStrip, sortFleet } from "../../src/layers/agents";
 import { MS_PER_MINUTE } from "../../src/time/units";
+import { type StyledRow, rowText } from "../../src/render/span";
 import { displayWidth } from "../../src/render/width";
 
 const T0 = Date.parse("2026-08-04T14:12:00.000Z");
+
+/**
+ * The text a styled row draws — what every rule in this file is *about*.
+ *
+ * The renderers emit spans now, so a colour decision and a drop-order decision
+ * live in the same return value. These cases are about the second: §2.1's drop
+ * order, §3.1's grouping, §2.3's degradation are all statements about which
+ * *characters* survive a narrowing, and they were written against the strings
+ * the terminal receives. Projecting here keeps them testing exactly that, so a
+ * restyle can never turn one of these red and a genuine drop-order regression
+ * can never hide behind one.
+ */
+const text = (row: StyledRow): string => rowText(row);
 
 const msg = (over: Partial<Message> = {}): Message => ({
   id: "ev_1",
@@ -67,16 +81,16 @@ describe("§2.1 statusline drop order", () => {
     // that looks idle while its socket is dead is the worst failure mode in
     // this product (§1.3 property 3), so the glyph is the one thing the row
     // cannot lose.
-    expect(row1(state, 80)).toContain("buzz://relay.example");
-    const narrow = row1(state, 40);
+    expect(text(row1(state, 80))).toContain("buzz://relay.example");
+    const narrow = text(row1(state, 40));
     expect(narrow).not.toContain("buzz://relay.example");
     expect(narrow).toContain("◉ live");
-    expect(row1(state, 20)).toContain("◉");
+    expect(text(row1(state, 20))).toContain("◉");
   });
 
   test("row 2 keeps mentions and DMs; the unread total goes last", () => {
     // A generic right-to-left drop would take DMs first, inverting the table.
-    const narrow = row2(state, 40);
+    const narrow = text(row2(state, 40));
     expect(narrow).toContain("3 mentions");
     expect(narrow).toContain("2 DMs");
     expect(narrow).not.toContain("12 unread");
@@ -85,16 +99,16 @@ describe("§2.1 statusline drop order", () => {
   test("row 3 is the [G13] door label and swaps hint for live count", () => {
     // "The same row swaps a static hint for a live count, and that count is
     // exactly what `↓` opens."
-    expect(row3(state, 80)).toContain("3 agents working");
-    expect(row3(state, 80)).toContain("↓ live");
-    const idle = row3({ ...state, agentsWorking: 0, huddles: 0 }, 80);
+    expect(text(row3(state, 80))).toContain("3 agents working");
+    expect(text(row3(state, 80))).toContain("↓ live");
+    const idle = text(row3({ ...state, agentsWorking: 0, huddles: 0 }, 80));
     expect(idle).toContain("↓ nothing running");
   });
 
   test("row 3 advertises the arrows only where they are doors (§2.3)", () => {
     // On a picker layer the arrows already move the list, so naming them as
     // doors would be a lie.
-    const picker = row3({ ...state, chatLayer: false }, 80);
+    const picker = text(row3({ ...state, chatLayer: false }, 80));
     expect(picker).toContain("↑↓ to navigate");
     expect(picker).not.toContain("↓ live");
   });
@@ -102,12 +116,12 @@ describe("§2.1 statusline drop order", () => {
   test("row 3 keeps the counts and drops the prose when narrowed", () => {
     // "never truncated below the affordance count" — the count *is* the
     // affordance.
-    const narrow = row3(state, 34);
+    const narrow = text(row3(state, 34));
     expect(narrow).toContain("3 agents working");
   });
 
   test("a keyless daemon is visible even though it is not a connection state", () => {
-    expect(row1({ ...state, archiving: false }, 100)).toContain("keyless");
+    expect(text(row1({ ...state, archiving: false }, 100))).toContain("keyless");
   });
 
   test("every non-connected state gets a distinct glyph (§2.6)", () => {
@@ -188,7 +202,7 @@ describe("§3.1 author grouping and dividers", () => {
       cols: 60,
       unreadAfterEventId: "b",
     });
-    const dividerAt = before.findIndex((r) => r.text.includes("● new"));
+    const dividerAt = before.findIndex((r) => text(r.text).includes("● new"));
     expect(dividerAt).toBeGreaterThan(0);
 
     // A burst arrives *before* the anchor. A row-index divider would drift; an
@@ -200,7 +214,7 @@ describe("§3.1 author grouping and dividers", () => {
     ].sort((m, n) => m.ts - n.ts);
     const after = renderTimeline(burst, { cols: 60, unreadAfterEventId: "b" });
     const rowAfterDivider =
-      after[after.findIndex((r) => r.text.includes("● new")) - 1];
+      after[after.findIndex((r) => text(r.text).includes("● new")) - 1];
     const rowBeforeBurst = before[dividerAt - 1];
     expect(rowAfterDivider?.messageId).toBe(rowBeforeBurst?.messageId ?? "");
   });
@@ -231,13 +245,13 @@ describe("§3.1 author grouping and dividers", () => {
       ],
       { cols: 80 },
     );
-    const text = rows.map((r) => r.text).join("\n");
+    const rendered = rows.map((r) => text(r.text)).join("\n");
     // "Collapsed to a header plus the changed-hunk summary" — a 200-line diff
     // inline is a timeline you have lost.
-    expect(text).toContain("diff · crates/buzz-db/src/read_state.rs");
-    expect(text).toContain("+18 −4");
-    expect(text).toContain("⏎ expand");
-    expect(text).not.toContain("│ x");
+    expect(rendered).toContain("diff · crates/buzz-db/src/read_state.rs");
+    expect(rendered).toContain("+18 −4");
+    expect(rendered).toContain("⏎ expand");
+    expect(rendered).not.toContain("│ x");
   });
 
   test("an expanded diff shows its hunks", () => {
@@ -258,9 +272,9 @@ describe("§3.1 author grouping and dividers", () => {
       ],
       { cols: 80, expandedDiffs: new Set(["d"]) },
     );
-    const text = rows.map((r) => r.text).join("\n");
-    expect(text).toContain("-old");
-    expect(text).toContain("+new");
+    const rendered = rows.map((r) => text(r.text)).join("\n");
+    expect(rendered).toContain("-old");
+    expect(rendered).toContain("+new");
   });
 });
 
