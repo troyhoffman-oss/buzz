@@ -304,6 +304,24 @@ export function wrapText(
         // Genuinely unbreakable — a 200-character URL. Place what fits and
         // carry the rest, because the alternative is overflowing the frame.
         const head = clip(remaining, room);
+        // **`clip` can return nothing, and then this branch makes no progress.**
+        // A two-column cluster in one column of room does not fit *at all*, so
+        // `head` is `""`, `remaining` is unchanged, and the `while` re-enters on
+        // identical state — an infinite loop that starves the event loop rather
+        // than misdrawing a row. It hangs the whole renderer, and the only
+        // symptom is a frozen terminal.
+        //
+        // The sibling branch below already guards this exact case; it was
+        // simply never reachable from here, because that one requires a fresh
+        // unindented row and this one fires while `current` still has content.
+        // Reachable in production through `renderDrawerExpansion`, whose field
+        // values wrap into `cols - labelWidth - 2` — one column on a narrow
+        // terminal with a `Channel:` label.
+        //
+        // Returning what is laid out so far is the honest answer: the cluster
+        // cannot be represented in the space given, and no amount of further
+        // looping changes that.
+        if (head.length === 0) return rows;
         current = current.trim() ? `${current} ${head}` : `${current}${head}`;
         remaining = remaining.slice(head.length);
         push();

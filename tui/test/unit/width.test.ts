@@ -172,6 +172,35 @@ describe("wrapHints — exits stay discoverable (§2.3, [G14])", () => {
 });
 
 describe("wrapText — detail fields wrap with hanging indent (§7)", () => {
+  test("a wide glyph in one column terminates instead of hanging", () => {
+    // **This hung the renderer**, and a hang is worse than any misdraw: it
+    // starves the event loop, so the symptom is a frozen terminal with no
+    // error and nothing in a log.
+    //
+    // A two-column cluster in one column of room does not fit at all, so
+    // `clip` returned `""`, `remaining` was unchanged, and the loop re-entered
+    // on identical state forever. ASCII was fine — `wrapText("abc", 1)` splits
+    // per character — which is why it survived: every test used Latin text.
+    //
+    // Reachable in production through `renderDrawerExpansion`, whose field
+    // values wrap into `cols - labelWidth - 2`. A `Channel:` label is 9, so a
+    // 12-column terminal with a CJK channel name is one column of room.
+    //
+    // The assertion is simply *that it returns*. Bun has no per-test timeout by
+    // default, so a regression here would hang the suite rather than fail it —
+    // which is exactly how this survived three milestones.
+    expect(wrapText("日本語", 1, 0)).toEqual([]);
+    expect(wrapText("abc", 1, 0)).toEqual(["a", "b", "c"]);
+    // The whole degenerate neighbourhood, not just the reported case.
+    for (const cols of [1, 2, 3]) {
+      for (const text of ["日本語", "a日b", "💯💯", "日 本", "ab日cd"]) {
+        const rows = wrapText(text, cols, 0);
+        for (const row of rows)
+          expect(displayWidth(row)).toBeLessThanOrEqual(cols);
+      }
+    }
+  });
+
   test("wrapping breaks on spaces", () => {
     const rows = wrapText("the quick brown fox jumps over", 12);
     for (const row of rows) expect(displayWidth(row)).toBeLessThanOrEqual(12);
