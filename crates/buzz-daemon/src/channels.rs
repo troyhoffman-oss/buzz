@@ -309,7 +309,13 @@ impl Channels {
     /// the observer pipeline). A rediscovery that zeroed them would blank the
     /// sidebar on every reconnect — the exact "looks idle while it is not"
     /// failure §1.3 property 3 forbids, one layer down.
-    fn merge_preserving_ambient(&mut self, mut channel: Channel) {
+    ///
+    /// Public because [`crate::wire::hydrate_channels`] runs the cold-start walk
+    /// against a **detached** cache — so the two relay round trips happen with
+    /// no state lock held — and then merges the answer back here. That merge
+    /// needs exactly this ambient-preserving semantic; [`Self::upsert`] would
+    /// blank the unread counts of every channel on every rediscovery.
+    pub fn merge_preserving_ambient(&mut self, mut channel: Channel) {
         if let Some(existing) = self.channels.get(&channel.id) {
             channel.unread = existing.unread;
             channel.mentions = existing.mentions;
@@ -354,6 +360,18 @@ impl Channels {
     /// The roster for a channel, as `/mention/candidates` reads it.
     pub fn roster(&self, channel_id: &str) -> Option<&BTreeSet<String>> {
         self.rosters.get(channel_id)
+    }
+
+    /// Every roster this cache holds, keyed by channel uuid.
+    ///
+    /// Exists for the same reason [`Self::merge_preserving_ambient`] is public:
+    /// the cold-start walk in [`crate::wire::hydrate_channels`] discovers into a
+    /// detached cache and has to move the rosters it found back into the live
+    /// one. Rosters seed the presence subscription (`plan_subscriptions` builds
+    /// its author list from exactly this), so a walk that carried the channels
+    /// across but not their members would leave every peer `unknown`.
+    pub fn rosters(&self) -> &BTreeMap<String, BTreeSet<String>> {
+        &self.rosters
     }
 
     /// Replace a channel's roster wholesale.

@@ -105,6 +105,16 @@ pub const PUBLISH_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// the catch-up burst a reconnect replays before the tail goes live.
 pub const CHANNEL_TAIL_LIMIT: u32 = 200;
 
+/// Minimum spacing between cold-start discovery walks.
+///
+/// The walk is two HTTP round trips against the relay, and a flapping socket
+/// would otherwise run it on every reconnect — a discovery storm aimed at a
+/// relay that is by definition already unwell, and one that buys nothing: the
+/// loop maintains the channel set live from 44100/44101 once it is seeded, so a
+/// reconnect a few seconds later is looking at the same answer. A long outage
+/// is different, and that is exactly what the interval admits.
+pub const DISCOVERY_INTERVAL: Duration = Duration::from_secs(300);
+
 /// Subscription id for the channel timeline of `channel_id`.
 ///
 /// Ingest dispatches on the **subscription**, not on the event kind: kind alone
@@ -856,6 +866,9 @@ pub async fn run(state: AppState, mut commands: tokio::sync::mpsc::Receiver<Wire
     // Held across reconnects on purpose — that is the whole of §2.7's "survives
     // exactly one reconnect, then fails visibly".
     let mut pending: Vec<PendingPublish> = Vec::new();
+    // When the cold-start walk last succeeded. `None` means never, which is what
+    // makes the first walk run immediately rather than one interval late.
+    let mut last_discovery: Option<Instant> = None;
 
     loop {
         set_state(&state, ConnectionState::Connecting).await;
@@ -877,6 +890,14 @@ pub async fn run(state: AppState, mut commands: tokio::sync::mpsc::Receiver<Wire
         };
         set_state(&state, ConnectionState::Connected).await;
         tracing::info!(relay = %relay_url, "relay connected and authenticated");
+
+        // The cold-start walk, **before** the first subscription plan. 39002 is
+        // a state record and 44100/44101 are change notifications, so a settled
+        // community emits nothing to hear and the registry would otherwise stay
+        // empty for the life of the process. `plan_subscriptions` reads the
+        // registry, so ordering is the whole of the fix: hydrating afterwards
+        // would open tails on the previous set and wait for the next reconnect.
+        hydrate_channels(&state, &mut last_discovery).await;
 
         // A session ends by returning; the ladder and the pending publishes
         // survive it. Everything the connection owns is dropped here, so a
@@ -1030,6 +1051,80 @@ pub fn is_dns_failure(err: &WsClientError) -> bool {
         || text.contains("name or service not known")
         || text.contains("nodename nor servname")
         || text.contains("temporary failure in name resolution")
+}
+
+/// Seed the channel set from the relay's own membership answer (§4.1.1 d3).
+///
+/// **The cold-start walk.** Without it, a daemon that boots into an existing
+/// community subscribes to nothing and stays that way: 44100/44101 are
+/// *notifications of change*, so a community whose membership is settled emits
+/// none, [`apply_membership_event`] never fires, and the channel registry stays
+/// empty until a client happens to page history on a channel it cannot see in
+/// the list. Measured against the live relay at M3: `connection.state` reached
+/// `connected` while `GET /channel` returned `[]` and `buzz-cli` under the same
+/// key at the same minute returned three channels.
+///
+/// Three properties this deliberately has:
+///
+/// - **It runs over the HTTP bridge, not the socket**, because the answer is a
+///   bounded two-round-trip query and not a subscription. Asking for it as a
+///   REQ would put 39002 and 39000 through the paced live path, where they
+///   compete with the tails they exist to open.
+/// - **It never blocks the loop.** A failed walk is logged and the session
+///   proceeds on whatever set it already had; the live membership path still
+///   works, and the next reconnect retries. A daemon that refused to run its
+///   loop because a query 500'd would be strictly worse than one with a stale
+///   channel list.
+/// - **The lock is not held across either round trip.** `discover` takes
+///   `&mut Channels`, so the cache is walked into a local and merged back under
+///   a second, brief acquisition rather than awaiting HTTP under the mutex —
+///   the same rule [`submit`] follows and for the same reason.
+///
+/// Returns the number of channels the walk registered, or `None` when it did
+/// not run (keyless, or inside [`DISCOVERY_INTERVAL`] of the last one).
+async fn hydrate_channels(state: &AppState, last: &mut Option<Instant>) -> Option<usize> {
+    if let Some(at) = last {
+        if at.elapsed() < DISCOVERY_INTERVAL {
+            return None;
+        }
+    }
+    let identity = state.identity_snapshot().await.ok()?;
+
+    // Discovery runs against a detached cache so the two relay round trips
+    // happen with no lock held. `Channels::discover` merges rosters and
+    // metadata into whatever it is given, so an empty one yields exactly the
+    // relay's answer and the merge below is what reconciles it with the ambient
+    // state a running daemon has accumulated.
+    let mut discovered = crate::channels::Channels::new();
+    match discovered.discover(state.rest.as_ref(), &identity).await {
+        Ok(count) => {
+            *last = Some(Instant::now());
+            let mut inner = state.lock().await;
+            for channel in discovered.list() {
+                // Subscribe *and* cache. Registering without caching leaves a
+                // tail open for a channel the list cannot show; caching without
+                // registering is the M2 symptom one layer down — a visible
+                // channel whose timeline never fills.
+                inner.session.subscriptions.subscribe(channel.id.clone());
+                inner.channels.merge_preserving_ambient(channel);
+            }
+            for (channel_id, roster) in discovered.rosters() {
+                inner
+                    .channels
+                    .set_roster(channel_id.clone(), roster.clone());
+            }
+            tracing::info!(channels = count, "cold-start channel discovery");
+            Some(count)
+        }
+        Err(err) => {
+            // Deliberately not fatal, and deliberately not a state transition:
+            // the socket is fine, so reporting a connection problem here would
+            // be the §1.3-property-3 failure in reverse — naming an outage that
+            // is not happening.
+            tracing::warn!(%err, "cold-start channel discovery failed; continuing on the cached set");
+            None
+        }
+    }
 }
 
 /// Fail every publish past its deadline, so loss is never silent (§2.7).
@@ -2120,6 +2215,45 @@ mod tests {
         assert_eq!(
             inner.session.subscriptions.resubscribe_since(CHANNEL),
             Some(NOW as u64 - crate::session::SINCE_SKEW_SECS)
+        );
+    }
+
+    /// **M3 regression, the pacing half.** A flapping socket must not turn the
+    /// cold-start walk into a discovery storm.
+    ///
+    /// The walk is two HTTP round trips. Running it on every reconnect aims that
+    /// pair at a relay which is by definition already unwell, and buys nothing:
+    /// once the registry is seeded the loop maintains it live from 44100/44101,
+    /// so a reconnect seconds later reads the same answer.
+    ///
+    /// Asserted at the gate rather than end to end, because the round trips
+    /// themselves need a relay. `None` is the "did not run" answer, and a
+    /// just-walked timestamp must produce it. The *other* direction — that a
+    /// never-walked daemon walks immediately — is what
+    /// `a_cold_daemon_discovers_its_channels_without_being_seeded` proves live;
+    /// a `None` here with `last = None` would mean the daemon never discovers at
+    /// all, which is the defect this lane fixed.
+    #[tokio::test]
+    async fn a_reconnect_storm_does_not_become_a_discovery_storm() {
+        let state = AppState::new(config(), None).expect("state");
+        let mut last = Some(Instant::now());
+        assert!(
+            hydrate_channels(&state, &mut last).await.is_none(),
+            "a walk inside DISCOVERY_INTERVAL of the last one must not run"
+        );
+
+        // And a keyless daemon never walks, whatever the clock says: the walk is
+        // an authenticated query, so without an identity there is nothing to
+        // sign it with. It must decline rather than error the loop out.
+        let mut never = None;
+        assert!(
+            hydrate_channels(&state, &mut never).await.is_none(),
+            "a keyless daemon has no identity to discover with"
+        );
+        assert!(
+            never.is_none(),
+            "a walk that did not happen must not stamp the clock, or the first \
+             walk after a key arrives would be suppressed for a full interval"
         );
     }
 

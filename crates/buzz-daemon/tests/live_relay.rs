@@ -659,6 +659,80 @@ async fn the_loops_channel_set_matches_what_the_relay_reports() {
     );
 }
 
+/// **The cold-start walk.** A loop given *nothing* must find its own channels.
+///
+/// This is the test the parity case above cannot be: that one seeds the cache by
+/// hand before starting the loop, so it proves the loop does not *invent*
+/// channels while proving nothing about whether it can *find* them. With the
+/// seeding removed, the daemon at `312e9c561` connected, authenticated, and
+/// served an empty channel list forever — because 44100/44101 are notifications
+/// of *change*, and a settled community emits none to hear.
+///
+/// Measured, not reasoned: `GET /channel` returned `{"channels":[]}` over the
+/// UDS while `buzz-cli channels list` under the same key at the same minute
+/// returned three. `dogfood-m3/live-daemon/cold-start-defect.md` carries both.
+#[tokio::test]
+async fn a_cold_daemon_discovers_its_channels_without_being_seeded() {
+    live!(live);
+    let discovery = buzz_daemon::channels::build_discovery_filter(&live.self_pubkey());
+    assert_read_only(&discovery);
+    let memberships = live
+        .rest
+        .query(&live.identity, &discovery)
+        .await
+        .expect("discovery is accepted");
+    let expected: std::collections::BTreeSet<String> = memberships
+        .iter()
+        .filter_map(buzz_daemon::channels::channel_id_from_membership)
+        .collect();
+    if expected.is_empty() {
+        eprintln!("SKIP: this identity is a member of no channels");
+        return;
+    }
+
+    // Nothing is seeded. The state starts with an empty cache and an empty
+    // subscription registry, exactly as a freshly launched daemon does.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state = live_state(&live, dir.path());
+    assert!(
+        state.lock().await.channels.is_empty(),
+        "the precondition of this test is a cold cache"
+    );
+
+    let hydrated = run_until(&state, std::time::Duration::from_secs(30), |inner| {
+        !inner.channels.is_empty()
+    })
+    .await;
+    assert!(
+        hydrated,
+        "a cold daemon must discover its channels from the relay, not wait for a \
+         membership change that a settled community never emits"
+    );
+
+    let inner = state.lock().await;
+    let cached: std::collections::BTreeSet<String> =
+        inner.channels.list().into_iter().map(|c| c.id).collect();
+    for id in &cached {
+        assert!(
+            expected.contains(id),
+            "the daemon cached channel {id}, which this identity is not a member of"
+        );
+    }
+    // The registry is the half that was missing at M2: a cached channel with no
+    // subscription is a row in the list whose timeline never fills.
+    for id in &cached {
+        assert!(
+            inner.session.subscriptions.resubscribe_since(id).is_some(),
+            "channel {id} was cached but never registered for subscription"
+        );
+    }
+    eprintln!(
+        "live: a cold daemon discovered {} channels and registered {} subscriptions",
+        cached.len(),
+        inner.session.subscriptions.len()
+    );
+}
+
 /// A real timeline window must render as rows the daemon's stores accept.
 ///
 /// The unit tests parse hand-built pages; this asserts the assembled page
