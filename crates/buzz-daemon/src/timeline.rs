@@ -620,8 +620,18 @@ pub fn build_aux_backfill_filter(message_ids: &[String]) -> serde_json::Value {
     serde_json::json!({
         "kinds": AUX_KINDS,
         "#e": message_ids,
+        // Bounded on purpose. Aux is *unbounded per row* — a single popular
+        // message can carry thousands of reactions — so a filter with no
+        // `limit` lets one `GET /message/{id}/reaction` pull an arbitrarily
+        // large response into a handler that then groups it under the daemon's
+        // single mutex. The cap is generous relative to any message a human
+        // reads and small enough that the worst case is bounded.
+        "limit": AUX_BACKFILL_LIMIT,
     })
 }
+
+/// Cap on one aux backfill response.
+pub const AUX_BACKFILL_LIMIT: u32 = 500;
 
 /// Build the thread-resolution filter for `GET /message/{id}/thread`.
 ///

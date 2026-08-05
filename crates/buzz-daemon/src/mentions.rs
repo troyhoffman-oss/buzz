@@ -120,6 +120,32 @@ pub fn rank_candidates(
     directory: &std::collections::BTreeMap<String, Profile>,
     limit: usize,
 ) -> Vec<MentionCandidate> {
+    rank_with(prefix, directory, limit, |pubkey| roster.contains(pubkey))
+}
+
+/// Rank across the **whole directory**, with everyone treated as in-roster.
+///
+/// The directory-wide search of `GET /user` and `GET /search/user`, where there
+/// is no channel to be a member of. It exists so those two handlers do not have
+/// to fake a roster by cloning every key into a `BTreeSet` — an allocation
+/// proportional to the directory, per request, **under the daemon's single
+/// mutex**, which is the one place this process cannot afford one.
+pub fn rank_directory(
+    prefix: &str,
+    directory: &std::collections::BTreeMap<String, Profile>,
+    limit: usize,
+) -> Vec<MentionCandidate> {
+    rank_with(prefix, directory, limit, |_| true)
+}
+
+/// The shared ranking core. `in_roster` is a predicate rather than a set so the
+/// directory-wide case costs nothing to express.
+fn rank_with(
+    prefix: &str,
+    directory: &std::collections::BTreeMap<String, Profile>,
+    limit: usize,
+    in_roster: impl Fn(&str) -> bool,
+) -> Vec<MentionCandidate> {
     let needle = prefix.to_lowercase();
     let mut scored: Vec<(u8, String, MentionCandidate)> = directory
         .values()
@@ -138,7 +164,7 @@ pub fn rank_candidates(
             } else {
                 return None;
             };
-            let in_roster = roster.contains(&profile.pubkey);
+            let in_roster = in_roster(&profile.pubkey);
             if needle.is_empty() && !in_roster {
                 return None;
             }

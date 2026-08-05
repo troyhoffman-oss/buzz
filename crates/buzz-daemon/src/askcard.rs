@@ -188,12 +188,51 @@ fn parse_option(value: &serde_json::Value) -> Option<AskOption> {
 /// no option, and the agent silently receives free strings instead of the
 /// option's wire value. `ElicitationField::select` resolves a 1-based index
 /// first, so numbers are unambiguous whatever the labels contain.
+///
+/// `saturating_add` rather than `+`: `indices` arrives from a client request
+/// body, and `usize::MAX` overflows. In a debug build that panics — dropping
+/// the connection with no error body, because no `CatchPanicLayer` is mounted —
+/// and in **release** it silently wraps to `"0"`, which is worse: the agent
+/// receives a token matching no option and the operator sees an answer that
+/// went nowhere. Saturating keeps the value out of range, where
+/// [`check_answerable_indices`] rejects it as the input error it is.
 pub fn ask_reply_content(indices: &[usize]) -> String {
     indices
         .iter()
-        .map(|index| (index + 1).to_string())
+        .map(|index| index.saturating_add(1).to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Reject an answer whose indices do not name options on this card.
+///
+/// The card is in hand at the call site, so "is 999 a real option" is a
+/// question with an answer — and an unchecked index is not a harmless no-op:
+/// `ask_reply_content` is **positional**, so an out-of-range one sends the
+/// agent a free-text token matching nothing, and the turn stays blocked while
+/// the operator believes they answered.
+///
+/// An empty selection is refused for the same reason rather than sent as an
+/// empty string: a card with options is answered by choosing one.
+/// `allow_free_text` cards are the exception — they carry no options to index,
+/// so they are answered through the message path, not this one.
+pub fn check_answerable_indices(card: &AskCard, indices: &[usize]) -> Result<(), String> {
+    if indices.is_empty() {
+        return Err("an answer must name at least one option".into());
+    }
+    if !card.multi_select && indices.len() > 1 {
+        return Err(format!(
+            "this card is single-select; {} options were chosen",
+            indices.len()
+        ));
+    }
+    let options = card.options.len();
+    if let Some(bad) = indices.iter().find(|index| **index >= options) {
+        return Err(format!(
+            "option index {bad} is out of range; this card has {options} options"
+        ));
+    }
+    Ok(())
 }
 
 /// The pubkeys an answer must `p`-tag: **the agent that asked, and only it**.

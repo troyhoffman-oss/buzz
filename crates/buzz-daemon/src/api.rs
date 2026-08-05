@@ -312,27 +312,56 @@ fn unix_now() -> i64 {
 /// Liveness is a **connect probe**, never a pidfile pid check — a pid check is
 /// a reuse race, and §2.3 is explicit that a socket nothing answers on is dead.
 async fn daemon_registry(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let mut entries: Vec<serde_json::Value> = Vec::new();
-    if let Ok(dir) = std::fs::read_dir(&state.config.runtime_dir) {
-        for socket in dir
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "sock"))
-        {
-            let alive = tokio::net::UnixStream::connect(&socket).await.is_ok();
-            entries.push(serde_json::json!({
-                "socket": socket.display().to_string(),
-                "alive": alive,
-                "self": socket == state.config.socket,
-            }));
+    // `tokio::fs`, not `std::fs`: a blocking `read_dir` on a runtime worker
+    // stalls every other task on that thread, and the runtime directory can
+    // live on a slow or unresponsive filesystem.
+    let mut sockets: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(mut dir) = tokio::fs::read_dir(&state.config.runtime_dir).await {
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "sock") {
+                sockets.push(path);
+            }
         }
     }
+
+    // Probed **concurrently and with a deadline**. Serially awaiting each
+    // connect means one wedged daemon — a full listen backlog accepts the
+    // connection at the kernel and never answers — stalls the whole
+    // enumeration, which is exactly the situation this endpoint exists to
+    // diagnose. `MAX_LIVE_DAEMONS` caps spawning, not stale `.sock` files left
+    // on disk, so the fan-out is over an unbounded set and each arm needs its
+    // own bound.
+    let probes = sockets.into_iter().map(|socket| {
+        let own = socket == state.config.socket;
+        async move {
+            let alive = tokio::time::timeout(
+                REGISTRY_PROBE_TIMEOUT,
+                tokio::net::UnixStream::connect(&socket),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok());
+            serde_json::json!({
+                "socket": socket.display().to_string(),
+                "alive": alive,
+                "self": own,
+            })
+        }
+    });
+    let mut entries: Vec<serde_json::Value> = futures_util::future::join_all(probes).await;
+
     entries.sort_by(|a, b| a["socket"].as_str().cmp(&b["socket"].as_str()));
     Json(serde_json::json!({
         "daemons": entries,
         "cap": crate::config::MAX_LIVE_DAEMONS,
     }))
 }
+
+/// How long a liveness probe waits before calling a socket dead.
+///
+/// A connect to a live daemon is a local kernel operation and completes in
+/// microseconds; anything approaching this is a daemon that cannot serve.
+const REGISTRY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// `POST /daemon/reconnect` — force the relay loop to redial (§2.6).
 ///
@@ -415,6 +444,14 @@ async fn channel_window(
     Path(id): Path<String>,
     Query(query): Query<WindowQuery>,
 ) -> crate::Result<Json<serde_json::Value>> {
+    // Validated before anything else touches it. This handler registers a live
+    // subscription below, and `Subscriptions::subscribe` is an `or_insert` with
+    // no cap and no production `unsubscribe` — so an unvalidated `{id}` means
+    // every junk string a client GETs is registered permanently and becomes a
+    // `PlannedReq` on **every** subsequent reconnect, at 125 ms each. A read
+    // endpoint must not be able to grow the daemon's reconnect cost without
+    // bound.
+    let id = parse_channel_uuid(&id)?.to_string();
     let cursor = query
         .before
         .as_deref()
@@ -510,11 +547,22 @@ async fn answer_ask(
     let identity = state.identity_snapshot().await?;
     let agent = {
         let inner = state.lock().await;
-        inner
+        let agent = inner
             .asks
             .asker(&id)
             .map(str::to_string)
-            .ok_or_else(|| DaemonError::NotFound(format!("no open ask card for {id}")))?
+            .ok_or_else(|| DaemonError::NotFound(format!("no open ask card for {id}")))?;
+        // Bounded against the card the daemon is holding, before anything is
+        // signed. The indices are positional, so an out-of-range one does not
+        // fail loudly — it sends the agent a token matching no option while the
+        // turn stays blocked and the operator believes they answered.
+        let card = inner
+            .asks
+            .get(&id)
+            .ok_or_else(|| DaemonError::NotFound(format!("no open ask card for {id}")))?;
+        crate::askcard::check_answerable_indices(card, &answer.indices)
+            .map_err(DaemonError::InvalidInput)?;
+        agent
     };
     let event = crate::post::build_ask_answer_event(
         &identity,
@@ -889,6 +937,45 @@ struct UserQuery {
     limit: usize,
 }
 
+/// Largest batch `GET /user?pubkeys=` will answer.
+///
+/// The handler runs under the daemon's single mutex, so an unbounded list is
+/// unbounded time with every other socket client — including an `/event`
+/// reader — blocked behind it. A cap turns that into a `400` the caller can
+/// see and page around.
+const MAX_PUBKEY_BATCH: usize = 256;
+
+impl UserQuery {
+    /// The requested pubkeys, validated and capped.
+    ///
+    /// Hex-checked as well as capped: an unvalidated key is a permanent
+    /// `unknown` row in the answer, which reads as "this person has no profile"
+    /// rather than as "you sent a typo".
+    fn pubkeys(&self) -> crate::Result<Vec<String>> {
+        let requested: Vec<&str> = self.pubkeys.split(',').filter(|s| !s.is_empty()).collect();
+        if requested.len() > MAX_PUBKEY_BATCH {
+            return Err(DaemonError::InvalidInput(format!(
+                "at most {MAX_PUBKEY_BATCH} pubkeys per request; {} were given",
+                requested.len()
+            )));
+        }
+        if let Some(bad) = requested
+            .iter()
+            .find(|value| !crate::search::is_hex_pubkey(value))
+        {
+            return Err(DaemonError::InvalidInput(format!(
+                "not a 32-byte hex pubkey: {bad}"
+            )));
+        }
+        Ok(requested.into_iter().map(str::to_string).collect())
+    }
+
+    /// The result cap, clamped so a client cannot ask for the whole directory.
+    fn limit(&self) -> usize {
+        self.limit.clamp(1, 100)
+    }
+}
+
 /// `GET /search/user` — directory search by name.
 async fn search_user(
     State(state): State<AppState>,
@@ -898,10 +985,8 @@ async fn search_user(
     // Ranked over the same directory the send path resolves against, which is
     // what makes "what you picked is what gets tagged" hold by construction
     // rather than by two implementations agreeing ([D-2]).
-    let everyone: std::collections::BTreeSet<String> =
-        inner.mentions.directory.keys().cloned().collect();
     Json(serde_json::json!({
-        "users": inner.mentions.candidates(&query.name, &everyone, query.limit),
+        "users": rank_over_directory(&inner, &query.name, query.limit()),
     }))
 }
 
@@ -909,15 +994,12 @@ async fn search_user(
 async fn list_users(
     State(state): State<AppState>,
     Query(query): Query<UserQuery>,
-) -> Json<serde_json::Value> {
+) -> crate::Result<Json<serde_json::Value>> {
+    // Validated **before** the lock: a `400` for a malformed batch must not
+    // queue behind whatever else is holding the mutex.
+    let requested = query.pubkeys()?;
     let inner = state.lock().await;
     let directory = &inner.mentions.directory;
-    let requested: Vec<String> = query
-        .pubkeys
-        .split(',')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
 
     let users: Vec<serde_json::Value> = if !requested.is_empty() {
         requested
@@ -931,20 +1013,32 @@ async fn list_users(
             .map(|roster| {
                 roster
                     .iter()
+                    .take(MAX_PUBKEY_BATCH)
                     .map(|pubkey| profile_json(directory.get(pubkey), pubkey))
                     .collect()
             })
             .unwrap_or_default()
     } else {
-        let everyone: std::collections::BTreeSet<String> = directory.keys().cloned().collect();
-        inner
-            .mentions
-            .candidates(&query.name, &everyone, query.limit)
+        rank_over_directory(&inner, &query.name, query.limit())
             .into_iter()
             .map(|c| serde_json::to_value(c).unwrap_or(serde_json::Value::Null))
             .collect()
     };
-    Json(serde_json::json!({"users": users}))
+    Ok(Json(serde_json::json!({"users": users})))
+}
+
+/// Rank directory candidates by prefix, without copying the whole directory.
+///
+/// Both directory-wide callers want "everyone", and expressing that as a
+/// `BTreeSet` clone of every key is an allocation proportional to the directory
+/// **per request, under the lock** — the one place this daemon cannot afford
+/// one. [`crate::mentions::rank_directory`] takes a predicate instead.
+fn rank_over_directory(
+    inner: &crate::state::Inner,
+    prefix: &str,
+    limit: usize,
+) -> Vec<crate::mentions::MentionCandidate> {
+    crate::mentions::rank_directory(prefix, &inner.mentions.directory, limit)
 }
 
 /// `GET /user/{pubkey}` — one profile plus its presence.

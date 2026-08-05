@@ -314,41 +314,60 @@ pub fn apply_relay_event(
     let kind = kind_of(event);
     let event_id = event.id.to_hex();
     let created_at = event.created_at.as_secs();
-    // The watermark key is the `h` tag when there is one and the subscription
-    // otherwise: a watermark is per-channel for channel traffic and
-    // per-subscription for everything else. Mixing the two would let a busy
-    // channel advance the observer subscription's replay window past frames it
-    // never delivered.
-    let watermark_key = channel_of(event).unwrap_or_else(|| subscription_id.to_string());
-    if !inner
-        .session
-        .record_event(&event_id, &watermark_key, created_at)
-    {
+
+    // Dedupe first, and **only** dedupe: the watermark does not move here.
+    //
+    // An earlier revision advanced it in the same call, before the routing
+    // decision below — which meant every `Dropped` arm left the replay window
+    // past an event that was deduped and never delivered. After a reconnect the
+    // resubscribe would start *after* it, so the event was permanently
+    // invisible: the exact "deduped but never delivered" failure
+    // `TwoGenDedup::remove` exists to prevent, reached by the watermark instead
+    // of the dedup set. The two now move together, at the bottom, on delivery.
+    if !inner.session.seen.insert(event_id.clone()) {
+        inner.session.note_duplicate();
         return Ingested::Duplicate;
     }
 
-    if subscription_id.starts_with(SUB_CHANNEL_PREFIX) {
-        return apply_timeline_event(inner, event, kind);
-    }
-    match subscription_id {
-        SUB_MEMBERSHIP => apply_membership_event(inner, event, created_at),
-        SUB_OBSERVER => apply_observer_event(inner, event, now),
-        SUB_METRIC => apply_metric_event(inner, event),
-        SUB_PRESENCE => apply_presence_event(inner, event, kind),
-        // An event on a subscription the daemon did not open is not routed by
-        // guessing. Forgetting it un-dedups it, so a later resubscribe that
-        // *does* name a route can still deliver it — `TwoGenDedup::remove`
-        // exists for exactly this "deduped but never delivered" case.
-        other => {
-            inner.session.forget_event(&event_id);
-            tracing::debug!(
-                subscription = other,
-                kind,
-                "event on an unrouted subscription"
-            );
-            Ingested::Dropped("unrouted_subscription")
+    let outcome = if subscription_id.starts_with(SUB_CHANNEL_PREFIX) {
+        apply_timeline_event(inner, event, kind)
+    } else {
+        match subscription_id {
+            SUB_MEMBERSHIP => apply_membership_event(inner, event, created_at),
+            SUB_OBSERVER => apply_observer_event(inner, event, now),
+            SUB_METRIC => apply_metric_event(inner, event),
+            SUB_PRESENCE => apply_presence_event(inner, event, kind, now),
+            // An event on a subscription the daemon did not open is not routed
+            // by guessing.
+            other => {
+                tracing::debug!(
+                    subscription = other,
+                    kind,
+                    "event on an unrouted subscription"
+                );
+                Ingested::Dropped("unrouted_subscription")
+            }
         }
+    };
+
+    match outcome {
+        // Delivered. The watermark key is the `h` tag when there is one and the
+        // subscription otherwise: a watermark is per-channel for channel
+        // traffic and per-subscription for everything else, and mixing the two
+        // would let a busy channel advance the observer subscription's replay
+        // window past frames it never delivered.
+        Ingested::Applied(_) => {
+            let key = channel_of(event).unwrap_or_else(|| subscription_id.to_string());
+            inner.session.subscriptions.observe(&key, created_at);
+        }
+        // Dropped: un-dedupe it so a resubscribe can re-deliver it, and leave
+        // the watermark where it was so the replay window still reaches back
+        // far enough to include it. Both halves are required — forgetting the
+        // id while the watermark has moved past the event is a no-op.
+        Ingested::Dropped(_) => inner.session.forget_event(&event_id),
+        Ingested::Duplicate => {}
     }
+    outcome
 }
 
 /// Route a channel-timeline event: the message families, plus their overlays.
@@ -492,10 +511,27 @@ fn apply_membership_event(inner: &mut Inner, event: &nostr::Event, created_at: u
     let json = event_json(event);
     let changed = inner.channels.apply_membership(&json);
     inner.session.subscriptions.observe_membership(created_at);
+
+    // Discovery lands in the **subscription registry**, not only in the channel
+    // cache. An earlier revision updated `Channels` and stopped there, so the
+    // only thing that ever called `subscriptions.subscribe` was the history
+    // endpoint: a fresh daemon with twelve channels subscribed to *zero* of
+    // them until a client paged history on each one, which is the same
+    // permanently-empty-stores symptom this whole module exists to fix.
+    //
+    // Registering here is what makes the next `plan_subscriptions` include the
+    // channel, and the REQ itself is paced out by the loop rather than sent
+    // from this pure function.
+    if let Some(channel_id) = channel_of(event).or_else(|| tag_value(event, "d")) {
+        if uuid::Uuid::parse_str(&channel_id).is_ok() {
+            inner.session.subscriptions.subscribe(channel_id);
+        }
+    }
+
     if !changed {
         // A no-op membership is common after a reconnect replay and must not
         // look like new activity. It was still *delivered* — the watermark
-        // advanced — so it is applied-with-no-topics rather than dropped.
+        // advances — so it is applied-with-no-topics rather than dropped.
         return Ingested::Applied(Vec::new());
     }
     inner
@@ -604,7 +640,15 @@ fn apply_metric_event(inner: &mut Inner, event: &nostr::Event) -> Ingested {
 }
 
 /// Route a 20001 beat or a 40902 snapshot.
-fn apply_presence_event(inner: &mut Inner, event: &nostr::Event, kind: u32) -> Ingested {
+///
+/// `now` is the **daemon's** clock, not the event's. Reading staleness against
+/// the event's own `created_at` makes `now - last_seen == 0` by construction,
+/// so [`crate::presence::PRESENCE_BEAT_TTL_SECS`] can never elapse and any peer
+/// — including one whose beats stopped an hour ago, or one publishing a
+/// backdated `created_at` — pins itself `present` forever. That is the
+/// looks-alive-while-it-is-dead failure §1.3 property 3 forbids, and presence
+/// is the one store whose entire job is not to make that claim.
+fn apply_presence_event(inner: &mut Inner, event: &nostr::Event, kind: u32, now: i64) -> Ingested {
     let pubkey = event.pubkey.to_hex();
     let status = tag_value(event, "status")
         .or_else(|| tag_value(event, "s"))
@@ -625,7 +669,7 @@ fn apply_presence_event(inner: &mut Inner, event: &nostr::Event, kind: u32) -> I
         // stream also the least informative.
         return Ingested::Applied(Vec::new());
     }
-    let record = inner.presence.get(&pubkey, created_at);
+    let record = inner.presence.get(&pubkey, now);
     inner.fleet.agent_mut(&pubkey).presence = Some(record.state);
     inner.stream.publish(
         "presence.update",
@@ -1157,7 +1201,7 @@ enum Handled {
 async fn handle_message(
     state: &AppState,
     message: RelayMessage,
-    pending: &mut [PendingPublish],
+    pending: &mut Vec<PendingPublish>,
 ) -> Handled {
     match message {
         RelayMessage::Event {
@@ -1189,17 +1233,28 @@ async fn handle_message(
             // A publish acknowledged over the socket resolves here too, so an
             // `OK` arriving while the bridge call is still in flight does not
             // leave the caller waiting for a verdict that already exists.
-            for item in pending.iter_mut() {
-                if item.event.id.to_hex() == ok.event_id {
-                    let local_id = item.local_id.clone();
-                    item.resolve(Ok(crate::post::SendResponse {
-                        event_id: ok.event_id.clone(),
-                        accepted: ok.accepted,
-                        message: ok.message.clone(),
-                        local_id,
-                    }));
+            //
+            // **`retain`, not `iter_mut`.** `resolve` only takes the responder;
+            // it does not remove the entry. An earlier revision iterated a
+            // `&mut [PendingPublish]` — a slice, where removal is structurally
+            // impossible — so an acknowledged publish answered its caller and
+            // then stayed at the head of the queue, re-submitted over the
+            // bridge every `PUBLISH_RETRY_INTERVAL` with nobody waiting on it:
+            // a silent duplicate-write loop, and a third write path the "exactly
+            // two" property does not admit.
+            pending.retain_mut(|item| {
+                if item.event.id.to_hex() != ok.event_id {
+                    return true;
                 }
-            }
+                let local_id = item.local_id.clone();
+                item.resolve(Ok(crate::post::SendResponse {
+                    event_id: ok.event_id.clone(),
+                    accepted: ok.accepted,
+                    message: ok.message.clone(),
+                    local_id,
+                }));
+                false
+            });
             Handled::Continue
         }
         RelayMessage::Eose { .. } | RelayMessage::Count { .. } => Handled::Continue,
@@ -1294,6 +1349,16 @@ async fn handle_command(
 /// across a single [`PUBLISH_DEADLINE`] — a retry storm aimed at a relay that
 /// is already unwell. [`PUBLISH_RETRY_INTERVAL`] paces it.
 async fn drain_publishes(state: &AppState, pending: &mut Vec<PendingPublish>) {
+    // **Unconditionally, first.** An earlier revision only reached
+    // `fail_expired` from this function's failure arm, which meant a publish
+    // queued *behind* a succeeding one aged past `PUBLISH_DEADLINE` with
+    // nothing ever checking it: `WireHandle::publish` awaits its oneshot bare
+    // and there is no timeout layer above it, so the client's
+    // `POST /channel/{id}/message` hung forever with the composed text stuck.
+    // That is precisely the ambiguous outcome §2.7 exists to prevent, reached
+    // by way of the queue rather than the relay. The deadline has to be swept
+    // on every tick, not only when the head fails.
+    fail_expired(pending);
     let Some(item) = pending.first_mut() else {
         return;
     };
@@ -1924,5 +1989,218 @@ mod tests {
             state.lock().await.session.state(),
             ConnectionState::Disconnected
         ));
+    }
+    /// **W1 regression.** A publish queued behind a succeeding one must still
+    /// hit its deadline. `fail_expired` used to run only from
+    /// `drain_publishes`'s failure arm, so an entry that was never at the head
+    /// during a failure aged forever — and `WireHandle::publish` awaits its
+    /// oneshot bare, with no timeout layer above it, so the client's POST hung
+    /// with the composed text stuck. Silence is the one outcome §2.7 forbids.
+    #[tokio::test]
+    async fn a_publish_behind_a_healthy_one_still_hits_its_deadline() {
+        let keys = Keys::generate();
+        let event = |n: u8| {
+            EventBuilder::new(Kind::Custom(9), format!("m{n}"))
+                .sign_with_keys(&keys)
+                .expect("sign")
+        };
+        let (head_tx, _head_rx) = tokio::sync::oneshot::channel();
+        let (tail_tx, tail_rx) = tokio::sync::oneshot::channel();
+        let mut pending = vec![
+            PendingPublish {
+                event: event(1),
+                respond: Some(head_tx),
+                local_id: None,
+                asked_at: Instant::now(),
+                last_attempt: None,
+            },
+            PendingPublish {
+                event: event(2),
+                respond: Some(tail_tx),
+                local_id: None,
+                // Queued long ago and never at the head.
+                asked_at: Instant::now() - PUBLISH_DEADLINE - Duration::from_secs(1),
+                last_attempt: None,
+            },
+        ];
+
+        // The sweep the loop performs at the top of every `drain_publishes`.
+        fail_expired(&mut pending);
+
+        assert_eq!(pending.len(), 1, "the expired tail must be dropped");
+        assert!(matches!(
+            tail_rx
+                .await
+                .expect("the caller is answered, never dropped"),
+            Err(DaemonError::RelayUnreachable)
+        ));
+    }
+
+    /// **W2 regression.** An `OK` over the socket must *remove* the pending
+    /// entry, not merely answer its caller. Resolving without removing left the
+    /// event at the head of the queue, re-submitted over the bridge every
+    /// `PUBLISH_RETRY_INTERVAL` with nobody waiting: a silent duplicate-write
+    /// loop, and a third write path the "exactly two" property does not admit.
+    #[tokio::test]
+    async fn an_ok_removes_the_pending_publish_rather_than_only_answering_it() {
+        let state = AppState::new(config(), None).expect("state");
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "sent")
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let event_id = event.id.to_hex();
+        let (respond, wait) = tokio::sync::oneshot::channel();
+        let mut pending = vec![PendingPublish {
+            event,
+            respond: Some(respond),
+            local_id: Some("local-9".into()),
+            asked_at: Instant::now(),
+            last_attempt: None,
+        }];
+
+        let ok = buzz_ws_client::OkResponse {
+            event_id: event_id.clone(),
+            accepted: true,
+            message: String::new(),
+        };
+        handle_message(&state, RelayMessage::Ok(ok), &mut pending).await;
+
+        assert!(
+            pending.is_empty(),
+            "an acknowledged publish must leave the queue, or it is re-sent forever"
+        );
+        let response = wait.await.expect("answered").expect("accepted");
+        assert_eq!(response.event_id, event_id);
+        assert_eq!(response.local_id.as_deref(), Some("local-9"));
+    }
+
+    /// **W3 regression.** A dropped event must leave the watermark where it
+    /// was. Advancing it before the routing decision meant the reconnect replay
+    /// began *after* an event that was deduped and never delivered — permanent
+    /// invisibility, reached by the watermark rather than the dedup set.
+    #[tokio::test]
+    async fn a_dropped_event_moves_neither_the_dedup_set_nor_the_watermark() {
+        let state = AppState::new(config(), None).expect("state");
+        let mut inner = state.lock().await;
+        inner.session.subscriptions.subscribe(CHANNEL);
+        let author = Keys::generate();
+        // Routed to a subscription that exists, but dropped by the handler: an
+        // observer frame at a keyless daemon.
+        let frame = EventBuilder::new(Kind::Custom(24_200), "x")
+            .tags([Tag::parse(["h", CHANNEL]).unwrap()])
+            .custom_created_at(nostr::Timestamp::from_secs(NOW as u64))
+            .sign_with_keys(&author)
+            .expect("sign");
+
+        let outcome = apply_relay_event(&mut inner, SUB_OBSERVER, &frame, NOW);
+        assert!(matches!(outcome, Ingested::Dropped(_)), "{outcome:?}");
+        assert!(
+            !inner.session.seen.contains(&frame.id.to_hex()),
+            "a dropped event must be un-deduped so a resubscribe can re-deliver it"
+        );
+        assert_eq!(
+            inner.session.subscriptions.resubscribe_since(CHANNEL),
+            Some(0),
+            "the watermark must not have advanced past an undelivered event"
+        );
+    }
+
+    /// The other half of W3: a **delivered** event does advance the watermark.
+    /// The fix must not trade one failure for the opposite one.
+    #[tokio::test]
+    async fn a_delivered_event_still_advances_the_watermark() {
+        let state = AppState::new(config(), None).expect("state");
+        let mut inner = state.lock().await;
+        inner.session.subscriptions.subscribe(CHANNEL);
+        let author = Keys::generate();
+        let message = channel_message(&author, CHANNEL, "hello", vec![], NOW);
+
+        let outcome = apply_relay_event(&mut inner, &channel_sub_id(CHANNEL), &message, NOW);
+        assert!(outcome.topics().contains(&"message.new".to_string()));
+        assert_eq!(
+            inner.session.subscriptions.resubscribe_since(CHANNEL),
+            Some(NOW as u64 - crate::session::SINCE_SKEW_SECS)
+        );
+    }
+
+    /// **W4 regression.** Membership discovery must register the channel in the
+    /// **subscription registry**, not only in the channel cache. Updating only
+    /// the cache meant a fresh daemon subscribed to zero of its channels until a
+    /// client paged history on each — the same permanently-empty-stores symptom
+    /// this module exists to fix.
+    #[tokio::test]
+    async fn membership_discovery_registers_the_channel_for_subscription() {
+        let state = AppState::new(config(), None).expect("state");
+        let mut inner = state.lock().await;
+        assert!(inner.session.subscriptions.is_empty());
+
+        let author = Keys::generate();
+        let joined = EventBuilder::new(Kind::Custom(44_100), "")
+            .tags([
+                Tag::parse(["h", CHANNEL]).unwrap(),
+                Tag::public_key(author.public_key()),
+            ])
+            .custom_created_at(nostr::Timestamp::from_secs(NOW as u64))
+            .sign_with_keys(&author)
+            .expect("sign");
+
+        apply_relay_event(&mut inner, SUB_MEMBERSHIP, &joined, NOW);
+        assert_eq!(inner.session.subscriptions.len(), 1);
+        let planned = plan_subscriptions(&inner, &"bb".repeat(32), NOW);
+        assert!(
+            planned
+                .iter()
+                .any(|req| req.subscription_id == channel_sub_id(CHANNEL)),
+            "the discovered channel must appear in the next resubscribe plan"
+        );
+    }
+
+    /// A membership event naming something that is not a uuid registers
+    /// nothing. `Subscriptions::subscribe` is an `or_insert` with no cap and no
+    /// production `unsubscribe`, so an unvalidated id is a permanent entry that
+    /// costs a paced REQ on every reconnect forever.
+    #[tokio::test]
+    async fn a_membership_event_with_a_junk_channel_id_registers_nothing() {
+        let state = AppState::new(config(), None).expect("state");
+        let mut inner = state.lock().await;
+        let author = Keys::generate();
+        let junk = EventBuilder::new(Kind::Custom(44_100), "")
+            .tags([
+                Tag::parse(["h", "../../etc/passwd"]).unwrap(),
+                Tag::public_key(author.public_key()),
+            ])
+            .custom_created_at(nostr::Timestamp::from_secs(NOW as u64))
+            .sign_with_keys(&author)
+            .expect("sign");
+
+        apply_relay_event(&mut inner, SUB_MEMBERSHIP, &junk, NOW);
+        assert!(inner.session.subscriptions.is_empty());
+    }
+
+    /// **W5 regression.** Staleness is measured against the **daemon's** clock.
+    /// Passing the event's own `created_at` as `now` makes `now - last_seen`
+    /// zero by construction, so the beat TTL can never elapse and any peer pins
+    /// itself `present` forever — the looks-alive-while-it-is-dead failure
+    /// §1.3 property 3 forbids, in the one store whose job is not to make that
+    /// claim.
+    #[tokio::test]
+    async fn a_stale_beat_does_not_pin_an_agent_present() {
+        let state = AppState::new(config(), None).expect("state");
+        let mut inner = state.lock().await;
+        let agent = Keys::generate();
+        let long_ago = NOW - crate::presence::PRESENCE_BEAT_TTL_SECS - 60;
+        let beat = EventBuilder::new(Kind::Custom(20_001), "")
+            .tags([Tag::parse(["status", "online"]).unwrap()])
+            .custom_created_at(nostr::Timestamp::from_secs(long_ago as u64))
+            .sign_with_keys(&agent)
+            .expect("sign");
+
+        // Ingested with the daemon's clock at NOW, not the event's.
+        apply_relay_event(&mut inner, SUB_PRESENCE, &beat, NOW);
+        assert_eq!(
+            inner.presence.get(&agent.public_key().to_hex(), NOW).state,
+            crate::presence::Presence::Unknown,
+            "a beat older than the TTL must lapse to unknown, not stay present"
+        );
     }
 }

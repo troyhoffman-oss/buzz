@@ -202,8 +202,16 @@ pub fn build_metric_filter(agent_pubkey: &str, self_pubkey: &str) -> Result<serd
         "kinds": [KIND_AGENT_TURN_METRIC],
         "#p": [self_pubkey],
         "authors": [agent_pubkey],
+        // Bounded because the caller NIP-44-decrypts every row it gets back:
+        // an unlimited filter against a long-lived agent turns one
+        // `GET /agent/{pk}/metric` into thousands of decrypt operations. The
+        // session view wants the recent turns, not the whole history.
+        "limit": METRIC_PAGE_LIMIT,
     }))
 }
+
+/// Cap on one `GET /agent/{pk}/metric` response.
+pub const METRIC_PAGE_LIMIT: u32 = 200;
 
 #[cfg(test)]
 mod tests {

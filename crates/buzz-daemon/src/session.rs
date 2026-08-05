@@ -596,6 +596,17 @@ impl Session {
         true
     }
 
+    /// Count an event the dedup set rejected.
+    ///
+    /// Split out from [`Self::record_event`] so a caller can dedupe *before*
+    /// routing and advance the watermark *after* it. Doing both in one call
+    /// forces the watermark to move for an event the caller has not yet decided
+    /// to deliver, and a watermark past an undelivered event is a permanent
+    /// loss: the reconnect replay starts after it.
+    pub fn note_duplicate(&mut self) {
+        self.counters.deduped += 1;
+    }
+
     /// Un-dedup an event that was never delivered, so replay can re-deliver it.
     pub fn forget_event(&mut self, event_id: &str) {
         self.seen.remove(event_id);
