@@ -280,7 +280,22 @@ pub fn reduce_agent(pubkey: &str, agent: &AgentAccumulator, now: i64) -> FleetRo
 
     FleetRow {
         pubkey: pubkey.to_string(),
-        name: agent.name.clone(),
+        // An unresolved agent falls back to its short pubkey rather than to the
+        // empty string. Wave 1 has no production caller for
+        // `ObserverPipeline::register_agent` (the profile directory that would
+        // fill it is not wired), so `name` is empty for **every** live agent —
+        // and the M3 live walk rendered exactly that: a drawer row with a
+        // status of `needs input` and no subject at all, which reads as a
+        // rendering bug rather than as an unresolved name.
+        //
+        // The short pubkey is the same fallback `/user` uses for an unresolved
+        // profile, so the two surfaces agree, and it is honest: it names the
+        // agent by the only identifier the daemon actually has.
+        name: if agent.name.is_empty() {
+            pubkey.chars().take(8).collect()
+        } else {
+            agent.name.clone()
+        },
         state: agent_state(agent),
         turn: agent.turn.clone(),
         elapsed_secs,
@@ -589,6 +604,32 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(reduce_agent("pk", &agent, NOW).tokens_per_min, None);
+    }
+
+    /// **M3 regression.** An unresolved agent is named by its short pubkey,
+    /// never by the empty string.
+    ///
+    /// `ObserverPipeline::register_agent` has no production caller in Wave 1 —
+    /// the profile directory that would fill it is not wired — so `name` is
+    /// empty for every live agent. The M3 live walk rendered exactly that: a
+    /// drawer row reading `needs input` with no subject at all, which looks
+    /// like a rendering bug rather than an unresolved name.
+    #[test]
+    fn an_unnamed_agent_falls_back_to_its_short_pubkey() {
+        let pubkey = "98071e8c".to_string() + &"ad".repeat(28);
+        let agent = AgentAccumulator {
+            presence: Some(Presence::Present),
+            ..Default::default()
+        };
+        assert_eq!(agent.name, "", "the precondition is an unresolved name");
+        assert_eq!(reduce_agent(&pubkey, &agent, NOW).name, "98071e8c");
+
+        // A resolved name still wins, so the fallback cannot mask one.
+        let named = AgentAccumulator {
+            name: "claude-1".into(),
+            ..agent.clone()
+        };
+        assert_eq!(reduce_agent(&pubkey, &named, NOW).name, "claude-1");
     }
 
     /// **M3 regression.** The metric accumulator is bounded.

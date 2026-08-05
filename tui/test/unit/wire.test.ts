@@ -224,9 +224,7 @@ describe("messages", () => {
       // The exact confusion that produced 28 blank rows against a daemon
       // serving real messages. Pinned so the two decoders cannot be swapped
       // back for one another without a red test.
-      expect(
-        decodeMessage({ event: events[0], thread: null }),
-      ).toBeUndefined();
+      expect(decodeMessage({ event: events[0], thread: null })).toBeUndefined();
     });
 
     test("a thread overlay contributes its reply count; null contributes none", () => {
@@ -238,13 +236,17 @@ describe("messages", () => {
         )?.replyCount,
       ).toBe(4);
       expect(
-        decodeTimelineRow({ event: first, thread: null }, channelId)?.replyCount,
+        decodeTimelineRow({ event: first, thread: null }, channelId)
+          ?.replyCount,
       ).toBeUndefined();
     });
 
     test("a row with no event id is dropped, like a message with none", () => {
       expect(
-        decodeTimelineRow({ event: { content: "hi" }, thread: null }, channelId),
+        decodeTimelineRow(
+          { event: { content: "hi" }, thread: null },
+          channelId,
+        ),
       ).toBeUndefined();
       expect(decodeTimelineRow({ thread: null }, channelId)).toBeUndefined();
     });
