@@ -230,6 +230,23 @@ impl Identity {
         self.keys.as_ref()
     }
 
+    /// The signing keys, cloned, for the NIP-42 handshake.
+    ///
+    /// The one exception to [`Self::keys`]'s crate-internal rule, and it is
+    /// narrow by construction: `buzz_ws_client::NostrWsConnection::connect_
+    /// authenticated` takes `&Keys` by value-of-reference and there is no way
+    /// to hand it a borrow that outlives this struct's lock guard. §2.5's
+    /// boundary is that key material never crosses a **process** edge — this
+    /// clone stays inside the daemon, and it is what
+    /// [`crate::wire::run`] holds for the life of the loop rather than
+    /// re-deriving per reconnect.
+    ///
+    /// Returns `None` in the keyless state, which is a supported and visible
+    /// one (`GET /health` reports `archiving: false`).
+    pub fn signing_keys(&self) -> Option<Keys> {
+        self.keys.clone()
+    }
+
     /// The NIP-OA tag as it goes on the wire, when one is configured.
     pub fn auth_tag_nostr(&self) -> Option<Tag> {
         self.auth_tag.as_ref().and_then(|t| t.to_nostr_tag().ok())

@@ -170,11 +170,29 @@ pub enum Replay {
     Reset,
 }
 
+/// Capacity of the live broadcast each `/event` reader subscribes to.
+///
+/// Sized well under [`EVENT_RING_CAPACITY`] on purpose: a client that falls
+/// this far behind has a genuine problem, and the ring is what lets it recover
+/// by re-issuing `?since=` rather than by the daemon buffering indefinitely. A
+/// receiver that lags past this gets `stream.overflow` **and then** the
+/// disconnect [D-5] specifies, so the loss is announced before it happens.
+pub const EVENT_BROADCAST_CAPACITY: usize = 1_024;
+
 /// The event-stream fan-out: the ring, the sequence, and `?since=` replay.
 ///
 /// Implements §4.1.1 deliverable 13 and §2.6's link-A behaviour.
 #[derive(Debug)]
 pub struct EventStream {
+    /// Live fan-out to every attached `/event` reader.
+    ///
+    /// The ring alone cannot serve a live reader — it is a *replay* structure,
+    /// and polling it would either busy-wait or add latency. The broadcast is
+    /// the push half; the ring is the catch-up half, and `?since=` is what
+    /// stitches them together without a gap: a reader subscribes **first**,
+    /// then replays, then drops any live frame at or below the replayed
+    /// high-water mark.
+    live: tokio::sync::broadcast::Sender<StreamFrame>,
     next_seq: u64,
     ring: std::collections::VecDeque<StreamFrame>,
     capacity: usize,
@@ -206,13 +224,31 @@ impl EventStream {
 
     /// A stream with an explicit ring capacity, for tests.
     pub fn with_capacity(capacity: usize) -> Self {
+        let (live, _) = tokio::sync::broadcast::channel(EVENT_BROADCAST_CAPACITY);
         Self {
+            live,
             next_seq: 0,
             ring: std::collections::VecDeque::with_capacity(capacity.min(1024)),
             capacity,
             coalesced: std::collections::BTreeMap::new(),
             floor: 0,
         }
+    }
+
+    /// Subscribe a live `/event` reader.
+    ///
+    /// Subscribe **before** calling [`Self::replay`]: the two together are only
+    /// gapless in that order. Subscribing first means a frame published during
+    /// the replay is buffered rather than missed; the reader then discards live
+    /// frames whose `seq` the replay already delivered. The reverse order has a
+    /// window in which a frame is in neither half.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<StreamFrame> {
+        self.live.subscribe()
+    }
+
+    /// How many live readers are attached.
+    pub fn subscriber_count(&self) -> usize {
+        self.live.receiver_count()
     }
 
     /// Allocate the next daemon-global sequence number.
@@ -280,6 +316,11 @@ impl EventStream {
     }
 
     fn push(&mut self, frame: StreamFrame) {
+        // Fan out before the ring bookkeeping, and ignore the error: `send`
+        // fails only when there is no receiver, which is the normal state of a
+        // daemon nobody has attached to. Treating "nobody is listening" as a
+        // failure would make the ingest path noisy exactly when it is healthy.
+        let _ = self.live.send(frame.clone());
         if self.ring.len() >= self.capacity {
             if let Some(evicted) = self.ring.pop_front() {
                 // Capacity eviction is real loss, so it moves the floor: a

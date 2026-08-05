@@ -19,7 +19,8 @@
 //!
 //! | Module | Deliverable |
 //! |---|---|
-//! | [`session`] | 1 — session layer + constant table ([D-4]) |
+//! | [`session`] | 1 — session layer, policy half ([D-4]) |
+//! | [`wire`] | 1 — session layer, relay I/O half (§2.6, §2.7) |
 //! | [`identity`] | 2 — ncryptsec, NIP-OA auth tag, zeroizing storage |
 //! | [`channels`] | 3 — channel discovery + cache |
 //! | [`timeline`] | 4 — NIP-CW window fetch ([D-10]) |
@@ -71,6 +72,7 @@ pub mod socket;
 pub mod state;
 pub mod stream;
 pub mod timeline;
+pub mod wire;
 
 pub use config::{Config, SocketIdentity};
 pub use error::{DaemonError, Result};
