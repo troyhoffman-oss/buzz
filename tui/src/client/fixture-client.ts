@@ -275,4 +275,14 @@ export class FixtureClient implements DaemonClient {
     };
     this.emit("read_state.update", channelId, { channelId, eventId: anchor });
   }
+
+  /**
+   * No-op: a scenario carries its own messages, so there is nothing to fetch.
+   *
+   * The parameter is deliberately unused. Faking a fetch here — even a delay —
+   * would make the fixture transport model the socket transport's *latency*
+   * without modelling its *failures*, which is the worst of both: tests would
+   * become timing-dependent while still never exercising a real error path.
+   */
+  async ensureMessages(_channelId: string): Promise<void> {}
 }

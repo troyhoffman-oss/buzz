@@ -36,6 +36,7 @@ interface SendCall {
 class RecordingClient implements DaemonClient {
   readonly sends: SendCall[] = [];
   readonly readMarks: string[] = [];
+  readonly messageLoads: string[] = [];
 
   constructor(
     private readonly inner: FixtureClient,
@@ -63,6 +64,17 @@ class RecordingClient implements DaemonClient {
   async markRead(channelId: string, eventId?: string): Promise<void> {
     this.readMarks.push(channelId);
     return this.inner.markRead(channelId, eventId);
+  }
+
+  /**
+   * Recorded as well as delegated, so a test can assert the Shell asks for a
+   * timeline when a channel layer becomes current — the effect that carries the
+   * whole L2 body on the socket transport, and that renders as an empty
+   * (indistinguishable from empty-channel) timeline when it does not fire.
+   */
+  async ensureMessages(channelId: string): Promise<void> {
+    this.messageLoads.push(channelId);
+    return this.inner.ensureMessages(channelId);
   }
 }
 
@@ -123,4 +135,32 @@ test("a rejected send restores the text rather than losing it silently", async (
   // A cleared composer plus a message that never arrived is indistinguishable
   // from the bug this seam was added to fix. The operator keeps their text.
   expect(t.captureCharFrame()).toContain("will fail");
+});
+
+/**
+ * **M3 regression.** The L2 body is loaded by an effect, not by the boot
+ * snapshot, and nothing above the client can tell "not asked for" from "empty
+ * channel" — both paint the same blank rows.
+ *
+ * Found against the live daemon: `UdsClient.hydrate` hardcoded `messages: {}`
+ * with a comment saying the endpoint was unmounted. It is mounted now, so the
+ * comment was stale and the timeline rendered 28 blank rows while
+ * `GET /channel/{id}/message` returned real messages over the same socket.
+ *
+ * Every fixture carries its own messages, so no fixture test could see this:
+ * `FixtureClient.getSnapshot` already had them, and the missing fetch was
+ * invisible. The assertion is therefore on the **call**, which is the thing
+ * that was absent.
+ */
+test("descending into a channel asks the client for its timeline", async () => {
+  const { client, t } = await mount();
+
+  t.mockInput.pressArrow("right");
+  await t.renderOnce();
+  // The effect is async and the render does not await it.
+  await Bun.sleep(20);
+  await t.renderOnce();
+
+  expect(client.messageLoads.length).toBeGreaterThan(0);
+  expect(client.messageLoads[0]).toBeTruthy();
 });

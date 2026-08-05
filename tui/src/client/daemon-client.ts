@@ -48,4 +48,25 @@ export interface DaemonClient {
 
   /** Mark a channel read to an event id, or to now (`POST /channel/{id}/read`). */
   markRead(channelId: string, eventId?: string): Promise<void>;
+
+  /**
+   * Ensure a channel's timeline is loaded, if this transport has to fetch it.
+   *
+   * On the socket transport this is `GET /channel/{id}/message` and it is the
+   * only way a timeline is ever populated — the boot snapshot deliberately
+   * carries none, because a machine with forty channels would otherwise make
+   * forty relay round trips before the first frame paints. It also has a
+   * **side effect the client depends on**: the daemon registers a live
+   * subscription for the channel when it serves a page, anchored to the newest
+   * row in it, so fetching history is also how the tail goes live.
+   *
+   * On the fixture transport it is a no-op: the scenario carries its own
+   * messages and there is nothing to fetch. That asymmetry is why this is a
+   * method on the interface rather than a call in the shell against a concrete
+   * client — the shell should not know which transport it holds.
+   *
+   * Idempotent by contract, because descent is a common keystroke and `←` `→`
+   * must not re-query the relay each time.
+   */
+  ensureMessages(channelId: string): Promise<void>;
 }

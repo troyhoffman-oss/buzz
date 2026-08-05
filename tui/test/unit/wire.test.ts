@@ -22,6 +22,7 @@ import {
   decodePresence,
   decodeSession,
   decodeStreamFrame,
+  decodeTimelineRow,
   decodeUsage,
 } from "../../src/client/wire";
 
@@ -193,6 +194,60 @@ describe("messages", () => {
   test("a message with no id is dropped — the unread divider anchors to one", () => {
     expect(decodeMessage({ channel_id: "c", content: "hi" })).toBeUndefined();
     expect(decodeMessage({ id: "e", content: "hi" })).toBeUndefined();
+  });
+
+  /**
+   * **M3 regression.** `GET /channel/{id}/message` serves `timeline::TimelineRow`
+   * — `{event, thread}`, with the relay's signed event verbatim inside — which
+   * is **not** the flat shape `decodeMessage` reads. Feeding a history row to
+   * `decodeMessage` returns `undefined` for every row, because `channel_id` is a
+   * tag on the inner event rather than a field on the outer object. That is
+   * silent, and it looks exactly like an empty channel.
+   */
+  describe("timeline rows are a different shape from hydrated messages", () => {
+    const channelId = wire("window-page").channel_id as string;
+    const events = wire("window-page").events as Array<Record<string, unknown>>;
+
+    test("the nested event decodes, with seconds converted once", () => {
+      const first = events[0] as Record<string, unknown>;
+      const row = decodeTimelineRow({ event: first, thread: null }, channelId);
+      expect(row?.id).toBe(first.id as string);
+      expect(row?.channelId).toBe(channelId);
+      expect(row?.ts).toBe((first.created_at as number) * 1000);
+      expect(row?.content).toBe("read-state slots are the risky part");
+      // No profile join on a history page, so the short pubkey is the honest
+      // label — inventing a name would make unresolved look resolved.
+      expect(row?.author.name).toBe((first.pubkey as string).slice(0, 8));
+    });
+
+    test("the flat decoder cannot read this shape — which is why it exists", () => {
+      // The exact confusion that produced 28 blank rows against a daemon
+      // serving real messages. Pinned so the two decoders cannot be swapped
+      // back for one another without a red test.
+      expect(
+        decodeMessage({ event: events[0], thread: null }),
+      ).toBeUndefined();
+    });
+
+    test("a thread overlay contributes its reply count; null contributes none", () => {
+      const first = events[0] as Record<string, unknown>;
+      expect(
+        decodeTimelineRow(
+          { event: first, thread: { reply_count: 4 } },
+          channelId,
+        )?.replyCount,
+      ).toBe(4);
+      expect(
+        decodeTimelineRow({ event: first, thread: null }, channelId)?.replyCount,
+      ).toBeUndefined();
+    });
+
+    test("a row with no event id is dropped, like a message with none", () => {
+      expect(
+        decodeTimelineRow({ event: { content: "hi" }, thread: null }, channelId),
+      ).toBeUndefined();
+      expect(decodeTimelineRow({ thread: null }, channelId)).toBeUndefined();
+    });
   });
 });
 

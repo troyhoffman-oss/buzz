@@ -104,6 +104,51 @@ describe("composer residency per layer (§2.2, §8 ruling 1)", () => {
     expect(composerPlaceholder(engineering)).toBe("message #engineering");
   });
 
+  /**
+   * **M3 regression.** A channel whose name has no `#` must still be named.
+   *
+   * The old implementation read `crumb.startsWith("#") ? crumb : channelId`.
+   * Every fixture bakes the `#` into `name` (`seeded-basic.jsonl` has
+   * `"name":"#engineering"`), so that branch always took in test and in every
+   * M1/M2 capture — while the relay's own 39000 `name` tag is bare, and DMs and
+   * forums have no `#` at all. Against the live daemon the fallback always took
+   * instead: the composer read `message 5705545b-3100-4872-93e3-b6c815c6e6ce`
+   * while the breadcrumb one row above it correctly read `DM`.
+   *
+   * The uuid is never the better label. It is not a name, it does not fit at 60
+   * columns, and the crumb beside it already proves the name was in hand.
+   */
+  test("a channel without a # is named, not uuid'd", () => {
+    const dm = {
+      kind: "channel" as const,
+      channelId: "5705545b-3100-4872-93e3-b6c815c6e6ce",
+      crumb: "DM",
+      selection: 0,
+    };
+    expect(composerPlaceholder(dm)).toBe("message DM");
+
+    // A forum, likewise: multi-word, no sigil, still a name.
+    const forum = {
+      kind: "channel" as const,
+      channelId: "853b8c9b-56f6-4abd-a0e6-c5d307379e2a",
+      crumb: "Test Forum",
+      selection: 0,
+    };
+    expect(composerPlaceholder(forum)).toBe("message Test Forum");
+
+    // Only a genuinely absent crumb falls back to the id, because then there
+    // is nothing else to say.
+    const nameless = {
+      kind: "channel" as const,
+      channelId: "db7a1970-ce56-42a8-a01d-0096056928b5",
+      crumb: "",
+      selection: 0,
+    };
+    expect(composerPlaceholder(nameless)).toBe(
+      "message db7a1970-ce56-42a8-a01d-0096056928b5",
+    );
+  });
+
   test("L3 replies to the thread root", () => {
     const thread = {
       kind: "thread" as const,

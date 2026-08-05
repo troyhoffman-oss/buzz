@@ -55,6 +55,7 @@ import {
   decodeMessage,
   decodeSession,
   decodeStreamFrame,
+  decodeTimelineRow,
   decodeTranscriptRow,
   decodeUsage,
 } from "./wire";
@@ -263,6 +264,11 @@ export class UdsClient implements DaemonClient {
       attention: [],
       threads: [],
       huddles: [],
+      // Timelines are **not** fetched at boot. One page per channel on a
+      // machine with forty of them is forty relay round trips before the first
+      // frame paints, for thirty-nine timelines nobody is looking at.
+      // `loadMessages` fills this on descent; §2.3 [D-1]'s floor is the boot
+      // set, and a timeline is not in it.
       messages: {},
       transcripts,
       usage,
@@ -271,6 +277,46 @@ export class UdsClient implements DaemonClient {
       // a snapshot that mutated underneath a render would make the same frame
       // disagree with itself.
       missing: [...this.missing],
+    };
+  }
+
+  /**
+   * Load one page of a channel's timeline (`GET /channel/{id}/message`).
+   *
+   * Called on descent into L2 rather than at boot, for the reason the
+   * `messages: {}` comment in {@link hydrate} gives: forty channels would mean
+   * forty relay round trips before the first frame, thirty-nine of them for
+   * timelines nobody is looking at.
+   *
+   * **This endpoint has a side effect on the daemon and it is the useful one.**
+   * `api.rs` registers a channel subscription when it serves a page, with the
+   * watermark set to the newest row the page carries — so the live tail resumes
+   * exactly where the history ends rather than from whenever the client
+   * happened to connect. Fetching the page is therefore also how a channel goes
+   * live, which is why this is not merely a read.
+   *
+   * A failure is left to the caller rather than swallowed into an empty
+   * timeline: an empty channel and an unreachable relay must not render the
+   * same, which is §1.3 property 3 and the M2-1 defect by name.
+   */
+  async ensureMessages(channelId: string): Promise<void> {
+    // Idempotent per the interface contract: `←` `→` between two channels is a
+    // common gesture and must not re-query the relay on each pass. The live
+    // tail keeps the loaded page current, so a second fetch would buy nothing.
+    if (this.snapshot.messages[channelId] !== undefined) return;
+    const body = await this.get(
+      `/channel/${encodeURIComponent(channelId)}/message`,
+    );
+    const messages = asArray(body, "messages")
+      .map((row) => decodeTimelineRow(row, channelId))
+      .filter((m): m is Message => m !== undefined)
+      // The daemon serves newest-first (the relay's own order); the timeline
+      // renders oldest-at-top. Sorting here rather than in the renderer keeps
+      // the one ordering rule at the boundary, where the wire order is known.
+      .sort((a, b) => a.ts - b.ts);
+    this.snapshot = {
+      ...this.snapshot,
+      messages: { ...this.snapshot.messages, [channelId]: messages },
     };
   }
 

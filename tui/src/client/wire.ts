@@ -357,6 +357,59 @@ export function decodeMessage(value: unknown): Message | undefined {
   };
 }
 
+/**
+ * Decode one assembled timeline row from `GET /channel/{id}/message`.
+ *
+ * **A different shape from {@link decodeMessage}, and deliberately so.** That
+ * one decodes a *hydrated* message — the flat form `POST` echoes back and the
+ * `/event` stream carries. A history page carries `timeline::TimelineRow`:
+ * `{event, thread}`, where `event` is the relay's signed event **verbatim** and
+ * `thread` is the `39005` overlay bound to it, or `null` when the relay sent
+ * none. Feeding one to the other's decoder yields `undefined` for every row —
+ * `channel_id` is a tag on the inner event, not a field on the outer object —
+ * which is silent and looks exactly like an empty channel.
+ *
+ * `channelId` is passed in rather than read off the event. The daemon answers
+ * per channel and the caller knows which one it asked for; digging the `h` tag
+ * out here would put NIP-29 tag vocabulary in `src/`, which §6.4 forbids and
+ * `check-boundary.sh` enforces.
+ *
+ * Returns `undefined` for a row with no event id: the unread divider and the
+ * thread descent both anchor to one, so a row that cannot be anchored is worse
+ * than an absent row.
+ */
+export function decodeTimelineRow(
+  value: unknown,
+  channelId: string,
+): Message | undefined {
+  const row = obj(value);
+  const event = obj(row?.event);
+  const id = str(event, "id");
+  if (!id) return undefined;
+  const thread = obj(row?.thread);
+  const authorPubkey = str(event, "pubkey") ?? "";
+  return {
+    id,
+    channelId,
+    author: {
+      pubkey: authorPubkey,
+      // The daemon's history page carries no profile join, so the short pubkey
+      // is the honest label. `/user` resolves display names separately and the
+      // renderer prefers whatever it has; inventing a name here would make an
+      // unresolved author indistinguishable from a resolved one.
+      name: authorPubkey.slice(0, 8),
+      isAgent: false,
+    },
+    // `created_at` is seconds on the wire (Nostr) and milliseconds in the view.
+    // Converting once at the boundary is why no renderer has to know which.
+    ts: (num(event, "created_at") ?? 0) * MS_PER_SECOND,
+    content: str(event, "content") ?? "",
+    ...(num(thread, "reply_count") !== undefined
+      ? { replyCount: num(thread, "reply_count") }
+      : {}),
+  };
+}
+
 /** Decode one observer frame into a transcript row (`observer::ObserverFrame`). */
 export function decodeTranscriptRow(value: unknown): TranscriptRow | undefined {
   const source = obj(value);

@@ -161,6 +161,18 @@ export function isPickerLayer(kind: LayerKind): boolean {
  * resolved the open question against post-in-place. Typing at the channel list
  * fuzzy-filters and `⏎` enters the highlighted channel; the composer there is
  * jump/filter only.
+ *
+ * The channel case is the one with history. It used to read
+ * `layer.crumb.startsWith("#") ? layer.crumb : layer.channelId`, on the
+ * assumption that a channel crumb is `#`-prefixed and anything else is not a
+ * name worth showing. **Every fixture bakes the `#` into `name`**
+ * (`fixtures/seeded-basic.jsonl` has `"name":"#engineering"`), so that branch
+ * always took in test and in every M1/M2 capture — while the relay's own 39000
+ * `name` tag is bare, and DMs and forums have no `#` at all. Against live data
+ * the fallback therefore always took instead, and the composer read
+ * `message 5705545b-3100-4872-93e3-b6c815c6e6ce` while the breadcrumb one row
+ * above it correctly read `DM`. The crumb is the channel's name; there is no
+ * case where the uuid is the better label.
  */
 export function composerPlaceholder(layer: Layer): string {
   switch (layer.kind) {
@@ -173,7 +185,7 @@ export function composerPlaceholder(layer: Layer): string {
     case "results":
       return "search";
     case "channel":
-      return `message ${layer.crumb.startsWith("#") ? layer.crumb : (layer.channelId ?? "")}`;
+      return `message ${layer.crumb || (layer.channelId ?? "")}`;
     case "thread":
       return "reply in thread";
     case "activity":

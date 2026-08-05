@@ -17,7 +17,14 @@
  */
 
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid";
-import { For, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import {
+  For,
+  createEffect,
+  createMemo,
+  createSignal,
+  onCleanup,
+  onMount,
+} from "solid-js";
 import { applyIntent, withDefaultSelection } from "../app/dispatch";
 import { renderScreen, rowContext } from "../app/screen";
 import { type AppState, initialState, takeEffect } from "../app/state";
@@ -249,6 +256,38 @@ export function Shell(props: ShellProps) {
         return;
     }
   }
+
+  /**
+   * Load a channel's timeline when one becomes the current layer.
+   *
+   * Declarative rather than threaded through the key handler, because a channel
+   * layer is reachable by four routes — `→` from L1, §4.4's teleport from a
+   * home attention row, a `ctrl+k` search hit, and `←` back onto one already on
+   * the stack. Hooking descent would cover the first and miss the rest, and the
+   * miss is invisible: the timeline renders empty, which is exactly what an
+   * empty channel looks like.
+   *
+   * On the fixture transport `ensureMessages` is a no-op, so this costs
+   * nothing there; on the socket transport it is idempotent, so `←` `→`
+   * between two channels does not re-query.
+   *
+   * The rejection is swallowed for the reason `perform`'s catch documents at
+   * length: this runs outside any handler that could receive a throw, an
+   * unhandled rejection can take the process down under Bun, and stderr belongs
+   * to the renderer. The `missing[]` channel the client already maintains is
+   * what carries the loss to the screen (§1.3 property 3).
+   */
+  createEffect(() => {
+    const layer = current(state().stack);
+    if (layer.kind !== "channel" || !layer.channelId) return;
+    const channelId = layer.channelId;
+    void props.client
+      .ensureMessages(channelId)
+      .then(() =>
+        setState((s) => ({ ...s, snapshot: props.client.getSnapshot() })),
+      )
+      .catch(() => {});
+  });
 
   const lines = createMemo(() =>
     renderScreen(state(), dimensions().width, dimensions().height, clock()),
