@@ -18,6 +18,8 @@ import { renderScreen } from "../../src/app/screen";
 import { initialState } from "../../src/app/state";
 import { withDefaultSelection } from "../../src/app/dispatch";
 import { emptyStateRows } from "../../src/render/emptystate";
+import { type StyledRow, rowText } from "../../src/render/span";
+import { displayWidth } from "../../src/render/width";
 import type { Snapshot } from "../../src/client/types";
 import {
   WAVE_2_TAG,
@@ -53,6 +55,21 @@ function emptySnapshot(overrides: Partial<Snapshot> = {}): Snapshot {
   };
 }
 
+/**
+ * The text an empty-state row draws.
+ *
+ * These cases are about *which words* an empty list says — §1.3 property 3's
+ * whole point is that the three causes must not read alike — so they assert on
+ * the projection, exactly as they did before the rows gained styling. The
+ * colour reinforces the distinction; the words are what carry it, and asserting
+ * on them is what keeps a restyle from ever turning one of these red.
+ */
+const text = (row: StyledRow): string => rowText(row);
+
+/** A rendered block, joined — what most of these cases match against. */
+const joined = (rows: readonly StyledRow[]): string =>
+  rows.map(text).join("\n");
+
 describe("emptyStateRows — the three causes are distinguishable", () => {
   test("an unmounted endpoint names the endpoint, not the community", () => {
     const rows = emptyStateRows(
@@ -61,8 +78,8 @@ describe("emptyStateRows — the three causes are distinguishable", () => {
       { connection: { state: "connected" }, missing: ["/channel"] },
       80,
     );
-    expect(rows.join("\n")).toContain("/channel");
-    expect(rows.join("\n")).toContain("upgrade");
+    expect(joined(rows)).toContain("/channel");
+    expect(joined(rows)).toContain("upgrade");
   });
 
   test("an unmounted endpoint outranks a bad connection", () => {
@@ -75,8 +92,8 @@ describe("emptyStateRows — the three causes are distinguishable", () => {
       { connection: { state: "disconnected" }, missing: ["/channel"] },
       80,
     );
-    expect(rows.join("\n")).toContain("does not serve");
-    expect(rows.join("\n")).not.toContain("fills in once");
+    expect(joined(rows)).toContain("does not serve");
+    expect(joined(rows)).not.toContain("fills in once");
   });
 
   test("a disconnected daemon says so and promises the list will fill", () => {
@@ -86,8 +103,8 @@ describe("emptyStateRows — the three causes are distinguishable", () => {
       { connection: { state: "disconnected" }, missing: [] },
       80,
     );
-    expect(rows.join("\n")).toContain("not connected to the relay");
-    expect(rows.join("\n")).toContain("fills in once the relay connects");
+    expect(joined(rows)).toContain("not connected to the relay");
+    expect(joined(rows)).toContain("fills in once the relay connects");
   });
 
   test("each non-connected state gets its own reason, not one generic line", () => {
@@ -95,7 +112,7 @@ describe("emptyStateRows — the three causes are distinguishable", () => {
     // "not connected" string for all seven would pass a laxer test and defeat
     // the requirement.
     const reason = (connection: Parameters<typeof emptyStateRows>[2]) =>
-      emptyStateRows("channels", "/channel", connection, 100).join("\n");
+      joined(emptyStateRows("channels", "/channel", connection, 100));
 
     const seen = new Set(
       (
@@ -121,8 +138,11 @@ describe("emptyStateRows — the three causes are distinguishable", () => {
       80,
     );
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toContain("no channels");
-    expect(rows[0]).not.toContain("relay");
+    // `joined` rather than indexing: the assertion is "the benign case says
+    // this and does not mention the relay", which is a statement about the
+    // whole block, and the length check above already pins it to one row.
+    expect(joined(rows)).toContain("no channels");
+    expect(joined(rows)).not.toContain("relay");
   });
 
   test("every row is padded to the requested width", () => {
@@ -144,7 +164,7 @@ describe("emptyStateRows — the three causes are distinguishable", () => {
           cols,
         ),
       ]) {
-        for (const row of rows) expect(row.length).toBe(cols);
+        for (const row of rows) expect(displayWidth(text(row))).toBe(cols);
       }
     }
   });

@@ -24,6 +24,7 @@
  */
 
 import { FOCUS_GLYPH, rule, topRule } from "../render/bands";
+import { rowText } from "../render/span";
 import { graphemes, pad, truncate, wrapHints, wrapText } from "../render/width";
 import {
   type OnboardingState,
@@ -257,7 +258,13 @@ export function renderOnboarding(
   const frame = body.slice(0, bodyRows);
   while (frame.length < bodyRows) frame.push(pad("", cols));
 
-  frame.push(topRule(prompt.crumb, cols));
+  // `topRule` is styled now (the crumb recedes a step less than the rule it
+  // sits in); the wizard is still a plain-text surface, so it takes the text
+  // projection. Onboarding runs before there is a daemon, a community, or a
+  // theme preference to honour, and it is the one screen where a single
+  // uniform weight is the right answer — there is exactly one thing to look at
+  // on it, and no chrome competing for the eye.
+  frame.push(rowText(topRule(prompt.crumb, cols)));
 
   if (fieldRows > 0) {
     const shown = isSecretStep(state.step)

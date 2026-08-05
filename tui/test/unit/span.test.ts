@@ -79,7 +79,10 @@ describe("padRow does not bleed style into the padding", () => {
     // Extending the last span's style would drag a selection background or an
     // error colour across the rest of the row: a one-word red status painting
     // eighty columns red is the "Christmas tree" §3.10 names by that word.
-    const row = padRow([styled("err", { fg: "error", bg: "backgroundPanel" })], 10);
+    const row = padRow(
+      [styled("err", { fg: "error", bg: "backgroundPanel" })],
+      10,
+    );
     const fill = row.at(-1);
     expect(fill?.text).toBe("       ");
     expect(fill?.fg).toBeUndefined();

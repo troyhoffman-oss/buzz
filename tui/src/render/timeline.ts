@@ -194,7 +194,8 @@ function authorHeader(message: Message, cols: number): StyledRow {
   // Below the stamp's own width `alignRight` abandons the label and clips the
   // stamp itself, so there is no name left to attribute and the whole row is
   // one metadata fragment.
-  if (cols - 2 <= displayWidth(stamp)) return padRow([styled(text, META)], cols);
+  if (cols - 2 <= displayWidth(stamp))
+    return padRow([styled(text, META)], cols);
 
   // The stamp is `alignRight`'s right-hand segment, placed whole at the end,
   // and `HH:MM` is ASCII — so its code-unit length is also its column count.
@@ -427,7 +428,8 @@ export function renderTimeline(
         // conversation *by*, so they are the one part of a body that is not
         // content. Splitting by the suffix's width preserves the exact text
         // `truncateKeepingSuffix` produced, gap included.
-        const carriesSuffix = isLast && suffix.length > 0 && text.endsWith(suffix);
+        const carriesSuffix =
+          isLast && suffix.length > 0 && text.endsWith(suffix);
         const [head, tail] = carriesSuffix
           ? splitAt([plain(text)], displayWidth(text) - displayWidth(suffix))
           : [[plain(text)], []];
@@ -442,9 +444,7 @@ export function renderTimeline(
           // terminal the eye has to hunt for it. The fill is what answers the
           // owner's "selection is hard to see", and it is scoped to the body
           // row the cursor actually marks.
-          text: selected
-            ? fillRow(body, cols, SELECTED)
-            : padRow(body, cols),
+          text: selected ? fillRow(body, cols, SELECTED) : padRow(body, cols),
           messageId: message.id,
           selectable: i === 0,
           kind: "body",

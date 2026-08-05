@@ -25,11 +25,28 @@ import type { Layer } from "../nav/layers";
 import { ATTENTION_LADDER } from "../render/drawer";
 import { MS_PER_MINUTE, formatDuration } from "../time/units";
 import {
-  alignRight,
-  pad,
-  truncateKeepingSuffix,
-  wrapText,
-} from "../render/width";
+  DEGRADED,
+  FAILED,
+  FOCUS,
+  LIVE,
+  MENTION,
+  META,
+  POSITION,
+  SECTION,
+  SELECTED,
+} from "../render/palette";
+import {
+  type Span,
+  type SpanStyle,
+  type StyledRow,
+  fillRow,
+  padRow,
+  plain,
+  rowText,
+  splitAt,
+  styled,
+} from "../render/span";
+import { displayWidth, truncateKeepingSuffix, wrapText } from "../render/width";
 
 /** Presence glyphs — four states, semantically exact (§3.1). */
 export function presenceGlyph(agent: Agent): string {
@@ -92,20 +109,87 @@ export function renderFleet(
   cols: number,
   now: number,
   composerFocused: boolean,
-): string[] {
-  const rows: string[] = [pad("  AGENTS", cols)];
+): StyledRow[] {
+  const rows: StyledRow[] = [
+    padRow([plain("  "), styled("AGENTS", SECTION)], cols),
+  ];
   agents.forEach((agent, index) => {
-    const marker = index === selected ? (composerFocused ? "▌ " : "❯ ") : "  ";
+    const isSelected = index === selected;
+    const marker = isSelected ? (composerFocused ? "▌ " : "❯ ") : "  ";
+    const glyph = presenceGlyph(agent);
     const label =
-      `${presenceGlyph(agent)} ${agent.name}   ${agent.channelName ?? ""}   ${agent.detail ?? ""}`.trimEnd();
+      `${glyph} ${agent.name}   ${agent.channelName ?? ""}   ${agent.detail ?? ""}`.trimEnd();
+    const status = agentStatus(agent, now);
+    const text = truncateKeepingSuffix(label, status, cols - 2);
+
+    // Two independent facts share this row and are routinely confused: the
+    // **presence** glyph says whether the process is reachable, the **status**
+    // suffix says what it is doing about your work. An agent can be present and
+    // idle, or working and about to go offline. Colouring them from the same
+    // source would merge the two questions into one answer.
+    const carries = status.length > 0 && text.endsWith(status);
+    const [head, tail] = carries
+      ? splitAt([plain(text)], displayWidth(text) - displayWidth(status))
+      : [[plain(text)], []];
+    const headText = rowText(head);
+    const spans: Span[] = [
+      isSelected
+        ? styled(marker, composerFocused ? POSITION : FOCUS)
+        : plain(marker),
+    ];
+    if (headText.startsWith(glyph)) {
+      spans.push(styled(glyph, presenceStyle(agent)));
+      spans.push(plain(headText.slice(glyph.length)));
+    } else {
+      spans.push(plain(headText));
+    }
+    if (carries) spans.push(styled(rowText(tail), agentStatusStyle(agent)));
     rows.push(
-      pad(
-        `${marker}${truncateKeepingSuffix(label, agentStatus(agent, now), cols - 2)}`,
-        cols,
-      ),
+      isSelected ? fillRow(spans, cols, SELECTED) : padRow(spans, cols),
     );
   });
   return rows;
+}
+
+/**
+ * The colour of the presence glyph — *is this process reachable?*
+ *
+ * `unknown` is deliberately not collapsed into `offline` here any more than it
+ * is in {@link presenceGlyph}: "no presence beat seen since this daemon
+ * started" is a different fact from "reported offline", and painting them the
+ * same colour would undo the distinction the glyph exists to draw.
+ */
+function presenceStyle(agent: Agent): SpanStyle {
+  switch (agent.presence) {
+    case "present":
+      return LIVE;
+    case "waking":
+      return DEGRADED;
+    default:
+      return META;
+  }
+}
+
+/**
+ * The colour of the status suffix — *what is it doing about your work?*
+ *
+ * The [G12] ladder, in colour: `needsInput` is the only state that is blocked
+ * on **you**, so it takes the mention tone and is the loudest thing in the
+ * fleet view — which is what makes a blocked agent findable in a list of
+ * twenty. `failed` is red, `working` is green, and an idle agent says nothing
+ * loudly.
+ */
+function agentStatusStyle(agent: Agent): SpanStyle {
+  switch (agent.state) {
+    case "needsInput":
+      return MENTION;
+    case "working":
+      return LIVE;
+    case "failed":
+      return FAILED;
+    default:
+      return META;
+  }
 }
 
 /** Where `→` on a fleet row descends to — the ACTIVITY renderable (§6). */
@@ -151,8 +235,8 @@ function stamp(ts: number): string {
 export function renderTranscript(
   rows: readonly TranscriptRow[],
   cols: number,
-): string[] {
-  const out: string[] = [];
+): StyledRow[] {
+  const out: StyledRow[] = [];
   for (const row of rows) {
     const glyph = CLASS_GLYPH[row.class];
     const counts =
@@ -162,19 +246,59 @@ export function renderTranscript(
           ? "[running]"
           : "";
     const head = `${glyph} ${stamp(row.ts)}  ${row.label}`;
-    out.push(
-      pad(
-        `  ${counts ? truncateKeepingSuffix(head, counts, cols - 2) : head}`,
-        cols,
-      ),
-    );
+    const text = counts ? truncateKeepingSuffix(head, counts, cols - 2) : head;
+    // The class glyph is the transcript's whole scanning mechanism — §3.4.1
+    // gives every row class its own — so it is what carries colour, and only
+    // for the two classes that are not routine: a permission prompt is blocked
+    // on you, an error already failed. Colouring reads, writes and shell
+    // invocations would tint most of a busy transcript and leave those two
+    // with nothing to stand out from.
+    const spans: Span[] = [plain("  ")];
+    if (text.startsWith(glyph)) {
+      spans.push(styled(glyph, transcriptGlyphStyle(row.class)));
+      const rest = text.slice(glyph.length);
+      // ` HH:MM:SS  ` — the stamp is fixed-width metadata and recedes so the
+      // labels form a readable column beside it.
+      const stampText = ` ${stamp(row.ts)}`;
+      if (rest.startsWith(stampText)) {
+        spans.push(styled(stampText, META));
+        spans.push(plain(rest.slice(stampText.length)));
+      } else {
+        spans.push(plain(rest));
+      }
+    } else {
+      spans.push(plain(text));
+    }
+    out.push(padRow(spans, cols));
     if (row.detail) {
       for (const line of wrapText(row.detail, Math.max(1, cols - 6), 0)) {
-        out.push(pad(`    ${line}`, cols));
+        // Indented continuation of the row above it, and the one place a
+        // transcript carries prose. Muted, because the label is what you scan
+        // and the detail is what you read only once you have stopped.
+        out.push(padRow([plain("    "), styled(line, META)], cols));
       }
     }
   }
   return out;
+}
+
+/**
+ * The colour a transcript row's class glyph takes.
+ *
+ * Only the two classes that mean something is *wrong or waiting* are coloured.
+ * §3.4.1's glyph set already distinguishes all nine classes by shape; colour
+ * here answers the coarser question an operator scanning a fast-moving
+ * transcript actually asks, which is whether they need to stop scrolling.
+ */
+function transcriptGlyphStyle(kind: TranscriptRow["class"]): SpanStyle {
+  switch (kind) {
+    case "permission":
+      return MENTION;
+    case "error":
+      return FAILED;
+    default:
+      return META;
+  }
 }
 
 /**

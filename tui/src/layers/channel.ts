@@ -19,8 +19,10 @@
 import type { Message } from "../client/types";
 import type { Layer } from "../nav/layers";
 import { clampSelection } from "../nav/keys";
+import { HINT } from "../render/palette";
+import { type StyledRow, padRow, plain, styled } from "../render/span";
 import { selectableIds, threadRootIds } from "../render/timeline";
-import { pad, truncate, wrapHints } from "../render/width";
+import { truncate, wrapHints } from "../render/width";
 
 /** Message-select's hint footer, replacing the statusline while active (§4.2). */
 export const MESSAGE_SELECT_HINTS = [
@@ -37,9 +39,16 @@ export const MESSAGE_SELECT_HINTS = [
  * previous frame's content survive at that position, and this band replaces the
  * statusline — which is wider than it is.
  */
-export function messageSelectHints(cols: number): string[] {
+export function messageSelectHints(cols: number): StyledRow[] {
+  // The whole footer recedes. It replaces the statusline while message-select
+  // is active, so it is the brightest thing competing with the timeline for
+  // the eye — and it is pure instruction: nothing on it is a state, a count,
+  // or a thing that changed. [G14] requires the exits stay discoverable, which
+  // is a statement about them being *present at every width*, not about them
+  // shouting. `nav/cc-research.md` records Claude Code doing exactly this with
+  // its own bottom hints.
   return wrapHints([...MESSAGE_SELECT_HINTS], Math.max(1, cols - 2)).map((h) =>
-    pad(`  ${h}`, cols),
+    padRow([plain("  "), styled(h, HINT)], cols),
   );
 }
 

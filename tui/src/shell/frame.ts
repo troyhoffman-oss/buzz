@@ -24,28 +24,35 @@
  */
 
 import { RULE_ROWS, renderComposer, rule, topRule } from "../render/bands";
-import { pad } from "../render/width";
+import { CHROME } from "../render/palette";
+import {
+  type StyledRow,
+  padRow,
+  plainRow,
+  rowText,
+  styledRow,
+} from "../render/span";
 
 /** The bottom region: what occupies the rows below the top rule. */
 export type BottomBand =
   | { kind: "composer"; text: string; placeholder: string; focused: boolean }
   /** The drawer or message-select — both replace composer + statusline (§2.3, §3). */
-  | { kind: "replaced"; rows: readonly string[] };
+  | { kind: "replaced"; rows: readonly StyledRow[] };
 
 /** Everything the frame needs. */
 export interface FrameInput {
   readonly cols: number;
   readonly rows: number;
   /** Body rows, newest last. Anchored to the bottom for chat, top for lists. */
-  readonly body: readonly string[];
+  readonly body: readonly StyledRow[];
   /** Which end of the body survives when it overflows. */
   readonly bodyAnchor: "top" | "bottom";
   readonly crumb: string;
   readonly bottom: BottomBand;
   /** Statusline rows. Ignored when the bottom band is `replaced`. */
-  readonly statusline: readonly string[];
+  readonly statusline: readonly StyledRow[];
   /** Completion band rows, rendered **above the top rule** (§2.5). */
-  readonly completion?: readonly string[];
+  readonly completion?: readonly StyledRow[];
   /**
    * Body row index the viewport must keep visible.
    *
@@ -64,8 +71,13 @@ export interface FrameInput {
  * Always returns exactly `rows` rows of exactly `cols` columns. Anything less
  * would let a previous frame's content survive at that position, which on a
  * streaming chat surface reads as a rendering glitch rather than as a bug.
+ *
+ * Returns **styled** rows; {@link renderFrameText} is the string projection the
+ * geometry suites assert against. The arithmetic below is unchanged — a styled
+ * row's width is its text's width, and `padRow` reproduces `pad` exactly (see
+ * `render/span.ts`), so band heights and the follow window behave identically.
  */
-export function renderFrame(input: FrameInput): string[] {
+export function renderFrame(input: FrameInput): StyledRow[] {
   const { cols, rows, crumb } = input;
   if (cols <= 0 || rows <= 0) return [];
 
@@ -81,11 +93,11 @@ export function renderFrame(input: FrameInput): string[] {
             },
             cols,
           ),
-          rule(cols),
-          ...input.statusline.map((r) => pad(r, cols)),
+          styledRow(rule(cols), CHROME),
+          ...input.statusline.map((r) => padRow(r, cols)),
         ];
 
-  const completion = (input.completion ?? []).map((r) => pad(r, cols));
+  const completion = (input.completion ?? []).map((r) => padRow(r, cols));
 
   // Top rule + completion band + bottom band is fixed overhead; the body gets
   // the rest. Floored at zero rather than clamped to one: below the §3.9 floor
@@ -95,11 +107,11 @@ export function renderFrame(input: FrameInput): string[] {
   const overhead = RULE_ROWS + completion.length + bottomRows.length;
   const bodyRows = Math.max(0, rows - overhead);
 
-  const body = input.body.map((r) => pad(r, cols));
-  const blanks = (n: number): string[] =>
-    Array.from({ length: n }, () => pad("", cols));
+  const body = input.body.map((r) => padRow(r, cols));
+  const blanks = (n: number): StyledRow[] =>
+    Array.from({ length: n }, () => padRow([], cols));
 
-  let shown: string[];
+  let shown: StyledRow[];
   if (body.length <= bodyRows) {
     // Chat sticks to the bottom: a half-empty channel shows its messages above
     // the composer, not floating at the top of the screen. Lists stick to the
@@ -125,7 +137,7 @@ export function renderFrame(input: FrameInput): string[] {
 
   const out = [
     ...shown,
-    pad(topRule(crumb, cols), cols),
+    padRow(topRule(crumb, cols), cols),
     ...completion,
     ...bottomRows,
   ];
@@ -134,6 +146,23 @@ export function renderFrame(input: FrameInput): string[] {
   // the *end* — the composer and the hint footer are the exits, and losing them
   // is what [G14] forbids.
   return out.length <= rows ? out : out.slice(out.length - rows);
+}
+
+/**
+ * The frame as plain text — the projection every geometry suite asserts on.
+ *
+ * Kept as a named export rather than inlined at the two call sites so that
+ * "the strings the tests compare are the strings the terminal receives" is one
+ * function rather than a convention. A second `.map(rowText)` written somewhere
+ * else is a second answer to that question.
+ */
+export function renderFrameText(input: FrameInput): string[] {
+  return renderFrame(input).map(rowText);
+}
+
+/** A plain unstyled body row — the adapter for renderers not yet converted. */
+export function textRow(text: string): StyledRow {
+  return plainRow(text);
 }
 
 // A `COMPOSER_BAND_ROWS` constant used to live here. It had no callers and

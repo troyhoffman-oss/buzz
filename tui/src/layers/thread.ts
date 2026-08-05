@@ -14,7 +14,26 @@
  */
 
 import type { Message } from "../client/types";
-import { pad, truncateKeepingSuffix, wrapText } from "../render/width";
+import {
+  AGENT,
+  AUTHOR,
+  CHROME,
+  FOCUS,
+  HINT,
+  META,
+  THREAD,
+} from "../render/palette";
+import {
+  type Span,
+  type SpanStyle,
+  type StyledRow,
+  padRow,
+  plain,
+  rowText,
+  splitAt,
+  styled,
+} from "../render/span";
+import { displayWidth, truncateKeepingSuffix, wrapText } from "../render/width";
 import { threadSuffix } from "../render/timeline";
 
 /**
@@ -86,28 +105,53 @@ export function buildThread(
   return nodes;
 }
 
-/** Render the thread body (§3.2's shape, §7's full-screen placement). */
+/**
+ * Render the thread body (§3.2's shape, §7's full-screen placement).
+ *
+ * The `└` guides are the thing colour helps most here. They are pure structure
+ * — three levels of them, two columns each — and drawn at the same weight as
+ * the replies they organise they read as punctuation inside the text. Receding
+ * them to `borderSubtle` is what lets the tree shape register peripherally
+ * while the words stay the only thing you actually read, which is the same
+ * trade `render/timeline.ts` makes for the day divider.
+ */
 export function renderThread(
   nodes: readonly ThreadNode[],
   cols: number,
   selectedMessageId?: string,
-): string[] {
-  const rows: string[] = [];
+): StyledRow[] {
+  const rows: StyledRow[] = [];
   for (const node of nodes) {
     const visual = Math.min(node.depth, MAX_INDENT);
     const indent = " ".repeat(visual * INDENT_COLS);
     const guide = node.depth > 0 ? "└ " : "";
     const overflow = node.depth > MAX_INDENT ? ` ·${node.depth}` : "";
-    const marker = selectedMessageId === node.message.id ? "❯" : " ";
+    const selected = selectedMessageId === node.message.id;
+    const marker = selected ? "❯" : " ";
     const time = formatClock(node.message.ts);
 
+    const head = truncateKeepingSuffix(
+      `${node.message.author.name}${overflow}`,
+      time,
+      Math.max(1, cols - 2 - indent.length - guide.length),
+    );
+    // The author line is `name … time`, laid out by `truncateKeepingSuffix`,
+    // so the stamp is the tail and the name is everything before it. Cutting
+    // the finished string keeps the layout function the only place that
+    // arithmetic lives (see `render/span.ts`).
+    const nameStyle = node.message.author.isAgent ? AGENT : AUTHOR;
+    const [namePart, timePart] = head.endsWith(time)
+      ? splitAt([plain(head)], displayWidth(head) - displayWidth(time))
+      : [[plain(head)], []];
     rows.push(
-      pad(
-        `${marker} ${indent}${guide}${truncateKeepingSuffix(
-          `${node.message.author.name}${overflow}`,
-          time,
-          Math.max(1, cols - 2 - indent.length - guide.length),
-        )}`,
+      padRow(
+        [
+          styled(marker, selected ? FOCUS : {}),
+          plain(` ${indent}`),
+          styled(guide, CHROME),
+          styled(rowText(namePart), nameStyle),
+          ...(timePart.length > 0 ? [styled(rowText(timePart), META)] : []),
+        ],
         cols,
       ),
     );
@@ -129,15 +173,45 @@ export function renderThread(
               Math.max(1, cols - 2 - bodyIndent.length),
             )
           : line;
-      rows.push(pad(`  ${bodyIndent}${text}`, cols));
+      // Reply text is content and stays unstyled; only a thread's own counts
+      // are attributed, for the reason §3's list-row rule gives — they are
+      // what you pick a conversation by, not part of what it says.
+      const carries = isLast && suffix.length > 0 && text.endsWith(suffix);
+      const [body, tail] = carries
+        ? splitAt([plain(text)], displayWidth(text) - displayWidth(suffix))
+        : [[plain(text)], []];
+      rows.push(
+        padRow(
+          [
+            plain(`  ${bodyIndent}`),
+            plain(rowText(body)),
+            ...(carries ? [styled(rowText(tail), THREAD)] : []),
+          ],
+          cols,
+        ),
+      );
     });
 
     if (node.orphan) {
       // §3.2: "Orphan replies whose parent is not loaded render an explicit
       // backfill affordance rather than silently hiding."
-      rows.push(pad(`  ${bodyIndent}┌ orphan — parent not loaded`, cols));
-      rows.push(pad(`  ${bodyIndent}│  ^X b  backfill ancestors`, cols));
-      rows.push(pad(`  ${bodyIndent}└`, cols));
+      //
+      // The box rules are chrome and the two lines inside it are a statement
+      // plus its remedy — so the notice is muted and the key is a hint, and
+      // **nothing here is red**. An orphan is not a failure: the ancestors
+      // exist and `^X b` fetches them, which is precisely why §3.2 pairs the
+      // notice with a key rather than with an apology. Drawing a recoverable
+      // gap in the same colour as `auth failed` is the "Christmas tree" §3.10
+      // names — and worse, it spends the one token that has to still mean
+      // something when the socket really is dead.
+      const box = (glyph: string, label: string, style: SpanStyle): Span[] => [
+        plain(`  ${bodyIndent}`),
+        styled(glyph, CHROME),
+        styled(label, style),
+      ];
+      rows.push(padRow(box("┌ ", "orphan — parent not loaded", META), cols));
+      rows.push(padRow(box("│  ", "^X b  backfill ancestors", HINT), cols));
+      rows.push(padRow([plain(`  ${bodyIndent}`), styled("└", CHROME)], cols));
     }
   }
   return rows;

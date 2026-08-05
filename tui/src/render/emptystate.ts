@@ -34,7 +34,8 @@
  */
 
 import type { ConnectionState } from "../client/types";
-import { pad } from "./width";
+import { DEGRADED, FAILED, META } from "./palette";
+import { type SpanStyle, type StyledRow, padRow, plain, styled } from "./span";
 
 /** What a list needs to explain its own emptiness. */
 export interface EmptyContext {
@@ -110,21 +111,77 @@ export function emptyStateRows(
   endpoint: string,
   context: EmptyContext,
   cols: number,
-): string[] {
+): StyledRow[] {
   if (context.missing.includes(endpoint)) {
+    // An unmounted route is **terminal**: it will not fill in no matter how
+    // long you wait, which is the whole reason it outranks the connection
+    // state above. Amber would say "in progress" about a state that has
+    // already finished failing.
     return [
-      pad(`  no ${subject} — this daemon does not serve ${endpoint}`, cols),
-      pad("  the daemon is older than this client; upgrade it", cols),
+      padRow(
+        [
+          plain("  "),
+          plain(`no ${subject} — `),
+          styled(`this daemon does not serve ${endpoint}`, FAILED),
+        ],
+        cols,
+      ),
+      padRow(
+        [
+          plain("  "),
+          styled("the daemon is older than this client; upgrade it", META),
+        ],
+        cols,
+      ),
     ];
   }
   if (!isLive(context.connection)) {
     return [
-      pad(
-        `  no ${subject} yet — ${connectionReason(context.connection)}`,
+      padRow(
+        [
+          plain("  "),
+          plain(`no ${subject} yet — `),
+          styled(
+            connectionReason(context.connection),
+            reasonStyle(context.connection),
+          ),
+        ],
         cols,
       ),
-      pad("  this list fills in once the relay connects", cols),
+      padRow(
+        [
+          plain("  "),
+          styled("this list fills in once the relay connects", META),
+        ],
+        cols,
+      ),
     ];
   }
-  return [pad(`  no ${subject}`, cols)];
+  // The benign case, and the only one that is not a loss. It gets no colour at
+  // all: an empty community is not a problem, and tinting it would make the
+  // three cases the module exists to separate look alike again from across the
+  // room — which is the failure §1.3 property 3 names.
+  return [padRow([plain(`  no ${subject}`)], cols)];
+}
+
+/**
+ * The colour a not-live reason is drawn in.
+ *
+ * The same two-tone split the statusline's connection glyph uses, and
+ * deliberately the same: §1.3 property 3 is about an operator being able to
+ * tell "waiting" from "broken" at a glance, and an empty list that disagreed
+ * with the chrome three rows below it about which one this is would undo the
+ * distinction rather than reinforce it.
+ *
+ * Everything transient is amber — it resolves itself by waiting. `auth_failed`
+ * is red because it does not.
+ */
+function reasonStyle(connection: ConnectionState): SpanStyle {
+  switch (connection.state) {
+    case "auth_failed":
+    case "disconnected":
+      return FAILED;
+    default:
+      return DEGRADED;
+  }
 }

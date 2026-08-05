@@ -17,7 +17,18 @@ import {
   renderMentionPicker,
 } from "../../src/render/completion";
 import type { MentionCandidate } from "../../src/client/types";
+import { type StyledRow, rowText } from "../../src/render/span";
 import { Session } from "../helpers/drive";
+
+/**
+ * The text a rendered picker draws.
+ *
+ * §3.3's rules are about *what the picker says* — that zero candidates still
+ * produce a `no matches` footer rather than nothing — so the assertion is on
+ * the projection, exactly as it was before the rows carried styling.
+ */
+const joined = (rows: readonly StyledRow[]): string =>
+  rows.map(rowText).join("\n");
 
 describe("§3.3 trigger detection — a pure function of (text, cursor)", () => {
   test("rule 1: the nearest trigger backwards from the cursor", () => {
@@ -173,8 +184,8 @@ describe("§3.3 zero candidates", () => {
     // no-op that keeps the popup open with a `no matches` footer." Leaving this
     // undefined risks a half-composed message sent by a reflexive Enter.
     const rows = renderMentionPicker([], 0, 60);
-    expect(rows.join("\n")).toContain("no matches");
-    expect(rows.join("\n")).toContain("esc close");
+    expect(joined(rows)).toContain("no matches");
+    expect(joined(rows)).toContain("esc close");
   });
 });
 

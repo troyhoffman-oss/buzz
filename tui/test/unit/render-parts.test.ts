@@ -121,7 +121,9 @@ describe("§2.1 statusline drop order", () => {
   });
 
   test("a keyless daemon is visible even though it is not a connection state", () => {
-    expect(text(row1({ ...state, archiving: false }, 100))).toContain("keyless");
+    expect(text(row1({ ...state, archiving: false }, 100))).toContain(
+      "keyless",
+    );
   });
 
   test("every non-connected state gets a distinct glyph (§2.6)", () => {

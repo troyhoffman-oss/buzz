@@ -27,11 +27,12 @@ import {
   untrack,
 } from "solid-js";
 import { applyIntent, withDefaultSelection } from "../app/dispatch";
-import { renderScreen, rowContext } from "../app/screen";
+import { renderStyledScreen, rowContext } from "../app/screen";
 import { type AppState, initialState, takeEffect } from "../app/state";
 import type { DaemonClient } from "../client/daemon-client";
 import { type KeyPress, resolveKey } from "../nav/keys";
 import { current } from "../nav/layers";
+import type { Span } from "../render/span";
 import { resolveTheme } from "../theme/theme";
 import { color } from "../theme/tokens";
 
@@ -333,8 +334,13 @@ export function Shell(props: ShellProps) {
       .catch(() => {});
   });
 
-  const lines = createMemo(() =>
-    renderScreen(state(), dimensions().width, dimensions().height, clock()),
+  const rows = createMemo(() =>
+    renderStyledScreen(
+      state(),
+      dimensions().width,
+      dimensions().height,
+      clock(),
+    ),
   );
 
   // §3.10: "pre-compute styles once at startup." The theme is resolved from
@@ -345,16 +351,37 @@ export function Shell(props: ShellProps) {
   const fg = color(theme, "text");
   const bg = color(theme, "background");
 
-  // TODO(wave1, §3.10): only the base pair is applied. Per-token colouring —
-  // the [G12] ladder's state tones, `diff*` on diff rows, the deterministic
-  // per-user hue, the per-community accent — needs the renderers to emit
-  // *spans* rather than plain strings, which is a change to the `string[]`
-  // contract `renderScreen` and the whole T1 matrix are built on. Doing it
-  // half-way (colouring only what is easy to reach from here) would leave the
-  // token set looking applied while most of §3.10's disciplines were not, so
-  // it lands as one change with its own snapshot pass rather than as a
-  // sprinkle. `NO_COLOR` and `TERM=dumb` are honoured today because `color()`
-  // returns `undefined` and OpenTUI inherits the terminal's own colours.
+  /**
+   * Resolve one span's style against the theme.
+   *
+   * The token → colour lookup is the *only* place a palette entry becomes a
+   * renderable colour, which is what makes `NO_COLOR` and `TERM=dumb` a single
+   * branch rather than a discipline: `color()` returns `undefined` for every
+   * token when the theme is colourless, so every span falls through to the
+   * terminal's own foreground and the frame degrades to exactly the plain text
+   * it was before this pass. The bold/italic attributes are dropped in that
+   * mode too — a `TERM=dumb` terminal is being told the output is not a
+   * terminal, and emitting SGR attributes into it is the same mistake as
+   * emitting colour.
+   */
+  const spanStyle = (span: Span) => {
+    if (theme.colorless) return {};
+    return {
+      ...(span.fg !== undefined ? { fg: color(theme, span.fg) } : {}),
+      ...(span.bg !== undefined ? { bg: color(theme, span.bg) } : {}),
+      ...(span.bold ? { bold: true } : {}),
+      ...(span.italic ? { italic: true } : {}),
+      ...(span.underline ? { underline: true } : {}),
+    };
+  };
+
+  // Each row is a `<text>` of `<span>`s. The `key` on the row `<For>` is its
+  // index rather than its content: the row list is a fixed-length window onto
+  // the frame (every frame is exactly `rows` rows of exactly `cols` columns, by
+  // `renderFrame`'s contract), so index-keying means a redraw *updates* the
+  // existing text nodes in place instead of unmounting and remounting the whole
+  // column. Content-keying would tear down and rebuild every node whose text
+  // changed, which is the full-frame flicker this pass is meant to remove.
   return (
     <box
       style={{
@@ -364,8 +391,14 @@ export function Shell(props: ShellProps) {
         ...(bg !== undefined ? { backgroundColor: bg } : {}),
       }}
     >
-      <For each={lines()}>
-        {(line) => <text style={fg !== undefined ? { fg } : {}}>{line}</text>}
+      <For each={rows()}>
+        {(row) => (
+          <text style={fg !== undefined ? { fg } : {}}>
+            <For each={row}>
+              {(span) => <span style={spanStyle(span)}>{span.text}</span>}
+            </For>
+          </text>
+        )}
       </For>
     </box>
   );

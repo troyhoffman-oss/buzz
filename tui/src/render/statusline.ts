@@ -209,9 +209,7 @@ export function row1(state: StatuslineState, cols: number): StyledRow {
           ? styled(part, style(original))
           : styled(
               part,
-              part === "⚠ keyless"
-                ? FAILED
-                : connectionStyle(state.connection),
+              part === "⚠ keyless" ? FAILED : connectionStyle(state.connection),
             ),
       );
     });
@@ -295,7 +293,11 @@ export function row2(state: StatuslineState, cols: number): StyledRow {
     state.mentions,
     MENTION,
   );
-  const dms = count(`${state.dms} DM${state.dms === 1 ? "" : "s"}`, state.dms, UNREAD);
+  const dms = count(
+    `${state.dms} DM${state.dms === 1 ? "" : "s"}`,
+    state.dms,
+    UNREAD,
+  );
 
   const spansFor = (which: readonly Segment[]): StyledRow => {
     const row = [plain(INDENT)];
@@ -394,7 +396,8 @@ export function row3(state: StatuslineState, cols: number): StyledRow {
 
   if (live.length > 0) {
     const countsOnly = `⏵ ${live.join(" · ")}`;
-    if (displayWidth(countsOnly) <= room) return padRow(spansFor(liveParts), cols);
+    if (displayWidth(countsOnly) <= room)
+      return padRow(spansFor(liveParts), cols);
     return padRow(
       [
         plain(INDENT),

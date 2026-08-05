@@ -11,9 +11,29 @@
  * ux-patterns P11/P12 as the desktop implements them.
  */
 
-import type { MentionCandidate } from "../client/types";
+import type { MentionCandidate, Presence } from "../client/types";
 import type { CompletionKind } from "../app/state";
-import { graphemes, pad, truncateKeepingSuffix, wrapHints } from "./width";
+import {
+  AGENT,
+  AUTHOR,
+  DEGRADED,
+  FOCUS,
+  HINT,
+  LIVE,
+  META,
+  SECTION,
+  SELECTED,
+} from "./palette";
+import {
+  type Span,
+  type SpanStyle,
+  type StyledRow,
+  fillRow,
+  padRow,
+  plain,
+  styled,
+} from "./span";
+import { graphemes, truncateKeepingSuffix, wrapHints } from "./width";
 
 /** A detected trigger: which completion is open and what has been typed. */
 export interface Trigger {
@@ -162,40 +182,117 @@ export function renderMentionPicker(
   candidates: readonly MentionCandidate[],
   selected: number,
   cols: number,
-): string[] {
+): StyledRow[] {
+  const hintRows = (): StyledRow[] =>
+    wrapHints([...MENTION_HINTS], cols).map((h) =>
+      padRow([plain("  "), styled(h, HINT)], cols),
+    );
+
   if (candidates.length === 0) {
     // §3.3: "Enter with zero candidates sends nothing and inserts nothing. It
     // is a no-op that keeps the popup open with a `no matches` footer."
     // Leaving this undefined risks a half-composed message sent by a reflexive
     // Enter, which is the worst available outcome.
     return [
-      pad("  no matches", cols),
-      ...wrapHints([...MENTION_HINTS], cols).map((h) => pad(`  ${h}`, cols)),
+      padRow([plain("  "), styled("no matches", META)], cols),
+      ...hintRows(),
     ];
   }
 
-  const rows: string[] = [];
+  const rows: StyledRow[] = [];
   let lastSection: "PEOPLE" | "AGENTS" | null = null;
   candidates.forEach((candidate, index) => {
     const section = candidate.isAgent ? "AGENTS" : "PEOPLE";
     if (section !== lastSection) {
-      rows.push(pad(`  ${section}`, cols));
+      rows.push(padRow([plain("  "), styled(section, SECTION)], cols));
       lastSection = section;
     }
-    const marker = index === selected ? "▸" : " ";
+    const isSelected = index === selected;
+    const marker = isSelected ? "▸" : " ";
     const number = index < 9 ? String(index + 1) : " ";
     const presence = candidate.isAgent ? ` ${presenceMark(candidate)}` : "";
     const label = `${marker}${number} @${candidate.handle}   ${candidate.displayName}${presence}`;
+    const text = truncateKeepingSuffix(label, candidate.detail ?? "", cols - 2);
+    // The handle is what `⏎` inserts, so it is the thing the eye is choosing
+    // between; agents and people are drawn apart because [D-2]'s whole point is
+    // that you know what you are addressing before you send. Everything after
+    // the handle — display name, presence, detail — is context and recedes.
+    //
+    // Attribution is by prefix length against the *finished* row, so a
+    // truncation that ate the handle simply leaves it unattributed rather than
+    // mis-colouring a fragment.
+    const prefix = `${marker}${number} `;
+    const handle = `@${candidate.handle}`;
+    const spans: Span[] = [plain("  ")];
+    if (text.startsWith(`${prefix}${handle}`)) {
+      // `▸` and the `alt+N` digit are two different affordances sharing a
+      // column pair, and flattening them into one colour loses the distinction
+      // that matters: the cursor says *where `⏎` goes*, the digit says *what
+      // `alt+N` reaches without moving the cursor at all* (§3.3's stable
+      // index). The digit is therefore metadata on every row including the
+      // selected one — an accent digit under an accent cursor would read as
+      // one two-column mark and quietly un-teach the shortcut.
+      spans.push(isSelected ? styled(marker, FOCUS) : plain(marker));
+      spans.push(styled(`${number} `, META));
+      spans.push(styled(handle, candidate.isAgent ? AGENT : AUTHOR));
+      spans.push(
+        ...tailSpans(text.slice(prefix.length + handle.length), candidate),
+      );
+    } else {
+      spans.push(styled(text, META));
+    }
     rows.push(
-      pad(
-        `  ${truncateKeepingSuffix(label, candidate.detail ?? "", cols - 2)}`,
-        cols,
-      ),
+      isSelected ? fillRow(spans, cols, SELECTED) : padRow(spans, cols),
     );
   });
-  for (const hint of wrapHints([...MENTION_HINTS], cols))
-    rows.push(pad(`  ${hint}`, cols));
-  return rows;
+  return [...rows, ...hintRows()];
+}
+
+/**
+ * The descriptive tail — display name, presence, `detail` — with the presence
+ * token carrying its state colour and everything else receding.
+ *
+ * §3.3 shows offline agents rather than hiding them, because "mentioning one is
+ * a deliberate act of queuing work". That only pays off if the queue's cost is
+ * legible *at the moment of choosing*, which is why presence is the one part of
+ * this tail that is not metadata: `⬤` means the turn starts now and `◐ waking`
+ * means it starts after a cold boot, and those are different decisions.
+ *
+ * `○ offline` and `◌` stay muted deliberately — they are the states with
+ * nothing to report, and colouring "nothing is happening" is how a palette
+ * stops meaning anything (§3.10). So exactly two of the four presences are
+ * ever tinted, and the glyph carries all four regardless.
+ *
+ * The offset is **computed from the label's construction and then verified
+ * against the finished text**, never searched for. Searching would find the
+ * first `⬤` anywhere in the row — a display name or a `detail` string is free
+ * to contain one — and the verification is what makes a truncated row degrade
+ * to "muted" rather than to "a colour on the wrong three characters".
+ */
+function tailSpans(tail: string, candidate: MentionCandidate): Span[] {
+  const style = presenceStyle(candidate.presence);
+  if (!candidate.isAgent || style === null) return [styled(tail, META)];
+  const token = presenceMark(candidate);
+  // `   ${displayName}` precedes the ` ${mark}` the label appended.
+  const at = 3 + candidate.displayName.length + 1;
+  if (tail.slice(at, at + token.length) !== token) return [styled(tail, META)];
+  const spans: Span[] = [styled(tail.slice(0, at), META), styled(token, style)];
+  const rest = tail.slice(at + token.length);
+  if (rest.length > 0) spans.push(styled(rest, META));
+  return spans;
+}
+
+/** The two presences worth a colour; `null` is "say it with the glyph alone". */
+function presenceStyle(presence: Presence): SpanStyle | null {
+  switch (presence) {
+    case "present":
+      return LIVE;
+    case "waking":
+      return DEGRADED;
+    case "offline":
+    case "unknown":
+      return null;
+  }
 }
 
 function presenceMark(candidate: MentionCandidate): string {

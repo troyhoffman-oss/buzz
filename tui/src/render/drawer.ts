@@ -19,8 +19,32 @@
 
 import type { Agent, AgentState, Huddle, LiveThread } from "../client/types";
 import {
+  CHROME,
+  DEGRADED,
+  FAILED,
+  FOCUS,
+  HINT,
+  LIVE,
+  MENTION,
+  META,
+  SECTION,
+  SELECTED,
+  THREAD,
+} from "./palette";
+import {
+  type Span,
+  type SpanStyle,
+  type StyledRow,
+  fillRow,
+  padRow,
+  plain,
+  rowText,
+  splitAt,
+  styled,
+} from "./span";
+import {
   alignRight,
-  pad,
+  displayWidth,
   truncateKeepingSuffix,
   wrapHints,
   wrapText,
@@ -264,7 +288,7 @@ export function renderDrawerList(
   selected: number,
   cols: number,
   availableRows: number,
-): string[] {
+): StyledRow[] {
   const hints = wrapHints([...DRAWER_HINTS], cols);
   // Reserve: the `Live` header, the summary, a blank, the trailing blank, and
   // the hint rows. What is left is what the list itself may use.
@@ -272,32 +296,98 @@ export function renderDrawerList(
   const fitted = fitDrawerRows(rows, listRows);
   const selectedId = rows[selected]?.id;
 
-  const out: string[] = [
-    pad("  Live", cols),
-    pad(`  ${liveSummary(rows)}`, cols),
-    pad("", cols),
+  const out: StyledRow[] = [
+    // The drawer replaces the statusline, so its own title is the only thing
+    // naming the surface you are now looking at — it stays at base weight
+    // while the summary beneath it, which is a count rather than a label,
+    // recedes.
+    padRow([plain("  Live")], cols),
+    padRow([plain("  "), styled(liveSummary(rows), META)], cols),
+    padRow([], cols),
   ];
 
   let lastSection: DrawerSection | null = null;
   fitted.rows.forEach((row) => {
     if (!fitted.compactHeaders && row.section !== lastSection) {
-      out.push(pad(`  ${row.section}`, cols));
+      out.push(padRow([plain("  "), styled(row.section, SECTION)], cols));
       lastSection = row.section;
     }
-    const marker = row.id === selectedId ? "❯ " : "  ";
+    const isSelected = row.id === selectedId;
+    const marker = isSelected ? "❯ " : "  ";
     const label = row.detail ? `${row.label}   ${row.detail}` : row.label;
-    out.push(
-      pad(
-        `${marker}${truncateKeepingSuffix(label, row.status, cols - 2)}`,
-        cols,
-      ),
-    );
+    const text = truncateKeepingSuffix(label, row.status, cols - 2);
+    // The status suffix is the [G12] ladder made visible: it is the reason the
+    // row is in the drawer at all, and §2.3 orders the whole list by it. So it
+    // is the one part of a drawer row that carries colour, and the label —
+    // an agent's name, a thread's title — stays neutral text.
+    const carries = row.status.length > 0 && text.endsWith(row.status);
+    const [head, tail] = carries
+      ? splitAt([plain(text)], displayWidth(text) - displayWidth(row.status))
+      : [[plain(text)], []];
+    const body: Span[] = [
+      isSelected ? styled(marker, FOCUS) : plain(marker),
+      // A SYSTEM row's "label" *is* its message — a degradation notice, not a
+      // name — so it takes the status colour it has no suffix to put it on.
+      row.section === "SYSTEM"
+        ? styled(rowText(head), systemStyle(row.label))
+        : plain(rowText(head)),
+      ...(carries ? [styled(rowText(tail), statusStyle(row))] : []),
+    ];
+    out.push(isSelected ? fillRow(body, cols, SELECTED) : padRow(body, cols));
   });
 
-  if (fitted.collapsed > 0) out.push(pad(`  … ${fitted.collapsed} more`, cols));
-  out.push(pad("", cols));
-  for (const hint of hints) out.push(pad(`  ${hint}`, cols));
+  if (fitted.collapsed > 0) {
+    out.push(
+      padRow([plain("  "), styled(`… ${fitted.collapsed} more`, META)], cols),
+    );
+  }
+  out.push(padRow([], cols));
+  for (const hint of hints)
+    out.push(padRow([plain("  "), styled(hint, HINT)], cols));
   return out;
+}
+
+/**
+ * The colour a drawer row's status suffix takes.
+ *
+ * Keyed on the section rather than on the string, so a thread whose title
+ * happened to read `working` cannot borrow an agent's colour — the section is
+ * what the row *is*, and it is known where the row is built.
+ *
+ * `needs input` is the loudest thing the drawer can say, and it is the only
+ * status that gets the mention colour: it is the top of §2.3's attention
+ * ladder for the same reason a mention is — something is blocked waiting for
+ * *you*, and it will stay blocked until you act. `working` is green because it
+ * needs nothing; `failed` is red because it is over.
+ */
+function statusStyle(row: DrawerRow): SpanStyle {
+  if (row.section === "THREADS") return THREAD;
+  if (row.section === "HUDDLE") return LIVE;
+  if (row.section === "SYSTEM") return systemStyle(row.label);
+  switch (row.status) {
+    case "needs input":
+      return MENTION;
+    case "working":
+      return LIVE;
+    case "failed":
+      return FAILED;
+    default:
+      return META;
+  }
+}
+
+/**
+ * The colour a SYSTEM row takes.
+ *
+ * Two degradations reach this section (`app/screen.ts`'s `drawerRows`), and
+ * they are not the same kind of bad. A reconnecting relay resolves itself by
+ * waiting; a daemon with no identity **never** does — §2.5 puts it here
+ * precisely because a keyless daemon that looks healthy is the failure the
+ * state exists to prevent, and amber would say "in progress" about something
+ * that requires the operator to go and fix it.
+ */
+function systemStyle(label: string): SpanStyle {
+  return label.includes("no identity") ? FAILED : DEGRADED;
 }
 
 /** The expanded detail view's data (§2.4). */
@@ -305,8 +395,16 @@ export interface DrawerExpansion {
   readonly title: string;
   /** Aligned label/value block — zone 1 of §2.4's two zones. */
   readonly fields: ReadonlyArray<readonly [string, string]>;
-  /** The live tail — zone 2, a fixed-height box that scrolls in place. */
-  readonly tail: readonly string[];
+  /**
+   * The live tail — zone 2, a fixed-height box that scrolls in place.
+   *
+   * Styled rows, because they come from `renderTranscript` and §6's whole claim
+   * is that the drawer's expansion and L4 render the *same* rows. Taking plain
+   * strings here would have flattened the transcript's class glyphs on one of
+   * the two paths — the version of "same rows" that is true of the text and
+   * false of the screen.
+   */
+  readonly tail: readonly StyledRow[];
   /** How far the tail is scrolled from its end. 0 == pinned to the newest. */
   readonly tailOffset: number;
   /** Total lines behind the tail window, for the `Showing 9 of 214` footer. */
@@ -347,11 +445,14 @@ export function renderDrawerExpansion(
   expansion: DrawerExpansion,
   cols: number,
   terminalRows: number,
-): string[] {
+): StyledRow[] {
   const height = expansionHeight(terminalRows);
   const hints = wrapHints([...EXPANSION_HINTS], cols);
 
-  const out: string[] = [pad(`  ${expansion.title}`, cols), pad("", cols)];
+  const out: StyledRow[] = [
+    padRow([plain(`  ${expansion.title}`)], cols),
+    padRow([], cols),
+  ];
 
   const labelWidth =
     Math.max(...expansion.fields.map(([k]) => k.length), 0) + 2;
@@ -363,12 +464,15 @@ export function renderDrawerExpansion(
     wrapped.forEach((line, i) => {
       const label =
         i === 0 ? `${key}:`.padEnd(labelWidth) : " ".repeat(labelWidth);
-      out.push(pad(`  ${label}${line}`, cols));
+      // Label muted, value at base weight. The block is read by scanning down
+      // the values — the turn id, the token counts — and a label column at the
+      // same weight makes the eye stop at every row twice.
+      out.push(padRow([plain("  "), styled(label, META), plain(line)], cols));
     });
   }
 
-  out.push(pad("", cols));
-  out.push(pad("  Transcript", cols));
+  out.push(padRow([], cols));
+  out.push(padRow([plain("  Transcript")], cols));
 
   // Everything above plus the box chrome, the footer, and the hints is fixed
   // overhead; the tail window is whatever is left, floored at one row so the
@@ -383,8 +487,11 @@ export function renderDrawerExpansion(
   // have not arrived yet", and it spends five rows of the chat's height saying
   // nothing.
   if (expansion.tail.length === 0) {
-    out.push(pad("  no frames yet", cols));
-    for (const hint of hints) out.push(pad(`  ${hint}`, cols));
+    // §1.3 property 3 in miniature: an empty tail is a *statement*, muted so it
+    // reads as one rather than as a box that failed to draw.
+    out.push(padRow([plain("  "), styled("no frames yet", META)], cols));
+    for (const hint of hints)
+      out.push(padRow([plain("  "), styled(hint, HINT)], cols));
     return out;
   }
 
@@ -392,18 +499,54 @@ export function renderDrawerExpansion(
   const start = Math.max(0, end - tailRows);
   const window = expansion.tail.slice(start, end);
 
-  out.push(pad(`  ╭${"─".repeat(inner)}╮`, cols));
-  for (let i = 0; i < tailRows; i++) {
-    const line = window[i] ?? "";
-    out.push(pad(`  │${pad(` ${line}`, inner)}│`, cols));
-  }
-  out.push(pad(`  ╰${"─".repeat(inner)}╯`, cols));
+  // The box is chrome and recedes; the transcript inside it is the content and
+  // does not. Drawn at one weight the frame competes with the frames it holds,
+  // which on the narrowest terminal is most of what you can see.
   out.push(
-    pad(
-      `  ${alignRight(`Showing ${window.length} of ${expansion.tailTotal} lines`, "", cols - 2)}`,
+    padRow([plain("  "), styled(`╭${"─".repeat(inner)}╮`, CHROME)], cols),
+  );
+  for (let i = 0; i < tailRows; i++) {
+    // The tail row keeps its own spans inside the box — this is §6's "one
+    // renderable" made literal: the class glyph an operator learned in L4 is
+    // the same colour here. Padding the row to the box's inner width *before*
+    // the right edge is what keeps the frame vertical when a transcript line
+    // is shorter than the box.
+    const line: StyledRow = window[i] ?? [];
+    out.push(
+      padRow(
+        [
+          plain("  "),
+          styled("│", CHROME),
+          ...padRow([plain(" "), ...line], inner),
+          styled("│", CHROME),
+        ],
+        cols,
+      ),
+    );
+  }
+  out.push(
+    padRow([plain("  "), styled(`╰${"─".repeat(inner)}╯`, CHROME)], cols),
+  );
+  // The `Showing N of M` footer is the box telling you it shrank — §2.4's
+  // fixed-height window made honest. It is metadata about the view, not
+  // content, so it recedes with everything else of that class.
+  out.push(
+    padRow(
+      [
+        plain("  "),
+        styled(
+          alignRight(
+            `Showing ${window.length} of ${expansion.tailTotal} lines`,
+            "",
+            cols - 2,
+          ),
+          META,
+        ),
+      ],
       cols,
     ),
   );
-  for (const hint of hints) out.push(pad(`  ${hint}`, cols));
+  for (const hint of hints)
+    out.push(padRow([plain("  "), styled(hint, HINT)], cols));
   return out;
 }

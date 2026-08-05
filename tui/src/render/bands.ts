@@ -17,7 +17,7 @@
  */
 
 import { CHROME, FOCUS, META, PLACEHOLDER } from "./palette";
-import { type StyledRow, plain, styled } from "./span";
+import { type StyledRow, padRow, plain, styled } from "./span";
 import { displayWidth, elideFromLeft } from "./width";
 
 /** The one focus glyph [G8]. There is exactly one on screen, ever. */
@@ -111,14 +111,17 @@ export interface ComposerView {
  *   else" (§2.2's list-owns-the-cursor case).
  */
 export function renderComposer(view: ComposerView, cols: number): StyledRow[] {
-  const prefix = view.focused
-    ? styled(`${FOCUS_GLYPH} `, FOCUS)
-    : plain("  ");
+  const prefix = view.focused ? styled(`${FOCUS_GLYPH} `, FOCUS) : plain("  ");
   const body =
     view.text.length > 0
       ? plain(view.text)
       : styled(view.placeholder, PLACEHOLDER);
-  return [[prefix, body]];
+  // Padded to the full width like every other band. An unpadded row lets the
+  // previous frame's tail survive to the right of the composer — on a
+  // streaming chat surface that reads as a rendering glitch rather than as a
+  // bug, which is why `renderFrame` promises exactly `cols` columns on every
+  // row and why the reflow suite asserts it.
+  return [padRow([prefix, body], cols)];
 }
 
 /** The fixed height of the rules. Used by the body's height arithmetic. */

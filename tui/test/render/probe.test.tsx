@@ -1,4 +1,4 @@
-import { test, expect } from "bun:test";
+import { test } from "bun:test";
 import { testRender } from "@opentui/solid";
 import pal from "../../themes/probe.json";
 

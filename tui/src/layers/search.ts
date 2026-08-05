@@ -15,7 +15,17 @@
 import type { SearchHit } from "../client/types";
 import type { Layer } from "../nav/layers";
 import { MS_PER_DAY, MS_PER_SECOND } from "../time/units";
-import { pad, truncateKeepingSuffix } from "../render/width";
+import { AUTHOR, FOCUS, META, POSITION, SELECTED } from "../render/palette";
+import {
+  type StyledRow,
+  fillRow,
+  padRow,
+  plain,
+  rowText,
+  splitAt,
+  styled,
+} from "../render/span";
+import { displayWidth, truncateKeepingSuffix } from "../render/width";
 
 /** A parsed query: the Slack operators plus the residual free text. */
 export interface ParsedQuery {
@@ -138,24 +148,58 @@ export function renderResults(
   now: number,
   composerFocused: boolean,
   hasQuery: boolean,
-): string[] {
-  if (!hasQuery) return [pad("  type to search", cols)];
-  if (hits.length === 0) return [pad("  no results", cols)];
-  const rows: string[] = [];
+): StyledRow[] {
+  // Both of these are the whole screen when they show, and §1.3 property 3's
+  // reasoning applies to a one-line body as much as to a blank one: they must
+  // read as a deliberate statement rather than as a rendering that gave up.
+  // Muted is what makes a lone centred-ish line look intentional — the same
+  // treatment `render/emptystate.ts` gives its remedy row.
+  if (!hasQuery)
+    return [padRow([plain("  "), styled("type to search", META)], cols)];
+  if (hits.length === 0)
+    return [padRow([plain("  "), styled("no results", META)], cols)];
+  const rows: StyledRow[] = [];
   hits.forEach((hit, index) => {
-    const marker = index === selected ? (composerFocused ? "▌ " : "❯ ") : "  ";
-    rows.push(
-      pad(
-        `${marker}${truncateKeepingSuffix(
-          `${hit.channelName} · ${hit.author}`,
-          relativeDay(hit.ts, now),
-          cols - 2,
-        )}`,
-        cols,
-      ),
+    const isSelected = index === selected;
+    const marker = isSelected ? (composerFocused ? "▌ " : "❯ ") : "  ";
+    const stamp = relativeDay(hit.ts, now);
+    const head = truncateKeepingSuffix(
+      `${hit.channelName} · ${hit.author}`,
+      stamp,
+      cols - 2,
     );
+    // `#channel · author … 14:09`. The author is the part you scan a result
+    // list by — "who said this" is the question a search answers second, right
+    // after "where" — so it carries the author colour while the channel and
+    // the stamp stay metadata. The split is by display column off the finished
+    // string, never a rebuild of the layout.
+    const [left, stampPart] = head.endsWith(stamp)
+      ? splitAt([plain(head)], displayWidth(head) - displayWidth(stamp))
+      : [[plain(head)], []];
+    const leftText = rowText(left);
+    const separator = `${hit.channelName} · `;
+    const [channelPart, authorPart] = leftText.startsWith(separator)
+      ? splitAt([plain(leftText)], displayWidth(separator))
+      : [[plain(leftText)], []];
+    const header: StyledRow = [
+      isSelected
+        ? styled(marker, composerFocused ? POSITION : FOCUS)
+        : plain(marker),
+      styled(rowText(channelPart), META),
+      ...(authorPart.length > 0 ? [styled(rowText(authorPart), AUTHOR)] : []),
+      ...(stampPart.length > 0 ? [styled(rowText(stampPart), META)] : []),
+    ];
+    // The excerpt is content and stays unstyled — the same rule the timeline
+    // follows, and for the same reason: if the matched text carried colour
+    // there would be nothing for the header above it to stand out against.
+    const excerpt: StyledRow = [
+      plain(`  ${truncateKeepingSuffix(hit.excerpt, "", cols - 4)}`),
+    ];
+    // Both rows of the hit take the fill, because the hit is what is selected —
+    // highlighting only its first line would read as selecting the header.
     rows.push(
-      pad(`  ${truncateKeepingSuffix(hit.excerpt, "", cols - 4)}`, cols),
+      isSelected ? fillRow(header, cols, SELECTED) : padRow(header, cols),
+      isSelected ? fillRow(excerpt, cols, SELECTED) : padRow(excerpt, cols),
     );
   });
   return rows;

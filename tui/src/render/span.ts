@@ -173,10 +173,7 @@ export function recede(row: StyledRow, fg: TokenName): StyledRow {
  * marker or a trailing suffix without rebuilding the layout — the split is by
  * display column, so a wide glyph is never cut in half.
  */
-export function splitAt(
-  row: StyledRow,
-  cols: number,
-): [StyledRow, StyledRow] {
+export function splitAt(row: StyledRow, cols: number): [StyledRow, StyledRow] {
   const head: Span[] = [];
   const tail: Span[] = [];
   let used = 0;

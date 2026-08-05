@@ -16,7 +16,31 @@
 
 import type { Channel } from "../client/types";
 import type { Layer } from "../nav/layers";
-import { alignRight, pad, truncateKeepingSuffix } from "../render/width";
+import {
+  FOCUS,
+  LIVE,
+  MENTION,
+  META,
+  POSITION,
+  SECTION,
+  SELECTED,
+  UNREAD,
+} from "../render/palette";
+import {
+  type Span,
+  type StyledRow,
+  fillRow,
+  padRow,
+  plain,
+  rowText,
+  splitAt,
+  styled,
+} from "../render/span";
+import {
+  alignRight,
+  displayWidth,
+  truncateKeepingSuffix,
+} from "../render/width";
 
 /** A section of the channel list (§1.3). */
 export type ChannelSection = "STARRED" | "CHANNELS" | "DMS";
@@ -221,30 +245,93 @@ export function descendTarget(row: ChannelRow): Layer | null {
  * and `8 · ⚡claude-1` does not.
  */
 export function channelStatus(channel: Channel): string {
-  const parts: string[] = [];
-  if (channel.unread > 0) parts.push(String(channel.unread));
-  if (channel.mentions > 0) parts.push(`@${channel.mentions}`);
-  if (channel.agentsWorking.length > 0)
-    parts.push(`⚡${channel.agentsWorking.join(" ")}`);
-  return parts.join(" · ");
+  return channelStatusParts(channel)
+    .map((part) => part.text)
+    .join(" · ");
 }
 
-/** Render the L1 list. */
+/**
+ * The status suffix as its **parts**, each carrying its own meaning.
+ *
+ * Three different signals share this one slot — volume, address, activity — and
+ * they are not equally urgent. `8` unread is information; `@2` is addressed to
+ * you; `⚡claude-1` is something happening right now. Rendering them in one
+ * colour makes the operator read all three to find the one they care about,
+ * which is the opposite of what a scannable status column is for.
+ *
+ * Exposed as parts rather than styled by matching the joined string, for the
+ * reason `render/span.ts` states: a channel whose *name* contains `@` would
+ * defeat a matcher, and the renderer already knows which part is which.
+ * {@link channelStatus} stays the single source of the text.
+ */
+export function channelStatusParts(channel: Channel): readonly Span[] {
+  const parts: Span[] = [];
+  if (channel.unread > 0) parts.push(styled(String(channel.unread), UNREAD));
+  if (channel.mentions > 0) parts.push(styled(`@${channel.mentions}`, MENTION));
+  if (channel.agentsWorking.length > 0) {
+    parts.push(styled(`⚡${channel.agentsWorking.join(" ")}`, LIVE));
+  }
+  return parts;
+}
+
+/**
+ * Render the L1 list.
+ *
+ * The status suffix is re-attributed span by span **after** truncation rather
+ * than before it. `truncateKeepingSuffix` guarantees the whole suffix survives
+ * (§3's list-row rule — the label ellipsizes, the counts do not), so its text
+ * is present verbatim at the end of the finished row, and cutting the row at
+ * the suffix's width recovers exactly the parts that went in. Building the row
+ * from pre-styled pieces instead would mean reimplementing the truncation, and
+ * the reimplementation is what drifts.
+ */
 export function renderChannels(
   rows: readonly ChannelRow[],
   selected: number,
   cols: number,
   composerFocused: boolean,
-): string[] {
+): StyledRow[] {
   return rows.map((row, index) => {
-    const marker = index === selected ? (composerFocused ? "▌ " : "❯ ") : "  ";
-    if (row.kind === "section") return pad(`  ${row.section}`, cols);
+    const isSelected = index === selected;
+    const marker = isSelected ? (composerFocused ? "▌ " : "❯ ") : "  ";
+    // A section header is never the cursor's row *and* never carries a marker,
+    // so it is built whole — and it recedes, because the caps already say it
+    // is a header.
+    if (row.kind === "section") {
+      const body: StyledRow = [plain("  "), styled(row.section, SECTION)];
+      return isSelected ? fillRow(body, cols, SELECTED) : padRow(body, cols);
+    }
+
+    const statusParts = channelStatusParts(row.channel);
     const status = channelStatus(row.channel);
     const label =
       row.channel.kind === "dm" ? `◍ ${row.channel.name}` : row.channel.name;
-    return pad(
-      `${marker}${status ? truncateKeepingSuffix(label, status, cols - 2) : alignRight(label, "", cols - 2)}`,
-      cols,
-    );
+    const text = status
+      ? truncateKeepingSuffix(label, status, cols - 2)
+      : alignRight(label, "", cols - 2);
+
+    const spans: Span[] = [
+      isSelected
+        ? styled(marker, composerFocused ? POSITION : FOCUS)
+        : plain(marker),
+    ];
+    if (status && text.endsWith(status)) {
+      const [head] = splitAt(
+        [plain(text)],
+        displayWidth(text) - displayWidth(status),
+      );
+      spans.push(plain(rowText(head)));
+      // Re-emit the parts in order, with the ` · ` separators muted so the
+      // three signals read as three rather than as one run.
+      statusParts.forEach((part, i) => {
+        if (i > 0) spans.push(styled(" · ", META));
+        spans.push(part);
+      });
+    } else {
+      // The suffix did not survive intact (a width below its own), so there is
+      // nothing to attribute and the row is one truncated fragment.
+      spans.push(plain(text));
+    }
+    return isSelected ? fillRow(spans, cols, SELECTED) : padRow(spans, cols);
   });
 }

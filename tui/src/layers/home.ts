@@ -16,7 +16,31 @@
 
 import type { AttentionItem, Channel, Community } from "../client/types";
 import type { Layer } from "../nav/layers";
-import { alignRight, pad, truncateKeepingSuffix } from "../render/width";
+import {
+  FOCUS,
+  MENTION,
+  META,
+  POSITION,
+  SECTION,
+  SELECTED,
+  UNREAD,
+  WAVE_TAG,
+} from "../render/palette";
+import {
+  type SpanStyle,
+  type StyledRow,
+  fillRow,
+  padRow,
+  plain,
+  rowText,
+  splitAt,
+  styled,
+} from "../render/span";
+import {
+  alignRight,
+  displayWidth,
+  truncateKeepingSuffix,
+} from "../render/width";
 
 /** Order of the ATTENTION groups — the §1 layer map's order, top to bottom. */
 export const ATTENTION_GROUPS = [
@@ -298,50 +322,129 @@ export function teleportCrumb(row: HomeRow): string | null {
   return GROUP_LABELS[row.item.group].toLowerCase();
 }
 
-/** Render home's rows to text (§4.1's and §4.4's frames). */
+/**
+ * Render home's rows (§4.1's and §4.4's frames).
+ *
+ * Home is the screen the owner opens on, and the M3 capture is why this pass
+ * exists: eight rows, three of them section headers, every one of them the same
+ * grey — so the zones that organise the screen read exactly as loudly as the
+ * destinations inside them, and the selected row was distinguishable only by
+ * two characters at the far left.
+ *
+ * Both halves are fixed here. Headers recede to `textMuted` (the caps already
+ * carry the structure — colour on top of caps makes scaffolding louder than
+ * content), and the selected row takes a full-width fill so it is seen without
+ * being looked for.
+ */
 export function renderHome(
   rows: readonly HomeRow[],
   selected: number,
   cols: number,
   composerFocused: boolean,
-): string[] {
+): StyledRow[] {
   return rows.map((row, index) => {
     // §2.2's one-glyph rule: the list holds `❯` while the composer is empty; a
     // single typed character moves it and demotes the row to `▌`.
-    const marker = index === selected ? (composerFocused ? "▌ " : "❯ ") : "  ";
+    const isSelected = index === selected;
+    const marker = isSelected ? (composerFocused ? "▌ " : "❯ ") : "  ";
+    const markerSpan = isSelected
+      ? styled(marker, composerFocused ? POSITION : FOCUS)
+      : plain(marker);
     // Every row is `marker + body` padded to width, so the marker and the pad
     // are applied once here rather than repeated in five branches — which is
     // what keeps a new row kind from accidentally shipping without one.
-    return pad(`${marker}${homeRowBody(row, cols - 2)}`, cols);
+    const body: StyledRow = [markerSpan, ...homeRowBody(row, cols - 2)];
+    // A demoted row keeps the fill: `▌` says the cursor is still there while
+    // the keys go to the composer, and dropping the highlight would make a
+    // filtered list look like a list with no position at all.
+    return isSelected ? fillRow(body, cols, SELECTED) : padRow(body, cols);
   });
 }
 
+/**
+ * Split a row built by {@link alignRight} into its label and its right-hand
+ * segment, keeping the exact text the layout function produced.
+ *
+ * The alternative — rebuilding the row as `label + gap + status` in span form —
+ * is a second implementation of `alignRight`'s arithmetic, and the two would
+ * drift the moment either changes. Cutting the finished string by display
+ * column means a mistake here can only ever mis-colour, never mis-draw.
+ */
+function splitAligned(text: string, right: string): [string, string] {
+  if (right.length === 0) return [text, ""];
+  const at = displayWidth(text) - displayWidth(right);
+  if (at <= 0) return ["", text];
+  const [head, tail] = splitAt([plain(text)], at);
+  return [rowText(head), rowText(tail)];
+}
+
 /** One home row's body, without the focus marker or the trailing pad. */
-function homeRowBody(row: HomeRow, cols: number): string {
+function homeRowBody(row: HomeRow, cols: number): StyledRow {
   switch (row.kind) {
     case "zoneHeader":
-      return row.label;
-    case "community":
-      return alignRight(
+      return [styled(row.label, SECTION)];
+    case "community": {
+      const status =
+        row.community.unread > 0 ? `${row.community.unread} unread` : "";
+      const text = alignRight(
         `${row.community.active ? "◉" : "○"} ${row.community.name}`,
-        row.community.unread > 0 ? `${row.community.unread} unread` : "",
+        status,
         cols,
       );
-    case "groupHeader":
-      return alignRight(
+      const [label, tail] = splitAligned(text, status);
+      return [plain(label), ...(tail ? [styled(tail, UNREAD)] : [])];
+    }
+    case "groupHeader": {
+      const count = String(row.count);
+      const text = alignRight(
         `${row.collapsed ? "▸" : "▾"} ${GROUP_LABELS[row.group]}`,
-        String(row.count),
+        count,
         cols,
       );
-    case "attention":
-      return truncateKeepingSuffix(
+      const [label, tail] = splitAligned(text, count);
+      return [styled(label, SECTION), ...(tail ? [styled(tail, META)] : [])];
+    }
+    case "attention": {
+      // The one row kind whose body is genuinely content — an author, a
+      // channel and a message preview, run together by `truncateKeepingSuffix`
+      // so the timestamp survives the cut. Only the timestamp is attributed:
+      // it is the part you read last, and picking the author out of a
+      // pre-truncated string would mean re-deriving a boundary the truncation
+      // may already have moved.
+      const stamp = formatClock(row.item.ts);
+      const text = truncateKeepingSuffix(
         `${row.item.author} · ${row.item.channelName}    ${row.item.preview}`,
-        formatClock(row.item.ts),
+        stamp,
         cols,
       );
-    case "place":
-      return alignRight(row.label, row.status, cols);
+      const [body, tail] = splitAligned(text, stamp);
+      return [plain(body), ...(tail ? [styled(tail, META)] : [])];
+    }
+    case "place": {
+      const text = alignRight(row.label, row.status, cols);
+      const [label, tail] = splitAligned(text, row.status);
+      return [
+        plain(label),
+        ...(tail ? [styled(tail, placeStatusStyle(row.status))] : []),
+      ];
+    }
   }
+}
+
+/**
+ * How a PLACES row's status suffix is drawn.
+ *
+ * Three meanings share one slot, and they must not look alike. `Wave 2` marks a
+ * row that is deliberately inert (§3.7 renders unshipped destinations "greyed
+ * with a `Wave 2` tag rather than hiding them, which teaches the roadmap
+ * instead of teaching absence") — so it is the quietest thing on the row, and
+ * italic, because it is a label about the row rather than a count from it. A
+ * mention is addressed to you and is the loudest. Plain unread is in between.
+ */
+function placeStatusStyle(status: string): SpanStyle {
+  if (status === WAVE_2_TAG) return WAVE_TAG;
+  if (status.includes("mention")) return MENTION;
+  return UNREAD;
 }
 
 /**

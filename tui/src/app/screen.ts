@@ -39,12 +39,20 @@ import {
   renderChannels,
   type ChannelRow,
 } from "../layers/channels";
-import { messageSelectHints, selectedMessage } from "../layers/channel";
+import { messageSelectHints } from "../layers/channel";
 import { buildHomeRows, renderHome, type HomeRow } from "../layers/home";
 import { buildThread, renderThread } from "../layers/thread";
 import { localSearch, parseQuery, renderResults } from "../layers/search";
 import { FOCUS_GLYPH, POSITION_GLYPH } from "../render/bands";
 import { type EmptyContext, emptyStateRows } from "../render/emptystate";
+import {
+  type StyledRow,
+  plain,
+  plainRow,
+  rowText,
+  styled,
+} from "../render/span";
+import { META } from "../render/palette";
 import { pad } from "../render/width";
 import { type BottomBand, renderFrame } from "../shell/frame";
 import { MIN_COLS, MIN_ROWS, isBelowFloor } from "../shell/tiers";
@@ -106,7 +114,7 @@ function pickerListIsEmpty(state: AppState): boolean {
 
 /** The rows the current layer's body renders to, plus its selection axis. */
 interface Body {
-  readonly rows: readonly string[];
+  readonly rows: readonly StyledRow[];
   readonly anchor: "top" | "bottom";
   /** How many selectable rows the layer has, for clamping. */
   readonly count: number;
@@ -130,10 +138,11 @@ interface Body {
  * {@link Body} under `exactOptionalPropertyTypes` without an explicit
  * `undefined`.
  */
-function withFollow(rows: readonly string[]): { follow?: number } {
-  const index = rows.findIndex(
-    (row) => row.startsWith(FOCUS_GLYPH) || row.startsWith(POSITION_GLYPH),
-  );
+function withFollow(rows: readonly StyledRow[]): { follow?: number } {
+  const index = rows.findIndex((row) => {
+    const text = rowText(row);
+    return text.startsWith(FOCUS_GLYPH) || text.startsWith(POSITION_GLYPH);
+  });
   return index >= 0 ? { follow: index } : {};
 }
 
@@ -295,7 +304,7 @@ function renderBody(state: AppState, cols: number, now: number): Body {
       }
       if (rows.length === 0) {
         return {
-          rows: [pad("  no channels match", cols)],
+          rows: [plainRow(pad("  no channels match", cols))],
           anchor: "top",
           count: 0,
         };
@@ -375,7 +384,11 @@ function renderBody(state: AppState, cols: number, now: number): Body {
         : [];
       const root = all.find((m) => m.id === layer.eventId);
       if (!root)
-        return { rows: ["  thread not loaded"], anchor: "bottom", count: 0 };
+        return {
+          rows: [plainRow("  thread not loaded")],
+          anchor: "bottom",
+          count: 0,
+        };
       const nodes = buildThread(root, all);
       return {
         rows: renderThread(nodes, cols),
@@ -393,13 +406,21 @@ function renderBody(state: AppState, cols: number, now: number): Body {
       const usage = layer.agentPubkey
         ? state.snapshot.usage[layer.agentPubkey]
         : undefined;
-      const header = agent
-        ? activityFields(agent, usage, now).map(([k, v]) => `  ${k}: ${v}`)
+      // The field block above the transcript: label muted, value at base
+      // weight, matching the drawer's expansion exactly — §6's "same rows"
+      // claim is about the transcript, but a header that read differently
+      // between the two entries would undercut it just as visibly.
+      const header: StyledRow[] = agent
+        ? activityFields(agent, usage, now).map(([k, v]) => [
+            plain("  "),
+            styled(`${k}: `, META),
+            plain(v),
+          ])
         : [];
       // §6's one renderable: the exact same `renderTranscript` the drawer's
       // expansion calls. Different entry, different back target, same rows.
       return {
-        rows: [...header, "", ...renderTranscript(rows, cols)],
+        rows: [...header, [], ...renderTranscript(rows, cols)],
         anchor: "bottom",
         count: rows.length,
       };
@@ -413,7 +434,7 @@ function renderBottom(
   cols: number,
   rows: number,
   now: number,
-): { band: BottomBand; statusline: string[] } {
+): { band: BottomBand; statusline: StyledRow[] } {
   const layer = current(state.stack);
 
   if (state.drawer) {
@@ -541,21 +562,26 @@ function attentionMeter(state: AppState): number {
 }
 
 /**
- * Render the whole screen.
+ * Render the whole screen, with styling — what the terminal receives.
  *
  * Below the floor it renders **one legible line and keeps running** — it does
  * not exit and does not panic (§3.9's surviving clause). Rendering into a
  * zero-size rect is a no-op, never a crash.
+ *
+ * {@link renderScreen} is this function's text projection, and every geometry
+ * suite asserts on that. The two cannot drift, because one calls the other: a
+ * separate string path would be a second renderer to keep in agreement with
+ * the real one, and the T1 matrix would be proving things about the copy.
  */
-export function renderScreen(
+export function renderStyledScreen(
   state: AppState,
   cols: number,
   rows: number,
   now: number,
-): string[] {
+): StyledRow[] {
   if (cols <= 0 || rows <= 0) return [];
   if (isBelowFloor(cols, rows)) {
-    return [`terminal too small — ${MIN_COLS}x${MIN_ROWS} minimum`];
+    return [plainRow(`terminal too small — ${MIN_COLS}x${MIN_ROWS} minimum`)];
   }
 
   const body = renderBody(state, cols, now);
@@ -587,6 +613,23 @@ export function renderScreen(
     ...(body.follow !== undefined ? { follow: body.follow } : {}),
     ...(completion ? { completion } : {}),
   });
+}
+
+/**
+ * The screen as plain text — the contract every geometry suite is written to.
+ *
+ * The T1 matrix, the §4 walkthroughs and the empty-state suite all compare the
+ * strings a frame renders to. Keeping that signature intact is what let the
+ * whole theme pass land in one change: the colour is additive, and every
+ * existing assertion keeps testing exactly what it tested before.
+ */
+export function renderScreen(
+  state: AppState,
+  cols: number,
+  rows: number,
+  now: number,
+): string[] {
+  return renderStyledScreen(state, cols, rows, now).map(rowText);
 }
 
 /** The number of selectable rows on the current layer, for clamping [G4]. */
