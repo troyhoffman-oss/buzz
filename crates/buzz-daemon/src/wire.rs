@@ -89,6 +89,15 @@ pub const TICK: Duration = Duration::from_millis(125);
 /// How long an unresolved publish is carried before it fails visibly (§2.7).
 pub const PUBLISH_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Minimum spacing between attempts on the same pending publish.
+///
+/// Without it, a failing publish is retried once per [`TICK`] — ~240 HTTP
+/// requests across one [`PUBLISH_DEADLINE`], aimed at a relay that is by
+/// definition already unwell. The bridge's own per-request retry ladder
+/// (`RETRY_BASE_SECS`) handles the fast transients; this paces the *outer*
+/// loop, which exists for the slow ones.
+pub const PUBLISH_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Live-tail page size for a channel subscription.
 ///
 /// A subscription is a *tail*, not a history read: the paged history walk is
@@ -768,6 +777,10 @@ struct PendingPublish {
     /// When the caller asked. The deadline is measured from here, not from the
     /// last attempt, so a flapping connection cannot extend it indefinitely.
     asked_at: Instant,
+    /// When the last bridge attempt was made, for [`PUBLISH_RETRY_INTERVAL`].
+    /// `None` means it has never been attempted, which is what makes the first
+    /// attempt immediate rather than one interval late.
+    last_attempt: Option<Instant>,
 }
 
 impl PendingPublish {
@@ -825,17 +838,21 @@ pub async fn run(state: AppState, mut commands: tokio::sync::mpsc::Receiver<Wire
         // socket cannot leak across an iteration.
         session_loop(&state, conn, &creds, &mut commands, &mut pending).await;
 
-        let delay = {
+        // Leaving `Connected` is what resets the ladder after a healthy run and
+        // counts the reconnect (`Session::transition`), and `next_retry_delay`
+        // then takes the rung — which also advances `attempt`, so the attempt
+        // is read *after* the delay rather than before. Reading it first
+        // reports the rung the previous outage used.
+        //
+        // One transition, not two. An earlier revision moved through
+        // `Disconnected` on the way to `Reconnecting`, which incremented
+        // `counters.reconnects` and then published a `disconnected` frame the
+        // status bar would render for the width of one lock acquisition — a
+        // flicker to the one state §2.6 says must stay distinct from the others.
+        let (delay, attempt) = {
             let mut inner = state.lock().await;
-            // Entering a non-`Connected` state is what resets the ladder after
-            // a healthy run and counts the reconnect; `next_retry_delay` then
-            // takes the rung.
-            inner.session.transition(ConnectionState::Disconnected);
-            inner.session.next_retry_delay(false)
-        };
-        let attempt = {
-            let mut inner = state.lock().await;
-            inner.session.backoff_mut().attempt()
+            let delay = inner.session.next_retry_delay(false);
+            (delay, inner.session.backoff_mut().attempt())
         };
         set_state(
             &state,
@@ -965,6 +982,8 @@ async fn session_loop(
     let mut last_frame = Instant::now();
     let mut last_paced = Instant::now();
     let mut probe_sent: Option<Instant> = None;
+    // When the relay's rate-limit gate is expected to disarm, if it is armed.
+    let mut rate_limited_until: Option<Instant> = None;
 
     loop {
         // ── Read. The only await that can lose a frame, and it is never inside
@@ -973,8 +992,10 @@ async fn session_loop(
             Ok(message) => {
                 last_frame = Instant::now();
                 probe_sent = None;
-                if !handle_message(state, message, pending).await {
-                    return;
+                match handle_message(state, message, pending).await {
+                    Handled::Continue => {}
+                    Handled::RateLimited { until } => rate_limited_until = Some(until),
+                    Handled::EndSession => return,
                 }
             }
             Err(WsClientError::Timeout) => {}
@@ -1016,6 +1037,21 @@ async fn session_loop(
         if let Ok(command) = commands.try_recv() {
             if !handle_command(state, command, pending, &mut queue).await {
                 return;
+            }
+        }
+
+        // ── Disarm the rate-limit gate once its window has passed.
+        //
+        // §2.7 gives the composer a live countdown, which is only honest if the
+        // gate actually disarms when it reaches zero. A `NOTICE` arms it and
+        // nothing on the relay side takes it back — there is no
+        // "you-are-no-longer-rate-limited" frame in NIP-01 — so without this
+        // the daemon stays `rate_limited` on a healthy socket forever, refusing
+        // every write with a countdown that expired.
+        if let Some(armed) = rate_limited_until {
+            if Instant::now() >= armed {
+                rate_limited_until = None;
+                set_state(state, ConnectionState::Connected).await;
             }
         }
 
@@ -1067,12 +1103,30 @@ fn mark_subscription_active(inner: &mut Inner, subscription_id: &str) {
     }
 }
 
-/// Handle one relay frame. Returns `false` when the session must end.
+/// What the session loop should do after one relay frame.
+///
+/// An enum rather than a `bool` because a rate-limit `NOTICE` is a *third*
+/// outcome: the session continues, but the loop now owns a deadline it has to
+/// disarm. Encoding that as "continue" plus a side channel is how the gate ends
+/// up armed forever on a healthy socket.
+enum Handled {
+    /// Nothing further; keep reading.
+    Continue,
+    /// The rate-limit gate is armed until this instant.
+    RateLimited {
+        /// When the gate is expected to disarm.
+        until: Instant,
+    },
+    /// End the session; the caller reconnects.
+    EndSession,
+}
+
+/// Handle one relay frame.
 async fn handle_message(
     state: &AppState,
     message: RelayMessage,
     pending: &mut [PendingPublish],
-) -> bool {
+) -> Handled {
     match message {
         RelayMessage::Event {
             subscription_id,
@@ -1082,7 +1136,7 @@ async fn handle_message(
             // behaving unexpectedly rather than data. Ignoring it keeps a
             // misbehaving relay from injecting into an unrouted store.
             if subscription_id == SUB_PROBE {
-                return true;
+                return Handled::Continue;
             }
             let now = unix_now();
             let mut inner = state.lock().await;
@@ -1091,7 +1145,7 @@ async fn handle_message(
             {
                 tracing::debug!(reason, kind = kind_of(&event), "event dropped");
             }
-            true
+            Handled::Continue
         }
         RelayMessage::Ok(ok) => {
             state
@@ -1114,9 +1168,9 @@ async fn handle_message(
                     }));
                 }
             }
-            true
+            Handled::Continue
         }
-        RelayMessage::Eose { .. } | RelayMessage::Count { .. } => true,
+        RelayMessage::Eose { .. } | RelayMessage::Count { .. } => Handled::Continue,
         RelayMessage::Closed {
             subscription_id,
             message,
@@ -1125,26 +1179,23 @@ async fn handle_message(
             // rows — usually a `#p`-gated kind whose scope is wrong. Naming it
             // is what turns "the agent feed is empty" into a one-line answer.
             tracing::warn!(subscription = %subscription_id, %message, "relay closed a subscription");
-            true
+            Handled::Continue
         }
-        RelayMessage::Notice { message } => {
-            handle_notice(state, &message).await;
-            true
-        }
+        RelayMessage::Notice { message } => handle_notice(state, &message).await,
         // A challenge mid-session means the relay wants re-authentication,
         // which `connect_authenticated` performs at connect. Ending the session
         // and reconnecting is the honest handling; re-signing in place would
         // fork the auth path that already exists.
-        RelayMessage::Auth { .. } => false,
+        RelayMessage::Auth { .. } => Handled::EndSession,
     }
 }
 
 /// Arm the rate-limit gate on a `rate-limited:` notice (§2.7).
-async fn handle_notice(state: &AppState, message: &str) {
+async fn handle_notice(state: &AppState, message: &str) -> Handled {
     let lower = message.to_lowercase();
     if !lower.contains("rate-limit") && !lower.contains("rate limited") {
         tracing::info!(notice = %message, "relay notice");
-        return;
+        return Handled::Continue;
     }
     let retry_after_ms = crate::rest::parse_retry_hint(message)
         .map(|secs| secs.min(crate::rest::RETRY_IN_MAX_SECS) * 1_000)
@@ -1158,6 +1209,9 @@ async fn handle_notice(state: &AppState, message: &str) {
         inner.session.observer_queue.requeue_in_flight();
     }
     set_state(state, ConnectionState::RateLimited { retry_after_ms }).await;
+    Handled::RateLimited {
+        until: Instant::now() + Duration::from_millis(retry_after_ms),
+    }
 }
 
 /// Handle one command. Returns `false` when the session must end.
@@ -1178,6 +1232,7 @@ async fn handle_command(
                 respond,
                 local_id,
                 asked_at: Instant::now(),
+                last_attempt: None,
             });
             true
         }
@@ -1202,12 +1257,21 @@ async fn handle_command(
 
 /// Attempt the oldest pending publish, resolving it on a definite outcome.
 ///
-/// One per tick: a publish is an HTTP round trip and running them unbounded
-/// from a loop that also owns the socket would starve the read.
+/// One per tick, and **not on every tick**: a publish is an HTTP round trip,
+/// and a failing one retried at [`TICK`] would fire ~240 requests at the relay
+/// across a single [`PUBLISH_DEADLINE`] — a retry storm aimed at a relay that
+/// is already unwell. [`PUBLISH_RETRY_INTERVAL`] paces it.
 async fn drain_publishes(state: &AppState, pending: &mut Vec<PendingPublish>) {
-    let Some(item) = pending.first() else {
+    let Some(item) = pending.first_mut() else {
         return;
     };
+    if item
+        .last_attempt
+        .is_some_and(|at| at.elapsed() < PUBLISH_RETRY_INTERVAL)
+    {
+        return;
+    }
+    item.last_attempt = Some(Instant::now());
     let event = item.event.clone();
     let local_id = item.local_id.clone();
     match submit(state, &event).await {
@@ -1231,19 +1295,14 @@ async fn drain_publishes(state: &AppState, pending: &mut Vec<PendingPublish>) {
 /// bridge already applied §2.7's retry policy, including the rule that a
 /// moderation kind is never blindly retried.
 async fn submit(state: &AppState, event: &nostr::Event) -> Option<crate::post::SendResponse> {
-    // The identity is borrowed only long enough to make the call; holding the
-    // state lock across an HTTP round trip would stall every socket client for
-    // its duration.
-    let rest = state.rest.clone();
-    let inner = state.lock().await;
-    let identity = inner.identity.as_ref()?;
-    // `submit_event` needs `&Identity`, and the lock guard is what keeps the
-    // reference alive. The call is awaited under the lock deliberately: the
-    // alternative is cloning key material out of `Inner` (§2.5 forbids growing
-    // the number of copies), and the daemon's clients are a handful of terminal
-    // panes rather than a request fleet.
-    let outcome = rest.submit_event(identity, event).await;
-    drop(inner);
+    // The identity is **cloned out** and the lock released before the request.
+    // Awaiting an HTTP round trip under the daemon's single mutex would stall
+    // every other socket client for its duration — including an `/event` reader
+    // whose whole job is to be prompt — and a relay that is timing out is
+    // exactly when that matters most. The clone carries the same zeroizing
+    // buffer and hand-written `Debug`, so §2.5's controls hold per copy.
+    let identity = state.identity_snapshot().await.ok()?;
+    let outcome = state.rest.submit_event(&identity, event).await;
     match outcome {
         Ok(body) => Some(crate::post::SendResponse {
             event_id: event.id.to_hex(),
@@ -1680,6 +1739,7 @@ mod tests {
             respond: Some(respond),
             local_id: Some("local-1".into()),
             asked_at: Instant::now() - PUBLISH_DEADLINE - Duration::from_secs(1),
+            last_attempt: None,
         }];
         fail_expired(&mut pending);
         assert!(pending.is_empty());
@@ -1701,6 +1761,7 @@ mod tests {
             respond: Some(respond),
             local_id: None,
             asked_at: Instant::now(),
+            last_attempt: None,
         }];
         fail_expired(&mut pending);
         assert_eq!(pending.len(), 1);
@@ -1738,5 +1799,98 @@ mod tests {
             apply_relay_event(&mut inner, &channel_sub_id(CHANNEL), &event, NOW),
             Ingested::Duplicate
         );
+    }
+    /// §2.7: a publish is retried on a **paced** interval, not once per tick.
+    /// Without the pace, a failing publish fires ~240 HTTP requests across one
+    /// deadline, at a relay that is by definition already unwell.
+    #[tokio::test]
+    async fn a_failing_publish_is_not_retried_every_tick() {
+        assert!(
+            PUBLISH_RETRY_INTERVAL > TICK * 4,
+            "the retry interval must be meaningfully slower than the loop tick"
+        );
+        // Attempts per deadline, at the paced rate. The tick-rate figure is
+        // `PUBLISH_DEADLINE / TICK` = 240, which is the number this bounds.
+        let attempts = PUBLISH_DEADLINE.as_millis() / PUBLISH_RETRY_INTERVAL.as_millis();
+        assert!(
+            attempts <= 20,
+            "{attempts} attempts per deadline is a retry storm"
+        );
+    }
+
+    /// A rate-limit `NOTICE` arms the gate with a deadline the loop can disarm.
+    ///
+    /// There is no "you-are-no-longer-rate-limited" frame in NIP-01, so nothing
+    /// on the relay side takes the gate back. Returning the deadline from
+    /// `handle_notice` is what lets the session loop restore `connected` when
+    /// the countdown the composer is showing actually reaches zero — otherwise
+    /// the daemon stays `rate_limited` on a healthy socket forever, refusing
+    /// every write against an expired countdown.
+    #[tokio::test]
+    async fn a_rate_limit_notice_carries_a_deadline_the_loop_can_disarm() {
+        let state = AppState::new(config(), None).expect("state");
+        // The relay's hint grammar is `retry in <n>s` — `parse_retry_hint`
+        // requires the bare `s` suffix (`rest.rs:145`). Spelled out here
+        // because "retry in 3 seconds" parses to `None` and falls back to the
+        // 1 s default, which is a countdown that is simply wrong rather than a
+        // visible failure.
+        let armed = handle_notice(&state, "rate-limited: retry in 3s").await;
+        let Handled::RateLimited { until } = armed else {
+            panic!("a rate-limit notice must arm the gate with a deadline");
+        };
+        let remaining = until.saturating_duration_since(Instant::now());
+        assert!(
+            remaining <= Duration::from_secs(3) && remaining > Duration::from_secs(2),
+            "expected ~3s from the relay's hint, got {remaining:?}"
+        );
+        assert!(matches!(
+            state.lock().await.session.state(),
+            ConnectionState::RateLimited { .. }
+        ));
+    }
+
+    /// A rate-limit notice with no parseable hint still arms a **bounded**
+    /// gate. An unbounded one is the same forever-armed bug by another route:
+    /// the composer would show a countdown that never reaches zero.
+    #[tokio::test]
+    async fn a_hintless_rate_limit_notice_still_arms_a_bounded_gate() {
+        let state = AppState::new(config(), None).expect("state");
+        let armed = handle_notice(&state, "rate-limited: slow down").await;
+        let Handled::RateLimited { until } = armed else {
+            panic!("a hintless rate-limit notice must still arm the gate");
+        };
+        assert!(until.saturating_duration_since(Instant::now()) <= Duration::from_secs(2));
+    }
+
+    /// A relay-supplied hint is **capped**. An uncapped one is a
+    /// relay-controlled hang: a hostile or buggy relay could park every write
+    /// behind an hour-long countdown.
+    #[tokio::test]
+    async fn a_relay_hint_cannot_park_writes_indefinitely() {
+        let state = AppState::new(config(), None).expect("state");
+        let armed = handle_notice(&state, "rate-limited: retry in 99999s").await;
+        let Handled::RateLimited { until } = armed else {
+            panic!("expected the gate to arm");
+        };
+        assert!(
+            until.saturating_duration_since(Instant::now())
+                <= Duration::from_secs(crate::rest::RETRY_IN_MAX_SECS),
+            "the hint must be capped at RETRY_IN_MAX_SECS"
+        );
+    }
+
+    /// An ordinary notice is not a gate. Arming on every `NOTICE` would refuse
+    /// writes because the relay said something conversational.
+    #[tokio::test]
+    async fn an_ordinary_notice_does_not_arm_the_gate() {
+        let state = AppState::new(config(), None).expect("state");
+        assert!(matches!(
+            handle_notice(&state, "restricted: not a member").await,
+            Handled::Continue
+        ));
+        assert!(matches!(
+            state.lock().await.session.state(),
+            ConnectionState::Disconnected
+        ));
     }
 }

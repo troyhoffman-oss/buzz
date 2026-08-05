@@ -30,12 +30,30 @@
 
 /// Emit the OpenAPI 3.1 document for the Wave-1 surface.
 ///
-/// TODO(wave1, §4.1.1 deliverable 14): derive from the handler types (utoipa or
+/// The `paths` object enumerates [`crate::api::MOUNTED_ENDPOINTS`] — what the
+/// router actually serves, not what the spec aspires to. An empty object, which
+/// is what shipped before the routes existed, tells a generated client that the
+/// daemon has no API at all; listing the mounted set means the document is
+/// *incomplete* rather than *wrong*, and a client can at least discover the
+/// surface.
+///
+/// TODO(wave1, §4.1.1 deliverable 14): derive the operation objects — request
+/// bodies, response schemas, parameters — from the handler types (utoipa or
 /// aide, per `tui-research.md`'s recommended shape) so the document cannot
 /// drift from the routes, and wire `just daemon-spec-check` to regenerate and
 /// diff. An **endpoint-not-in-spec build failure** is the required outcome, not
-/// a warning.
+/// a warning. Until then the paths are present and their operations are not,
+/// which the `x-incomplete` marker below states rather than implies.
 pub fn document() -> serde_json::Value {
+    let paths: serde_json::Map<String, serde_json::Value> = crate::api::MOUNTED_ENDPOINTS
+        .iter()
+        .map(|path| {
+            (
+                (*path).to_string(),
+                serde_json::json!({"x-incomplete": "operations are not yet derived from the handlers"}),
+            )
+        })
+        .collect();
     serde_json::json!({
         "openapi": "3.1.0",
         "info": {
@@ -43,7 +61,7 @@ pub fn document() -> serde_json::Value {
             "version": crate::VERSION,
             "x-api-version": crate::API_VERSION,
         },
-        "paths": {},
+        "paths": paths,
     })
 }
 

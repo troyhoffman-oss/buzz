@@ -151,6 +151,15 @@ pub struct SessionIdentityRequest {
 
 /// A loaded identity. The secret key is held in a zeroizing wrapper (§2.5, "In
 /// memory") and never leaves this crate.
+///
+/// `Clone` is derived deliberately rather than avoided. The instinct is that
+/// fewer copies of a secret is safer, and it is — but the alternative here is
+/// holding the daemon's single state lock across every relay round trip, which
+/// stalls every other socket client for the duration of an HTTP request. Each
+/// copy carries the same [`Zeroizing`] buffer, so it is wiped on drop, and the
+/// hand-written [`std::fmt::Debug`] below keeps every copy out of a log line.
+/// §2.5's boundary is the **process** edge, and a clone never crosses it.
+#[derive(Clone)]
 pub struct Identity {
     /// Lowercase-hex pubkey derived from the decrypted secret.
     pub pubkey: String,

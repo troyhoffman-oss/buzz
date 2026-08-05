@@ -272,6 +272,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let socket_path = config.socket.clone();
     let state = buzz_daemon::state::AppState::new(config, identity)?;
+
+    // The relay loop, and the handle every write endpoint reaches it through.
+    // Started **after** the state exists and **before** the router is built, so
+    // no request can arrive at a handler whose `state.wire` is still `None` —
+    // that would present as a spurious `503` in the first milliseconds of a
+    // daemon's life, which reads exactly like a relay outage.
+    let (wire, commands) = buzz_daemon::wire::channel();
+    let state = state.with_wire(wire);
+    let wire_state = state.clone();
+    tokio::spawn(async move {
+        buzz_daemon::wire::run(wire_state, commands).await;
+    });
+
     let app = buzz_daemon::api::router(state.clone());
 
     // The idle timer keys on **client activity**, not connection presence

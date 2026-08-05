@@ -105,6 +105,49 @@ impl Harness {
             .expect("read response");
         String::from_utf8_lossy(&response).into_owned()
     }
+
+    /// Read the body of `GET /event` up to a short quiet period.
+    ///
+    /// `read_to_end` cannot be used here and that is the point: `/event` never
+    /// closes — it is an open stream, which is what makes it the *one* push
+    /// channel. Reading until the daemon stops writing is what a real client
+    /// does with a line reader, and it is the only way to assert on a stream's
+    /// contents without asserting that it ended.
+    async fn stream_body(&self, path: &str) -> String {
+        let raw = self.stream_raw(path, "application/x-ndjson").await;
+        dechunk(raw.split("\r\n\r\n").nth(1).unwrap_or(""))
+    }
+
+    /// The full response — headers included — of a streaming request.
+    async fn stream_raw(&self, path: &str, accept: &str) -> String {
+        let mut stream = UnixStream::connect(&self.socket).await.expect("connect");
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nAccept: {accept}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .expect("write request");
+
+        let mut response = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            // The quiet period is what terminates the read: the replayed
+            // prelude arrives immediately and the live half is silent in a test
+            // with no relay, so 250 ms of nothing means the prelude is complete.
+            let read = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                stream.read(&mut buffer),
+            )
+            .await;
+            match read {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(n)) => response.extend_from_slice(&buffer[..n]),
+                Ok(Err(err)) => panic!("stream read failed: {err}"),
+            }
+        }
+        String::from_utf8_lossy(&response).into_owned()
+    }
 }
 
 fn parse_response(raw: &str) -> (u16, serde_json::Value) {
@@ -118,6 +161,45 @@ fn parse_response(raw: &str) -> (u16, serde_json::Value) {
     // parse failure — returning null keeps the assertion at the call site.
     let value = serde_json::from_str(body.trim()).unwrap_or(serde_json::Value::Null);
     (status, value)
+}
+
+/// Strip HTTP/1.1 chunked framing from a streamed body.
+///
+/// Not incidental plumbing: a body with no `Content-Length` — which is every
+/// open stream, by definition — is chunked, so `{"seq":1,…}` arrives on the
+/// wire as `1f\r\n{"seq":1,…}\n\r\n`. A test that parses the raw body sees the
+/// hex length prefix and fails with `expected value at line 1 column 1`, which
+/// reads like the daemon emitted malformed JSON rather than like the test
+/// forgot a transfer encoding. Doing it here, once, is what keeps that
+/// misdiagnosis out of every streaming assertion.
+///
+/// A hand-rolled de-chunker rather than a client library for the same reason
+/// the rest of this harness is hand-rolled: `hyper` would also hide the framing
+/// bug this exists to make visible.
+fn dechunk(body: &str) -> String {
+    let mut out = String::new();
+    let mut rest = body;
+    loop {
+        let Some((size_line, remainder)) = rest.split_once("\r\n") else {
+            // No framing at all: a short or unframed body is passed through
+            // rather than discarded, so a regression to `Content-Length` shows
+            // up as a *content* assertion failing rather than as an empty
+            // string that could mean anything.
+            out.push_str(rest);
+            break;
+        };
+        let Ok(size) = usize::from_str_radix(size_line.trim(), 16) else {
+            out.push_str(rest);
+            break;
+        };
+        if size == 0 || remainder.len() < size {
+            out.push_str(&remainder[..remainder.len().min(size)]);
+            break;
+        }
+        out.push_str(&remainder[..size]);
+        rest = remainder[size..].trim_start_matches("\r\n");
+    }
+    out
 }
 
 fn mode_of(path: &Path) -> u32 {
@@ -567,4 +649,169 @@ async fn the_idle_reset_covers_every_mounted_route() {
             "{path} did not reset the idle timer (idle_for = {after:?})"
         );
     }
+}
+
+// ── The endpoints the relay loop unblocked ─────────────────────────────────
+//
+// These bind the *whole* Wave-1 surface now that `wire.rs` exists. The
+// harness starts a daemon with **no relay loop** (`state.wire` is `None`),
+// which is exactly the interesting case: the honest answer to a write with no
+// relay is `503 relay_unreachable`, not `404`. A `404` is indistinguishable
+// from a typo'd route; a `503` names the condition and the TUI already renders
+// it with a retry (§2.7).
+
+/// Every mounted route answers *something*. A route that hangs or 500s on a
+/// bare request is worse than one that is absent, because a client cannot tell
+/// it from a wedged daemon.
+#[tokio::test]
+async fn every_mounted_read_endpoint_answers() {
+    let harness = Harness::start(None).await;
+    for path in [
+        "/health",
+        "/openapi.json",
+        "/daemon",
+        "/daemon/registry",
+        "/session",
+        "/session/identity",
+        "/channel",
+        "/read-state",
+        "/presence",
+        "/agent",
+        "/agent/fleet",
+    ] {
+        let (status, _) = harness.get(path).await;
+        assert!(
+            status < 500,
+            "{path} answered {status}; a mounted route must not 500 on a bare GET"
+        );
+    }
+}
+
+/// §2.7: a write with no relay is `503 relay_unreachable`, with the `code` the
+/// TUI switches on. This is the whole reason mounting the write endpoints is
+/// now the right call rather than the wrong one — the endpoint exists and names
+/// its own condition.
+#[tokio::test]
+async fn a_write_without_a_relay_loop_is_relay_unreachable_not_a_404() {
+    let identity = Identity::from_keys(nostr::Keys::generate(), None);
+    let harness = Harness::start(Some(identity)).await;
+    let (status, body) = harness
+        .post("/channel/3f1d9c9e-0f7a-4a2e-9b1f-2c4d5e6f7a8b/join")
+        .await;
+    assert_ne!(status, 404, "the route must be mounted");
+    assert_eq!(body["error"]["code"], "relay_unreachable", "{body}");
+}
+
+/// `daemon-api.md` §3.5: typing is **always `202`**, never an error. It is
+/// dropped rather than queued under the rate-limit gate, so an error the TUI
+/// has to handle would be an error about a frame that is allowed to vanish.
+#[tokio::test]
+async fn typing_is_always_accepted_even_with_no_relay() {
+    let identity = Identity::from_keys(nostr::Keys::generate(), None);
+    let harness = Harness::start(Some(identity)).await;
+    let (status, _) = harness
+        .post("/channel/3f1d9c9e-0f7a-4a2e-9b1f-2c4d5e6f7a8b/typing")
+        .await;
+    assert_eq!(status, 202);
+}
+
+/// §2.4: `/openapi.json` must describe what is actually mounted. An empty
+/// `paths` object tells a generated client the daemon has no API at all.
+#[tokio::test]
+async fn the_openapi_document_lists_the_mounted_paths() {
+    let harness = Harness::start(None).await;
+    let (status, body) = harness.get("/openapi.json").await;
+    assert_eq!(status, 200);
+    let paths = body["paths"].as_object().expect("paths is an object");
+    for endpoint in buzz_daemon::api::MOUNTED_ENDPOINTS {
+        assert!(
+            paths.contains_key(*endpoint),
+            "{endpoint} missing from the spec"
+        );
+    }
+}
+
+/// §4.1.1 deliverable 13: `GET /event` streams ndjson by default, and every
+/// frame already in the ring is replayed from `?since=0`.
+#[tokio::test]
+async fn the_event_stream_replays_the_ring_as_ndjson() {
+    let harness = Harness::start_with(None, |inner| {
+        inner.stream.publish(
+            "message.new",
+            serde_json::json!({"channel_id": "c", "n": 1}),
+        );
+        inner.stream.publish(
+            "message.new",
+            serde_json::json!({"channel_id": "c", "n": 2}),
+        );
+    })
+    .await;
+
+    let raw = harness.stream_body("/event?since=0").await;
+    let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(lines.len() >= 2, "expected the ring replayed, got {raw:?}");
+    let first: serde_json::Value = serde_json::from_str(lines[0]).expect("ndjson line");
+    assert_eq!(first["type"], "message.new");
+    assert_eq!(first["seq"], 1);
+    assert_eq!(first["payload"]["n"], 1);
+}
+
+/// §2.6 link A: a cursor that has aged out of the ring gets `stream.reset`
+/// **first**, so the TUI invalidates and re-fetches rather than presenting a
+/// silently gapped timeline.
+#[tokio::test]
+async fn an_aged_out_cursor_gets_stream_reset_first() {
+    let harness = Harness::start_with(None, |inner| {
+        inner.stream.publish("message.new", serde_json::json!({}));
+    })
+    .await;
+
+    // A cursor ahead of the sequence is from a previous daemon process whose
+    // numbering started over — the numbers do not refer to the same events.
+    let raw = harness.stream_body("/event?since=999999").await;
+    let first = raw.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let parsed: serde_json::Value = serde_json::from_str(first).expect("ndjson line");
+    assert_eq!(parsed["type"], "stream.reset", "{raw:?}");
+}
+
+/// The `?topic=` filter matches on the dotted namespace by prefix, so a client
+/// asking for `agent` gets `agent.frame` and `agent.metric` without
+/// enumerating them — and does not get `message.new`.
+#[tokio::test]
+async fn the_topic_filter_selects_by_dotted_prefix() {
+    let harness = Harness::start_with(None, |inner| {
+        inner.stream.publish("message.new", serde_json::json!({}));
+        inner.stream.publish("agent.frame", serde_json::json!({}));
+        inner.stream.publish("agent.metric", serde_json::json!({}));
+    })
+    .await;
+
+    let raw = harness.stream_body("/event?since=0&topic=agent").await;
+    let types: Vec<String> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v["type"].as_str().map(str::to_string))
+        .collect();
+    assert!(types.contains(&"agent.frame".to_string()), "{types:?}");
+    assert!(types.contains(&"agent.metric".to_string()), "{types:?}");
+    assert!(!types.contains(&"message.new".to_string()), "{types:?}");
+}
+
+/// SSE is content-negotiated and carries `id:` with the same `seq` the body
+/// does, so an SSE client's own `Last-Event-ID` reconnect and the daemon's
+/// `?since=` cursor are one number rather than two schemes to reconcile.
+#[tokio::test]
+async fn sse_is_negotiated_and_its_id_matches_the_body_seq() {
+    let harness = Harness::start_with(None, |inner| {
+        inner.stream.publish("message.new", serde_json::json!({}));
+    })
+    .await;
+
+    let raw = harness
+        .stream_raw("/event?since=0", "text/event-stream")
+        .await;
+    assert!(raw.contains("text/event-stream"), "{raw}");
+    assert!(raw.contains("id: 1"), "{raw}");
+    assert!(raw.contains("\"seq\":1"), "{raw}");
 }

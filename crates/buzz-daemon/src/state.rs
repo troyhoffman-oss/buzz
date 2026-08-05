@@ -84,6 +84,13 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// The relay HTTP bridge. Internally `reqwest`-pooled and `Send + Sync`.
     pub rest: Arc<RestClient>,
+    /// Handle to the relay I/O loop, once one is running.
+    ///
+    /// `None` in the keyless state and in every unit test that serves the
+    /// router without a socket. Write endpoints check it and return
+    /// `503 relay_unreachable` when it is absent, which is the honest answer:
+    /// the endpoint exists, the relay does not.
+    pub wire: Option<crate::wire::WireHandle>,
     /// When the daemon started, for `GET /health`'s uptime.
     pub started_at: std::time::Instant,
     /// Last time a client made a request, for the idle timer.
@@ -139,9 +146,34 @@ impl AppState {
             })),
             config: Arc::new(config),
             rest: Arc::new(rest),
+            wire: None,
             started_at: std::time::Instant::now(),
             last_request: Arc::new(Mutex::new(std::time::Instant::now())),
         })
+    }
+
+    /// Attach the relay loop's command handle.
+    ///
+    /// Returns a new handle rather than mutating in place: the state is cloned
+    /// into the router before the loop starts, and a mutation after that point
+    /// would be invisible to the clone axum already holds.
+    pub fn with_wire(self, wire: crate::wire::WireHandle) -> Self {
+        Self {
+            wire: Some(wire),
+            ..self
+        }
+    }
+
+    /// The relay loop's handle, or `503` when there is no loop.
+    ///
+    /// §2.7: a write while the relay is unreachable is `relay_unreachable`, the
+    /// TUI keeps the composed text, and the retry is explicit. A keyless daemon
+    /// reaches this the same way a disconnected one does, which is correct —
+    /// from the composer's point of view they are one outcome.
+    pub fn wire(&self) -> crate::Result<&crate::wire::WireHandle> {
+        self.wire
+            .as_ref()
+            .ok_or(crate::DaemonError::RelayUnreachable)
     }
 
     /// Borrow the inner state.
@@ -167,6 +199,21 @@ impl AppState {
     /// Whether an identity is loaded — `GET /health`'s `archiving` field.
     pub async fn is_archiving(&self) -> bool {
         self.lock().await.identity.is_some()
+    }
+
+    /// A cloned identity for a relay call, or `401` when the daemon is keyless.
+    ///
+    /// Cloned rather than borrowed because the alternative is holding the state
+    /// lock across an HTTP round trip, which stalls every other socket client
+    /// for its duration. The clone stays inside the process — §2.5's boundary
+    /// is the process edge — and [`Identity`]'s hand-written `Debug` keeps it
+    /// out of a log line however many copies exist.
+    pub async fn identity_snapshot(&self) -> crate::Result<Identity> {
+        self.lock()
+            .await
+            .identity
+            .clone()
+            .ok_or(crate::DaemonError::NotAuthenticated)
     }
 
     /// The health payload of §2.3 [D-1].

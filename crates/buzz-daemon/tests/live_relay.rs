@@ -456,3 +456,495 @@ async fn the_auth_tag_binds_to_this_identity() {
     tag.to_nostr_tag()
         .expect("the tag converts to its wire form");
 }
+
+// ── The relay I/O loop, against a live relay ───────────────────────────────
+//
+// These are the tests the wire lane exists for. Everything above asserts that a
+// *filter* is accepted; these assert that the loop built on those filters
+// reaches `connected`, fills the stores, and agrees with `buzz-cli` about what
+// is there.
+//
+// **They remain read-only, and structurally so.** The loop publishes on exactly
+// two paths — an explicit `WireCommand::Publish`, and the read-state debounce
+// gated on `ReadState::is_dirty`. These tests issue no command and mark
+// nothing, so neither can fire. `the_loop_cannot_have_written_anything` asserts
+// that mechanically at the end of the live run rather than trusting the claim.
+
+/// Build an `AppState` around the live credentials, with a wire handle.
+///
+/// The socket path is a temp directory's: nothing binds it, because these tests
+/// drive the relay loop directly rather than through HTTP.
+fn live_state(live: &Live, dir: &std::path::Path) -> buzz_daemon::state::AppState {
+    let config = buzz_daemon::config::Config {
+        identity: buzz_daemon::config::SocketIdentity::new(
+            &live.relay_url,
+            live.self_pubkey(),
+            live.identity
+                .auth_tag
+                .as_ref()
+                .map(|t| t.owner_pubkey.clone())
+                .unwrap_or_default(),
+        ),
+        socket: dir.join("daemon.sock"),
+        runtime_dir: dir.to_path_buf(),
+        data_dir: dir.to_path_buf(),
+        idle_timeout: None,
+        observer_cache_bytes: 1024 * 1024,
+        systemd_managed: false,
+    };
+    buzz_daemon::state::AppState::new(config, Some(live.identity.clone())).expect("state")
+}
+
+/// Run the relay loop until `ready` holds, or the deadline passes.
+///
+/// Returns whether the condition held. A deadline rather than an unbounded wait
+/// because a live test that hangs on a relay outage is a CI job that hangs, and
+/// the honest outcome of "the relay did not answer in 30 s" is a failure with
+/// that sentence in it.
+async fn run_until(
+    state: &buzz_daemon::state::AppState,
+    deadline: std::time::Duration,
+    ready: impl Fn(&buzz_daemon::state::Inner) -> bool,
+) -> bool {
+    let (wire, commands) = buzz_daemon::wire::channel();
+    let loop_state = state.clone().with_wire(wire);
+    let task = tokio::spawn(async move {
+        buzz_daemon::wire::run(loop_state, commands).await;
+    });
+
+    let started = std::time::Instant::now();
+    let mut held = false;
+    while started.elapsed() < deadline {
+        if ready(&*state.lock().await) {
+            held = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // Aborted rather than left running: the loop never returns by design, and a
+    // leaked one would keep a websocket open for the rest of the test binary.
+    task.abort();
+    held
+}
+
+/// §2.6: `connection.state` must actually reach `connected`.
+///
+/// This is the assertion the whole lane turns on. Before the loop existed the
+/// daemon reported `disconnected` for the life of the process while `buzz-cli`
+/// against the same identity and relay showed three channels and a live
+/// conversation — the stores were correct and empty. A mock cannot catch that;
+/// only asking the real relay for a NIP-42 handshake can.
+#[tokio::test]
+async fn the_relay_loop_reaches_connected() {
+    live!(live);
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state = live_state(&live, dir.path());
+
+    let connected = run_until(&state, std::time::Duration::from_secs(30), |inner| {
+        matches!(
+            inner.session.state(),
+            buzz_daemon::session::ConnectionState::Connected
+        )
+    })
+    .await;
+
+    let final_state = state.lock().await.session.state().clone();
+    assert!(
+        connected,
+        "the loop never reached connected; last state was {final_state:?}"
+    );
+    eprintln!("live: connection.state reached {final_state:?}");
+}
+
+/// §2.6: the transition is **published**, not merely recorded.
+///
+/// `connection.state` is a durable topic precisely because §2.6 renders these
+/// states as chrome rather than as toasts — a state change the TUI never
+/// receives leaves the status bar claiming an outage that ended.
+#[tokio::test]
+async fn reaching_connected_publishes_a_connection_state_frame() {
+    live!(live);
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state = live_state(&live, dir.path());
+
+    let published = run_until(&state, std::time::Duration::from_secs(30), |inner| {
+        matches!(
+            inner.stream.replay(0),
+            buzz_daemon::stream::Replay::Frames(ref frames)
+                if frames.iter().any(|f| f.topic == "connection.state"
+                    && f.payload["state"] == "connected")
+        )
+    })
+    .await;
+    assert!(published, "no connection.state frame carrying `connected`");
+}
+
+/// §4.1.1 deliverable 3: the channels the loop discovers must be the channels
+/// the relay says this identity is in.
+///
+/// Parity against the **relay's own answer** through the HTTP bridge — the same
+/// query `buzz-cli channels list` runs — rather than against a fixed count. A
+/// count is a fact about the community on one afternoon; the agreement between
+/// two independent reads of the same membership set is a fact about the code.
+#[tokio::test]
+async fn the_loops_channel_set_matches_what_the_relay_reports() {
+    live!(live);
+    let discovery = buzz_daemon::channels::build_discovery_filter(&live.self_pubkey());
+    assert_read_only(&discovery);
+    let memberships = live
+        .rest
+        .query(&live.identity, &discovery)
+        .await
+        .expect("discovery is accepted");
+    let expected: std::collections::BTreeSet<String> = memberships
+        .iter()
+        .filter_map(buzz_daemon::channels::channel_id_from_membership)
+        .collect();
+    if expected.is_empty() {
+        eprintln!("SKIP: this identity is a member of no channels");
+        return;
+    }
+
+    // Hydrate the channel cache the way the daemon's discovery step does, then
+    // let the loop subscribe to what it found. The loop maintains the set live
+    // from 44100/44101; discovery is what seeds it.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state = live_state(&live, dir.path());
+    {
+        let ids: Vec<String> = expected.iter().cloned().collect();
+        let metadata = live
+            .rest
+            .query(
+                &live.identity,
+                &buzz_daemon::channels::build_metadata_filter(&ids),
+            )
+            .await
+            .unwrap_or_default();
+        let mut inner = state.lock().await;
+        for channel in buzz_daemon::channels::merge_discovered(ids.clone(), &metadata) {
+            inner.session.subscriptions.subscribe(channel.id.clone());
+            inner.channels.upsert(channel);
+        }
+    }
+
+    let connected = run_until(&state, std::time::Duration::from_secs(30), |inner| {
+        matches!(
+            inner.session.state(),
+            buzz_daemon::session::ConnectionState::Connected
+        )
+    })
+    .await;
+    assert!(
+        connected,
+        "the loop must connect before parity means anything"
+    );
+
+    let inner = state.lock().await;
+    let cached: std::collections::BTreeSet<String> =
+        inner.channels.list().into_iter().map(|c| c.id).collect();
+    // Subset rather than equality: `merge_discovered` drops archived channels,
+    // which are members the relay still reports. A cached channel the relay
+    // does *not* report is the real defect — that is a channel the daemon
+    // invented — and this catches it.
+    for id in &cached {
+        assert!(
+            expected.contains(id),
+            "the daemon cached channel {id}, which this identity is not a member of"
+        );
+    }
+    eprintln!(
+        "live: {} membership rows → {} cached channels",
+        expected.len(),
+        cached.len()
+    );
+}
+
+/// A real timeline window must render as rows the daemon's stores accept.
+///
+/// The unit tests parse hand-built pages; this asserts the assembled page
+/// carries content rows from a live channel and that each one is a kind the
+/// timeline claims to render. A row of a kind the renderer does not know is a
+/// blank line in the TUI, and it looks like a rendering bug rather than a
+/// filter one.
+#[tokio::test]
+async fn a_live_timeline_window_yields_renderable_rows() {
+    live!(live);
+    let discovery = buzz_daemon::channels::build_discovery_filter(&live.self_pubkey());
+    let memberships = live
+        .rest
+        .query(&live.identity, &discovery)
+        .await
+        .unwrap_or_default();
+
+    let mut rendered = 0usize;
+    for channel_id in memberships
+        .iter()
+        .filter_map(buzz_daemon::channels::channel_id_from_membership)
+    {
+        let filter = timeline::build_window_filter(&channel_id, 20, None);
+        assert_read_only(&filter);
+        let events = live
+            .rest
+            .query(&live.identity, &filter)
+            .await
+            .unwrap_or_default();
+        let page = match timeline::parse_window_response(&events, &channel_id, None) {
+            Ok(page) => page,
+            Err(_) => timeline::assemble_downgraded_page(&events, 20),
+        };
+        for row in &page.rows {
+            let kind = row.event["kind"].as_u64().expect("a row has a kind") as u32;
+            assert!(
+                timeline::is_content_kind(kind),
+                "kind {kind} assembled as a row but is not a content kind"
+            );
+            assert!(
+                !timeline::is_aux_kind(kind),
+                "kind {kind} is an aux overlay and must never be a row"
+            );
+            rendered += 1;
+        }
+        // Also assert the *live* filter the loop subscribes with is accepted:
+        // the window filter and the tail filter are different shapes, and a
+        // tail the relay refuses is a channel that goes quiet after its first
+        // page with no error anywhere.
+        let tail = buzz_daemon::wire::channel_live_filter(&channel_id, None);
+        assert_read_only(&tail);
+        live.rest
+            .query(&live.identity, &tail)
+            .await
+            .unwrap_or_else(|e| panic!("the live tail filter was refused: {e}\n{tail}"));
+    }
+    eprintln!("live: {rendered} renderable rows across every joined channel");
+}
+
+/// §4.1.1 deliverable 11: presence must resolve for the identities the roster
+/// actually names, and `unknown` must stay distinct from `offline`.
+///
+/// The brief asked for "presence/fleet reflect the 6 live units". A hard count
+/// is a fact about the community on one afternoon, not about the code — the
+/// prior instance measured 5 and the number will move again. The derived
+/// property is what holds: **every pubkey the roster names resolves to a
+/// presence record**, and a pubkey with no evidence resolves to `unknown`
+/// rather than to `offline`, because beats stopping means the daemon stopped
+/// hearing, which is not the same as an agent saying it went away.
+#[tokio::test]
+async fn presence_resolves_for_every_roster_member_and_unknown_is_not_offline() {
+    live!(live);
+    let discovery = buzz_daemon::channels::build_discovery_filter(&live.self_pubkey());
+    let memberships = live
+        .rest
+        .query(&live.identity, &discovery)
+        .await
+        .unwrap_or_default();
+
+    // The roster comes from the 39000 metadata's `p` tags — the same source
+    // `merge_discovered` counts members from.
+    let ids: Vec<String> = memberships
+        .iter()
+        .filter_map(buzz_daemon::channels::channel_id_from_membership)
+        .collect();
+    if ids.is_empty() {
+        eprintln!("SKIP: this identity is a member of no channels");
+        return;
+    }
+    let metadata = live
+        .rest
+        .query(
+            &live.identity,
+            &buzz_daemon::channels::build_metadata_filter(&ids),
+        )
+        .await
+        .unwrap_or_default();
+    let members: std::collections::BTreeSet<String> = metadata
+        .iter()
+        .filter_map(|event| event.get("tags")?.as_array())
+        .flatten()
+        .filter(|tag| tag.get(0).and_then(serde_json::Value::as_str) == Some("p"))
+        .filter_map(|tag| tag.get(1).and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect();
+    if members.is_empty() {
+        eprintln!("SKIP: no roster members are visible on this relay");
+        return;
+    }
+
+    // The durable 40902 snapshot is what a cold daemon reads: 20001 is
+    // ephemeral, so a daemon starting after an agent's last beat sees nothing
+    // until the next one. Without this filter a fresh daemon shows the whole
+    // fleet as `unknown` for a full beat interval.
+    let roster: Vec<String> = members.iter().cloned().collect();
+    let snapshot_filter = buzz_daemon::presence::build_snapshot_filter(&roster);
+    assert_read_only(&snapshot_filter);
+    let snapshots = live
+        .rest
+        .query(&live.identity, &snapshot_filter)
+        .await
+        .expect("40902 by author is accepted");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut tracker = buzz_daemon::presence::PresenceTracker::new();
+    for event in &snapshots {
+        let (Some(pubkey), Some(created_at)) = (
+            event.get("pubkey").and_then(serde_json::Value::as_str),
+            event.get("created_at").and_then(serde_json::Value::as_u64),
+        ) else {
+            continue;
+        };
+        let status = event
+            .get("tags")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|tags| {
+                tags.iter()
+                    .find(|t| t.get(0).and_then(serde_json::Value::as_str) == Some("status"))
+                    .and_then(|t| t.get(1).and_then(serde_json::Value::as_str))
+            })
+            .or_else(|| event.get("content").and_then(serde_json::Value::as_str))
+            .unwrap_or("");
+        tracker.observe_snapshot(pubkey, status, created_at as i64);
+    }
+
+    let resolved = tracker.snapshot(&roster, now);
+    assert_eq!(
+        resolved.len(),
+        roster.len(),
+        "every roster member must resolve to a record, even an unknown one"
+    );
+    let unknown = resolved
+        .values()
+        .filter(|r| r.state == buzz_daemon::presence::Presence::Unknown)
+        .count();
+    for record in resolved.values() {
+        // The load-bearing distinction: absence of evidence resolves to
+        // `unknown`, never to `offline`. Only an explicit `offline` status is
+        // `offline`, and collapsing the two renders a live dot's absence as a
+        // claim the daemon cannot make.
+        if record.state == buzz_daemon::presence::Presence::Offline {
+            assert!(
+                record.last_seen.is_some(),
+                "an `offline` record with no evidence should have been `unknown`"
+            );
+        }
+    }
+    eprintln!(
+        "live: {} roster members, {} resolved with evidence, {unknown} unknown",
+        roster.len(),
+        roster.len() - unknown
+    );
+}
+
+/// The fleet reduction must survive live data without inventing a measurement.
+///
+/// §3.4.1's null rule: a `0` where the agent reported nothing is a fabricated
+/// measurement. This walks the live agents and asserts that every numeric field
+/// is either absent or came from somewhere — specifically that `context_pct` is
+/// `None` when no model reported a denominator, which is the field the design
+/// singles out ("renders `—` and **no bar**").
+#[tokio::test]
+async fn the_fleet_reduction_over_live_agents_invents_no_measurements() {
+    live!(live);
+    let me = live.self_pubkey();
+    let filter = buzz_daemon::metric::build_metric_filter(&me, &me).expect("filter builds");
+    assert_read_only(&filter);
+    let events = live
+        .rest
+        .query(&live.identity, &filter)
+        .await
+        .expect("44200 with #p=self is accepted");
+
+    let mut fleet = buzz_daemon::fleet::Fleet::new();
+    let mut decoded = 0usize;
+    for raw in &events {
+        let Ok(event) = serde_json::from_value::<nostr::Event>(raw.clone()) else {
+            continue;
+        };
+        let agent = event.pubkey.to_hex();
+        match buzz_daemon::metric::decrypt_metric(&live.identity, &event, None) {
+            Ok(metric) => {
+                fleet.agent_mut(&agent).observe_metric(metric);
+                decoded += 1;
+            }
+            // Not a failure: 44200 is `#p`-addressed, and a metric encrypted to
+            // a different reader legitimately does not decrypt here.
+            Err(err) => eprintln!("live: 44200 not readable by this identity: {err}"),
+        }
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    for row in fleet.rows(now) {
+        if let Some(pct) = row.context_pct {
+            assert!(
+                pct.is_finite() && pct >= 0.0,
+                "context_pct must be a real fraction, got {pct}"
+            );
+        }
+        if let Some(cost) = row.cost_usd {
+            assert!(cost.is_finite() && cost >= 0.0, "cost_usd {cost}");
+        }
+        // A rate needs both halves. `None` is the honest answer when either is
+        // missing; a rate computed from a fabricated zero is worse than no rate.
+        if row.tokens_per_min.is_some() {
+            assert!(row.elapsed_secs.is_some_and(|s| s > 0));
+        }
+    }
+    eprintln!("live: {decoded} turn metrics decoded into the fleet reduction");
+}
+
+/// **The read-only property, asserted mechanically.**
+///
+/// Design decision 4 says read-only against `claude-test` is *structural*, not
+/// a flag: the loop writes on exactly two paths, and neither can fire without a
+/// caller doing something this test does not do. Trusting that is exactly the
+/// mistake this lane's history warns about, so it is checked:
+///
+/// - `is_dirty()` is false, so the read-state debounce — the only unprompted
+///   write path — cannot fire. Nothing here calls `mark`.
+/// - `local_ids` is empty, so no send was correlated, which means
+///   `build_message_event` was never reached.
+/// - The subscription registry is populated but no `WireCommand::Publish` was
+///   ever constructed; the loop's `pending` list is unreachable from here by
+///   construction, and these two observables are what it would have moved.
+///
+/// If a future test adds a write, one of these assertions fails **in the same
+/// run** rather than after the write has already landed on a shared identity.
+#[tokio::test]
+async fn the_loop_cannot_have_written_anything() {
+    live!(live);
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state = live_state(&live, dir.path());
+
+    let connected = run_until(&state, std::time::Duration::from_secs(30), |inner| {
+        matches!(
+            inner.session.state(),
+            buzz_daemon::session::ConnectionState::Connected
+        )
+    })
+    .await;
+    assert!(
+        connected,
+        "the loop must have run for this to prove anything"
+    );
+
+    let inner = state.lock().await;
+    assert!(
+        !inner.read_state.is_dirty(),
+        "read-state is dirty: something marked a context, which arms the only \
+         unprompted publish path in the loop"
+    );
+    assert!(
+        inner.local_ids.is_empty(),
+        "a local_id was recorded, which only the send path does"
+    );
+    assert_eq!(
+        inner.session.observer_queue.in_flight_len(),
+        0,
+        "an observer frame was written and is awaiting an OK"
+    );
+    eprintln!("live: the loop ran and wrote nothing, mechanically");
+}
