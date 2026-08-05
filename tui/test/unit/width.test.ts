@@ -39,6 +39,21 @@ describe("displayWidth", () => {
     expect(displayWidth("💯")).toBe(2);
   });
 
+  test("⚡ is Wide, not Ambiguous — the agent-working marker", () => {
+    // U+26A1 is `eaw=W` in UAX #11, which is not a policy choice the way the
+    // Ambiguous set above is: every terminal advances two cells for it.
+    //
+    // It was missing from the table for three milestones, and the cost was not
+    // a rounding error. `⚡` rides the channel-list and fleet status suffixes —
+    // exactly the rows §3's list-row rule works hardest to keep intact — so a
+    // row measured one column short overflowed the pane, the terminal wrapped
+    // it, and `⚡claude-1 goose-1` rendered as `⚡claude-1 goose-` with a bare
+    // `1` alone on the next line. Visible in the M1, M2 and M3 captures at both
+    // widths, and read as a layout bug rather than a measurement one.
+    expect(displayWidth("⚡")).toBe(2);
+    expect(displayWidth("⚡claude-1")).toBe(10);
+  });
+
   test("a ZWJ sequence counts once, not once per code point", () => {
     expect(displayWidth("\u{1F468}‍\u{1F4BB}")).toBe(2);
     expect(graphemes("\u{1F468}‍\u{1F4BB}")).toHaveLength(1);

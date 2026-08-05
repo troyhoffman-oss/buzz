@@ -47,6 +47,12 @@
  */
 const WIDE_RANGES: ReadonlyArray<readonly [number, number]> = [
   [0x1100, 0x115f], // Hangul Jamo init. consonants
+  // U+26A1 HIGH VOLTAGE SIGN — `eaw=W`, the agent-working marker. Kept in
+  // lockstep with `src/render/width.ts`: that module's header states the two
+  // tables must stay identical, "what stops the doc gate and the renderer
+  // disagreeing about what 120 columns means". Omitting it here would let a
+  // mock measure 120 while the app draws 121 and wraps.
+  [0x26a1, 0x26a1],
   [0x2e80, 0x303e], // CJK Radicals, Kangxi, CJK Symbols
   [0x3041, 0x33ff], // Hiragana, Katakana, Bopomofo, CJK Compatibility
   [0x3400, 0x4dbf], // CJK Unified Ideographs Extension A

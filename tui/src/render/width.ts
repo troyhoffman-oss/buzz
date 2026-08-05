@@ -32,9 +32,23 @@
  * design's mocks are drawn against and the one `scripts/check-mocks.ts`
  * measures. Keeping the two tables identical is what stops the doc gate and the
  * renderer disagreeing about what 120 columns means.
+ *
+ * **`W` is not the same as `A`, and the distinction is load-bearing.** The
+ * ambiguous set above is a *policy choice*; the Wide set is not negotiable —
+ * every terminal advances two cells for it. Missing one is not a rounding
+ * error: the row overflows the pane, the terminal wraps it, and the tail lands
+ * on the next line. Measured in the dogfood captures as a bare `1` on its own
+ * row under `⚡claude-1 goose-`, at both 120 and 60 columns and in the M1
+ * captures too, so it predates this pass by three milestones.
  */
 const WIDE_RANGES: ReadonlyArray<readonly [number, number]> = [
   [0x1100, 0x115f],
+  // U+26A1 HIGH VOLTAGE SIGN — `eaw=W`. The agent-working marker `⚡`, which
+  // rides the channel-list and fleet status suffixes, i.e. the rows §3's
+  // list-row rule works hardest to keep intact. It is the one glyph in the
+  // design's whole set that is Wide and was absent here; `♥ ● ▏ ─ │ ⊙` are
+  // `A` and correctly stay at width 1 under the Latin policy.
+  [0x26a1, 0x26a1],
   [0x2e80, 0x303e],
   [0x3041, 0x33ff],
   [0x3400, 0x4dbf],
