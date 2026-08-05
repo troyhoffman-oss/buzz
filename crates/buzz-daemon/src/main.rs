@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use buzz_daemon::config::{
     Config, SocketIdentity, DEFAULT_IDLE_TIMEOUT, DEFAULT_OBSERVER_CACHE_BYTES,
@@ -21,6 +21,10 @@ use buzz_daemon::{identity, socket};
 #[derive(Debug, Parser)]
 #[command(name = "buzz-daemon", version, about)]
 struct Cli {
+    /// One-shot identity provisioning (§2.5). Absent means "serve".
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Socket path to bind. Normally derived from the (relay, identity) tuple
     /// (§2.2) and passed by the TUI; an explicit path is for the `ssh -L`
     /// forward case of §6.5.
@@ -30,6 +34,16 @@ struct Cli {
     /// Relay websocket URL. Part of the socket-path preimage (§2.2).
     #[arg(long)]
     relay: Option<String>,
+
+    /// Pubkey (or `<pubkey8>` prefix) of a provisioned identity.
+    ///
+    /// Resolves to `~/.local/share/buzz/identity/<pubkey8>.ncryptsec` and its
+    /// `.authtag` sibling. This is the flag the TUI passes, and it exists so
+    /// the front end never has to know the on-disk identity layout — §6.4 puts
+    /// that knowledge in this crate, and a TUI spelling out the path would be
+    /// a second implementation of it to keep in agreement.
+    #[arg(long, conflicts_with_all = ["identity_ncryptsec", "auth_tag_file"])]
+    identity: Option<String>,
 
     /// Path to the NIP-49 `ncryptsec` identity blob. **The path is on argv
     /// because it is not a secret**; the passphrase is not (§2.5).
@@ -79,6 +93,63 @@ struct Cli {
     detach: bool,
 }
 
+/// One-shot subcommands. Each runs, prints one JSON object, and exits — none of
+/// them binds a socket or contacts a relay.
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Provision an identity at rest (§2.5, "`buzz-tui identity import` — one
+    /// shot, writes an ncryptsec to disk, then uses path 1").
+    ///
+    /// The request arrives as **one JSON line on stdin** and the response is
+    /// one JSON object on stdout carrying a pubkey and a path — never key
+    /// material. Nothing secret is on argv, per §2.5's opening rule.
+    Identity {
+        /// What to do.
+        #[command(subcommand)]
+        action: IdentityAction,
+    },
+
+    /// Print the socket, lock, and pidfile paths for a (relay, identity) pair.
+    ///
+    /// §2.2 derives them from
+    /// `sha256(relay_url + ":" + pubkey + ":" + auth_tag_owner)[0..16]`, where
+    /// `auth_tag_owner` is the owner pubkey **parsed out of a NIP-OA tag**. The
+    /// TUI needs the socket path before any daemon is running, and §6.4 keeps
+    /// tag parsing out of the front end — so it asks for the answer here rather
+    /// than reimplementing the derivation. Two implementations of one hash is
+    /// how a client and a daemon end up on two sockets for one identity, which
+    /// is the double-daemon §2.3's lock exists to prevent.
+    ///
+    /// Costs no scrypt: the auth tag is read and verified, the blob is not
+    /// opened, so this is a few milliseconds and safe to call on every launch.
+    SocketPath {
+        /// Relay websocket URL.
+        #[arg(long)]
+        relay: String,
+        /// Pubkey (or `<pubkey8>` prefix) of a provisioned identity.
+        #[arg(long)]
+        identity: String,
+    },
+}
+
+/// Identity subcommands.
+#[derive(Debug, Subcommand)]
+enum IdentityAction {
+    /// Read `{"mode":"create"|"import", …}` from stdin, write the blob, print
+    /// `{"pubkey", "ncryptsec_path", "created"}`.
+    Provision,
+    /// Print `{"identities": ["<pubkey8>", …]}` for the identity directory.
+    ///
+    /// This is how the TUI decides whether it is a first run: an empty list
+    /// with no configured community *is* the brand-new-user state, and it is
+    /// read from the daemon rather than guessed from the TUI's own config, so
+    /// an operator who provisioned on another front end is not re-onboarded.
+    List,
+    /// Read `{"pubkey", "tag"}` from stdin and store the NIP-OA auth tag beside
+    /// that identity's blob (§2.5).
+    SetAuthTag,
+}
+
 /// `socket::bind` calls `tokio::net::UnixListener::bind`, which **panics**
 /// without a reactor ("there is no reactor running"). A synchronous `main` made
 /// every real invocation abort at the bind — exit 101, a panic message, and a
@@ -97,8 +168,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // §2.5: there is no environment-variable path. The daemon reads the
     // variable only to refuse it, *before* anything binds — a refusal after a
-    // listener is up would leave a half-started daemon behind.
+    // listener is up would leave a half-started daemon behind. It runs ahead of
+    // the subcommand dispatch too: provisioning is exactly when a stray
+    // `BUZZ_PRIVATE_KEY` would be most tempting to honour.
     identity::refuse_env_key_paths()?;
+
+    if let Some(command) = &cli.command {
+        return run_command(command);
+    }
 
     // The identity flags parse but are not yet honoured (deliverable 2). Refuse
     // them rather than accepting them silently: §2.5 makes "keyless" a visible
@@ -225,6 +302,153 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Run a one-shot subcommand: read stdin, write one JSON line, exit.
+///
+/// Synchronous on purpose. Provisioning runs scrypt at log-n 18 (~256 MiB,
+/// hundreds of milliseconds), and the argument for `spawn_blocking` in the
+/// serving path — that it would wedge every other socket client — does not
+/// apply to a process whose only job is this one call. Putting it on the async
+/// runtime anyway would suggest a concurrency story that does not exist.
+fn run_command(command: &Command) -> Result<(), Box<dyn std::error::Error>> {
+    use buzz_daemon::provision;
+
+    let identity_dir = buzz_daemon::config::identity_dir()?;
+
+    match command {
+        Command::Identity {
+            action: IdentityAction::Provision,
+        } => {
+            // One line, so a caller can pipe a request without deciding when to
+            // close stdin — which matters because the TUI writes this from a
+            // key handler and a half-closed pipe would hang the wizard.
+            let request: provision::ProvisionRequest = serde_json::from_str(&read_stdin_line()?)?;
+            let outcome = provision::provision(&request, &identity_dir)?;
+            println!("{}", serde_json::to_string(&outcome)?);
+        }
+        Command::Identity {
+            action: IdentityAction::List,
+        } => {
+            let identities = provision::provisioned_identities(&identity_dir);
+            println!(
+                "{}",
+                serde_json::json!({
+                    "identities": identities,
+                    "identity_dir": identity_dir.display().to_string(),
+                })
+            );
+        }
+        Command::Identity {
+            action: IdentityAction::SetAuthTag,
+        } => {
+            #[derive(serde::Deserialize)]
+            struct SetAuthTag {
+                pubkey: String,
+                tag: String,
+            }
+            let request: SetAuthTag = serde_json::from_str(&read_stdin_line()?)?;
+            let path = provision::write_auth_tag(&identity_dir, &request.pubkey, &request.tag)?;
+            println!(
+                "{}",
+                serde_json::json!({"auth_tag_path": path.display().to_string()})
+            );
+        }
+        Command::SocketPath { relay, identity } => {
+            let runtime_dir = buzz_daemon::config::runtime_dir()?;
+            let socket_identity = SocketIdentity::new(
+                relay.clone(),
+                resolve_full_pubkey(&identity_dir, identity)?,
+                auth_tag_owner(&identity_dir, identity)?,
+            );
+            println!(
+                "{}",
+                serde_json::json!({
+                    "socket": socket_identity.socket_path(&runtime_dir).display().to_string(),
+                    "lock": socket_identity.lock_path(&runtime_dir).display().to_string(),
+                    "pidfile": socket_identity.pidfile_path(&runtime_dir).display().to_string(),
+                    "runtime_dir": runtime_dir.display().to_string(),
+                })
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The **full** pubkey behind a `<pubkey8>` stem or a full pubkey.
+///
+/// The socket preimage takes the full pubkey (§2.2) and the blob's filename
+/// carries eight characters of it, so a stem is expanded through the `.pub`
+/// sidecar [`buzz_daemon::provision::pubkey_path_for`] writes. NIP-49 is
+/// ciphertext, so the sidecar is the only place the remaining 56 characters
+/// exist without the passphrase.
+///
+/// A stem with no readable sidecar is an **error**, not a fallback: a socket
+/// path derived from a truncated preimage names a daemon that looks right and
+/// shares nothing with the real one, which is worse than refusing to launch.
+fn resolve_full_pubkey(
+    identity_dir: &std::path::Path,
+    pubkey: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use buzz_daemon::provision::{is_pubkey, pubkey_path_for};
+
+    if is_pubkey(pubkey) {
+        return Ok(pubkey.to_string());
+    }
+    let sidecar = pubkey_path_for(identity_dir, pubkey);
+    match std::fs::read_to_string(&sidecar) {
+        Ok(full) if is_pubkey(full.trim()) => Ok(full.trim().to_string()),
+        _ => Err(format!(
+            "cannot resolve {pubkey} to a full pubkey: {} is missing or malformed. \
+             Pass the full 64-character pubkey, or re-provision this identity.",
+            sidecar.display()
+        )
+        .into()),
+    }
+}
+
+/// The NIP-OA owner pubkey for an identity, or `""` when it has no auth tag.
+///
+/// Verified rather than trusted: `AuthTag::load` runs `verify_auth_tag`, so a
+/// tag naming an owner it cannot prove does not silently change which socket
+/// this identity lands on. A malformed tag is an error rather than an empty
+/// owner, because falling back to `""` would move a tagged identity onto the
+/// untagged socket — two effective identities on one cache, which §2.2 names.
+fn auth_tag_owner(
+    identity_dir: &std::path::Path,
+    pubkey: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let path = identity::authtag_path_for(identity_dir, pubkey);
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    identity::assert_secret_file_is_private(&path)?;
+    let raw = std::fs::read_to_string(&path)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let parsed = nostr::PublicKey::from_hex(pubkey)?;
+    Ok(identity::AuthTag::load(raw.trim(), &parsed, now)?.owner_pubkey)
+}
+
+/// Read exactly one line from stdin.
+///
+/// The same shape as [`identity::read_passphrase_from_stdin`] and for the same
+/// reason: the line may carry a secret, so it is read once and not echoed.
+/// Unlike that function this one does not zeroize, because `serde_json` will
+/// copy the fields out into owned `String`s the moment it parses — a zeroizing
+/// buffer here would protect one copy of three and imply a guarantee this path
+/// does not make. The real guarantee is process lifetime: this binary parses,
+/// seals, and exits.
+fn read_stdin_line() -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    if line.trim().is_empty() {
+        return Err("expected one JSON request on stdin".into());
+    }
+    Ok(line)
+}
+
 /// Load the identity from whichever of §2.5's three intake paths was requested.
 ///
 /// Returns `None` when no identity source was given, which is the keyless state
@@ -234,7 +458,35 @@ async fn load_identity(
 ) -> Result<Option<buzz_daemon::identity::Identity>, Box<dyn std::error::Error>> {
     use buzz_daemon::identity::{CredentialSource, IntakePath};
 
-    let Some(ncryptsec_path) = cli.identity_ncryptsec.clone() else {
+    // `--identity <pubkey>` resolves the on-disk layout here rather than in the
+    // caller (§6.4): the TUI passes a pubkey and never learns that identities
+    // are `<pubkey8>.ncryptsec` with an `.authtag` sibling.
+    let (resolved_ncryptsec, resolved_auth_tag) = match cli.identity.as_deref() {
+        Some(pubkey) => {
+            let dir = buzz_daemon::config::identity_dir()?;
+            // Both a stem and a full pubkey name the same blob (the path helper
+            // truncates), so no expansion is needed *here* — but the socket
+            // preimage below does need the full one, and resolving once keeps
+            // the two from disagreeing about which identity is being served.
+            let blob = identity::ncryptsec_path_for(&dir, pubkey);
+            if !blob.exists() {
+                // Naming the directory is what makes this actionable: the
+                // common cause is a pubkey typo, and the second is a
+                // `$HOME`/`XDG_DATA_HOME` that differs from the one
+                // provisioning wrote under.
+                return Err(format!(
+                    "no provisioned identity for {pubkey}: {} does not exist",
+                    blob.display()
+                )
+                .into());
+            }
+            let tag = identity::authtag_path_for(&dir, pubkey);
+            (Some(blob), tag.exists().then_some(tag))
+        }
+        None => (cli.identity_ncryptsec.clone(), cli.auth_tag_file.clone()),
+    };
+
+    let Some(ncryptsec_path) = resolved_ncryptsec else {
         // A passphrase source with no blob to decrypt is a misconfiguration
         // that would otherwise start a keyless daemon looking like a keyed one.
         if cli.passphrase_stdin
@@ -292,7 +544,7 @@ async fn load_identity(
         _ => return Err("give exactly one passphrase source".into()),
     };
 
-    let auth_tag = match cli.auth_tag_file.as_ref() {
+    let auth_tag = match resolved_auth_tag.as_ref() {
         Some(path) => {
             buzz_daemon::identity::assert_secret_file_is_private(path)?;
             Some(std::fs::read_to_string(path)?.trim().to_string())

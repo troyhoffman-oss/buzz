@@ -40,8 +40,10 @@
 //! [`lifecycle`] (§2.2/§2.3 registry, cap, idle timer), [`redact`] (§2.5
 //! redactor superset), [`cache`] (§4.1.1-3 SQLite), [`cursor`] ([D-6]),
 //! [`error`] (§2.4 error model), [`rest`] (the relay's NIP-98 HTTP bridge,
-//! re-exported as `session::RestClient`), and [`api`] (the HTTP routes
-//! themselves).
+//! re-exported as `session::RestClient`), [`provision`] (§2.5's one-shot
+//! `identity create` / `identity import`, which exists here rather than in the
+//! TUI because every step of it is protocol work §6.4 forbids the front end
+//! from holding), and [`api`] (the HTTP routes themselves).
 
 pub mod api;
 pub mod askcard;
@@ -59,6 +61,7 @@ pub mod observer;
 pub mod openapi;
 pub mod post;
 pub mod presence;
+pub mod provision;
 pub mod readstate;
 pub mod redact;
 pub mod rest;
