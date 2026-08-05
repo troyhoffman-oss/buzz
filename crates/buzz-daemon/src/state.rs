@@ -184,6 +184,28 @@ impl AppState {
             .ok_or(crate::DaemonError::RelayUnreachable)
     }
 
+    /// The relay loop's handle, **gated on the connection state** (§2.7).
+    ///
+    /// What every write path should call. [`Self::wire`] only asks whether a
+    /// loop exists, which is true in every connection state — `main` attaches a
+    /// handle unconditionally before the router is built — so six of the seven
+    /// write endpoints reached `WireHandle::publish` with no state check at all.
+    /// `publish` awaits its oneshot bare and there is no timeout layer above the
+    /// router, so a write during an outage blocked the HTTP request for the full
+    /// `PUBLISH_DEADLINE` and *then* answered `503`, rather than failing
+    /// immediately with the state's own error code. During `RateLimited` it did
+    /// not fail at all: the socket is up, so the publish went out over the
+    /// bridge and the gate was bypassed.
+    ///
+    /// [`Self::wire`] stays for the one caller that has already checked
+    /// (`send_message`, which must check the mention cap *first* so a capped
+    /// message is not told about the relay before it is told about the cap).
+    pub async fn writable_wire(&self) -> crate::Result<&crate::wire::WireHandle> {
+        let handle = self.wire()?;
+        crate::post::check_writable(self.lock().await.session.state())?;
+        Ok(handle)
+    }
+
     /// Borrow the inner state.
     pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, Inner> {
         self.inner.lock().await
@@ -275,6 +297,75 @@ mod tests {
         let identity = Identity::from_keys(nostr::Keys::generate(), None);
         let state = AppState::new(config(None), Some(identity)).unwrap();
         assert!(state.health().await.archiving);
+    }
+
+    /// **M3 regression.** A write must be refused by *state*, not only by the
+    /// absence of a loop.
+    ///
+    /// `wire()` asks whether a handle exists, and `main` attaches one
+    /// unconditionally before the router is built — so it succeeds in every
+    /// connection state. Six of the seven write endpoints called it directly.
+    /// While disconnected that meant the request blocked for the full
+    /// `PUBLISH_DEADLINE` and *then* answered `503`, instead of failing
+    /// immediately with the state's own code; while `RateLimited` the socket is
+    /// up, so the write went out over the bridge and the gate was bypassed
+    /// entirely.
+    ///
+    /// The distinction that matters to the TUI is which `code` comes back:
+    /// `not_authenticated` sends the operator to `:login`, `rate_limited`
+    /// carries a countdown, and `relay_unreachable` says keep the text and
+    /// retry. Collapsing them is the §1.3-property-3 failure by name.
+    #[tokio::test]
+    async fn writable_wire_refuses_on_state_not_only_on_a_missing_loop() {
+        let identity = Identity::from_keys(nostr::Keys::generate(), None);
+        let (handle, _commands) = crate::wire::channel();
+        let state = AppState::new(config(None), Some(identity))
+            .unwrap()
+            .with_wire(handle);
+
+        // A loop exists, so `wire()` succeeds in every state below. That is
+        // exactly why it was the wrong gate.
+        assert!(state.wire().is_ok());
+
+        for (next, expected) in [
+            (
+                crate::session::ConnectionState::Disconnected,
+                "relay_unreachable",
+            ),
+            (
+                crate::session::ConnectionState::AuthFailed {
+                    reason: "bad sig".into(),
+                },
+                "not_authenticated",
+            ),
+            (
+                crate::session::ConnectionState::RateLimited {
+                    retry_after_ms: 4_000,
+                },
+                "rate_limited",
+            ),
+        ] {
+            state.lock().await.session.transition(next);
+            let err = state
+                .writable_wire()
+                .await
+                .expect_err("a write must be refused in this state");
+            assert_eq!(
+                crate::error::ErrorBody::from(&err).code,
+                expected,
+                "the TUI branches on `code`, so each state must keep its own"
+            );
+        }
+
+        state
+            .lock()
+            .await
+            .session
+            .transition(crate::session::ConnectionState::Connected);
+        assert!(
+            state.writable_wire().await.is_ok(),
+            "a connected daemon must still be able to write"
+        );
     }
 
     /// §2.5: a derived `Debug` would reach the identity's key bytes, and one

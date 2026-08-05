@@ -71,6 +71,37 @@ pub struct SendResponse {
     pub local_id: Option<String>,
 }
 
+/// Reject **any** write the connection state cannot carry (§2.7).
+///
+/// Split out of [`check_sendable`] because it applies to every write, not only
+/// to a message: answering an ask card, joining, leaving, reacting, creating a
+/// channel, and steering an agent are all publishes, and all six reached
+/// `WireHandle::publish` with no state check at all.
+///
+/// What that cost, concretely. `WireHandle::publish` awaits its oneshot bare and
+/// there is no timeout layer above the router, so while the loop is
+/// `Disconnected`/`Reconnecting`/`AuthFailed` — states in which `session_loop`
+/// is not running and `drain_publishes` is therefore never reached — the request
+/// blocked for the full `PUBLISH_DEADLINE` of 30 s and *then* answered `503`,
+/// instead of the immediate `401 not_authenticated` this function produces and
+/// that §1.3 property 3 requires to stay distinct with its `:login` remedy.
+/// While `RateLimited` it was worse: the socket is up, so the write went out
+/// over the bridge and the gate was bypassed entirely, with no `retry_after_ms`
+/// countdown reaching the composer.
+pub fn check_writable(state: &ConnectionState) -> Result<()> {
+    match state {
+        ConnectionState::Connected => Ok(()),
+        ConnectionState::RateLimited { retry_after_ms } => Err(DaemonError::RateLimited {
+            retry_after_ms: *retry_after_ms,
+        }),
+        ConnectionState::AuthFailed { .. } => Err(DaemonError::NotAuthenticated),
+        // Every other state is "the relay is not there right now". They are
+        // distinct on the *status* surface (§2.6 renders each one differently),
+        // but for a write they are one outcome: it did not go, keep the text.
+        _ => Err(DaemonError::RelayUnreachable),
+    }
+}
+
 /// Reject a send that cannot succeed, **before** it is signed (§2.7).
 ///
 /// Order matters. The cap is checked first because it is a property of the
@@ -86,17 +117,7 @@ pub fn check_sendable(request: &SendRequest, state: &ConnectionState) -> Result<
         requested: e.requested,
     })?;
 
-    match state {
-        ConnectionState::Connected => Ok(()),
-        ConnectionState::RateLimited { retry_after_ms } => Err(DaemonError::RateLimited {
-            retry_after_ms: *retry_after_ms,
-        }),
-        ConnectionState::AuthFailed { .. } => Err(DaemonError::NotAuthenticated),
-        // Every other state is "the relay is not there right now". They are
-        // distinct on the *status* surface (§2.6 renders each one differently),
-        // but for a write they are one outcome: it did not go, keep the text.
-        _ => Err(DaemonError::RelayUnreachable),
-    }
+    check_writable(state)
 }
 
 /// Build and sign a channel message (§4.1 scope: channels/threads/posting).

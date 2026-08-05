@@ -815,3 +815,91 @@ async fn sse_is_negotiated_and_its_id_matches_the_body_seq() {
     assert!(raw.contains("id: 1"), "{raw}");
     assert!(raw.contains("\"seq\":1"), "{raw}");
 }
+
+/// **M3 regression.** [D-5]'s "announce, **then** end" must actually end.
+///
+/// The `Lagged` arm used to emit `stream.overflow`, set `high_water = u64::MAX`,
+/// and carry a comment asserting the next poll would return `None` because "the
+/// closed channel ends the stream". That premise is false: the broadcast
+/// `Sender` lives in `Inner.stream` for the life of the process, so
+/// `RecvError::Closed` — the only `return None` path — is unreachable while the
+/// daemon runs. What happened instead was that `prelude` was exhausted, `recv()`
+/// kept succeeding, and every frame failed `seq <= u64::MAX`, so the loop
+/// `continue`d forever: the reader got exactly one overflow line and then a
+/// connection that stayed open, consumed every subsequent frame, and emitted
+/// nothing ever again — indistinguishable from a quiet relay, which is the
+/// "looks alive while it is dead" failure [D-5] exists to prevent.
+///
+/// The assertion is therefore on the **close**, not on the announcement: an
+/// announcement followed by a live connection is precisely the bug.
+///
+/// Nothing exercised this path before, because reaching it needs more than
+/// `EVENT_BROADCAST_CAPACITY` frames published while a reader is stalled, and
+/// every other streaming test publishes fewer than five.
+#[tokio::test]
+async fn an_overflowed_reader_is_disconnected_rather_than_silently_stalled() {
+    let harness = Harness::start(None).await;
+
+    let mut stream = UnixStream::connect(&harness.socket).await.expect("connect");
+    stream
+        .write_all(
+            b"GET /event HTTP/1.1\r\nHost: localhost\r\nAccept: application/x-ndjson\r\n\r\n",
+        )
+        .await
+        .expect("write request");
+
+    // Read the headers so the handler has certainly subscribed before the
+    // flood: publishing first would age the frames out of the ring instead of
+    // lagging the receiver, which is a different path.
+    let mut head = [0u8; 512];
+    tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut head))
+        .await
+        .expect("headers arrive")
+        .expect("headers read");
+
+    // Overrun the broadcast buffer without reading a byte of the body.
+    {
+        let mut inner = harness.state.lock().await;
+        for n in 0..(buzz_daemon::stream::EVENT_BROADCAST_CAPACITY * 2) {
+            inner
+                .stream
+                .publish("message.new", serde_json::json!({"n": n}));
+        }
+    }
+
+    // Read until the body ends. **The terminating chunk is the signal, not a
+    // socket close.** `/event` is chunked by definition (no `Content-Length` —
+    // it never has a known length), and HTTP/1.1 keep-alive means hyper may
+    // hold the connection open for a subsequent request after the body is
+    // complete. Asserting on close therefore fails against a *correct* server,
+    // which is what the first draft of this test did — and the misdiagnosis it
+    // invites ("the fix does not work") costs far more than these two lines.
+    let mut body = Vec::new();
+    let mut buffer = [0u8; 8192];
+    let ended = loop {
+        if body.ends_with(b"0\r\n\r\n") {
+            break true;
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buffer))
+            .await
+        {
+            // A close is also a legitimate end of body.
+            Ok(Ok(0)) | Ok(Err(_)) => break true,
+            Ok(Ok(n)) => body.extend_from_slice(&buffer[..n]),
+            // Ten seconds of nothing with the body unterminated: the connection
+            // is open and mute, which is the defect this test exists for.
+            Err(_) => break false,
+        }
+    };
+
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("stream.overflow"),
+        "the loss must be announced, not silent: {text:?}"
+    );
+    assert!(
+        ended,
+        "the stream must end after announcing overflow; a body that never \
+         terminates is indistinguishable from a quiet relay"
+    );
+}

@@ -571,7 +571,7 @@ async fn answer_ask(
         &agent,
         &answer.indices,
     )?;
-    let response = state.wire()?.publish(event, None).await?;
+    let response = state.writable_wire().await?.publish(event, None).await?;
     // Closed only after the relay accepted it: closing on send would clear the
     // card while the agent is still blocked, and the operator would have no
     // affordance left to answer with.
@@ -592,7 +592,9 @@ async fn join_channel(
     let identity = state.identity_snapshot().await?;
     let event = identity
         .sign_event(buzz_sdk::build_join(uuid).map_err(|e| DaemonError::Sdk(e.to_string()))?)?;
-    Ok(Json(state.wire()?.publish(event, None).await?))
+    Ok(Json(
+        state.writable_wire().await?.publish(event, None).await?,
+    ))
 }
 
 async fn leave_channel(
@@ -603,7 +605,9 @@ async fn leave_channel(
     let identity = state.identity_snapshot().await?;
     let event = identity
         .sign_event(buzz_sdk::build_leave(uuid).map_err(|e| DaemonError::Sdk(e.to_string()))?)?;
-    Ok(Json(state.wire()?.publish(event, None).await?))
+    Ok(Json(
+        state.writable_wire().await?.publish(event, None).await?,
+    ))
 }
 
 /// `POST /channel` — create a channel.
@@ -663,7 +667,7 @@ async fn create_channel(
     )
     .map_err(|e| DaemonError::Sdk(e.to_string()))?;
     let event = identity.sign_event(builder)?;
-    let response = state.wire()?.publish(event, None).await?;
+    let response = state.writable_wire().await?.publish(event, None).await?;
     Ok(Json(serde_json::json!({
         "channel_id": channel_id.to_string(),
         "event_id": response.event_id,
@@ -833,7 +837,9 @@ async fn react(
     let builder = buzz_sdk::build_reaction(event_id, &request.emoji)
         .map_err(|e| DaemonError::Sdk(e.to_string()))?;
     let event = identity.sign_event(builder)?;
-    Ok(Json(state.wire()?.publish(event, None).await?))
+    Ok(Json(
+        state.writable_wire().await?.publish(event, None).await?,
+    ))
 }
 
 /// `GET /message/{id}/reaction` — grouped reactions over the aux overlay.
@@ -1226,7 +1232,9 @@ async fn agent_control(
     )
     .map_err(|e| DaemonError::Sdk(e.to_string()))?;
     let event = identity.sign_event(builder)?;
-    Ok(Json(state.wire()?.publish(event, None).await?))
+    Ok(Json(
+        state.writable_wire().await?.publish(event, None).await?,
+    ))
 }
 
 // ── The event stream ───────────────────────────────────────────────────────
@@ -1313,15 +1321,41 @@ async fn event_stream(
         }
     }
 
+    // The receiver is an `Option` so that [D-5]'s "announce, **then** end" has
+    // a state to end *in*. It used to be a bare receiver, with the overflow arm
+    // setting `high_water = u64::MAX` and a comment claiming the next poll would
+    // return `None` because "the closed channel ends the stream". That premise
+    // is false: the broadcast `Sender` lives in `Inner.stream` (`state.rs:150`)
+    // for the whole life of the process, so `RecvError::Closed` — the only
+    // `return None` path — is unreachable while the daemon runs. What actually
+    // happened was that `prelude` was exhausted, `recv()` kept succeeding, and
+    // every frame failed `seq <= u64::MAX`, so the loop `continue`d forever: the
+    // reader got exactly one `stream.overflow` line and then a connection that
+    // stayed open, consumed every subsequent frame, and emitted nothing ever
+    // again. From the TUI that is indistinguishable from a quiet relay — the
+    // precise "looks alive while it is dead" failure [D-5] exists to prevent,
+    // reached through the mechanism meant to prevent it.
     let body = futures_util::stream::unfold(
-        (receiver, prelude.into_iter(), high_water, topics, encoding),
-        |(mut receiver, mut prelude, high_water, topics, encoding)| async move {
+        (
+            Some(receiver),
+            prelude.into_iter(),
+            high_water,
+            topics,
+            encoding,
+        ),
+        |(receiver, mut prelude, high_water, topics, encoding)| async move {
             if let Some(line) = prelude.next() {
                 return Some((
                     Ok::<_, std::convert::Infallible>(bytes::Bytes::from(line)),
                     (receiver, prelude, high_water, topics, encoding),
                 ));
             }
+            // `None` is the terminal state the overflow arm moves into: the
+            // announcement was the last frame, and this is where the stream
+            // actually ends. Dropping the receiver here also releases the
+            // broadcast slot, so the sender stops paying fan-out cost for a
+            // reader that can never emit again.
+            let mut receiver = receiver?;
             loop {
                 match receiver.recv().await {
                     Ok(frame) => {
@@ -1333,7 +1367,7 @@ async fn event_stream(
                         }
                         return Some((
                             Ok(bytes::Bytes::from(encoding.encode(&frame))),
-                            (receiver, prelude, high_water, topics, encoding),
+                            (Some(receiver), prelude, high_water, topics, encoding),
                         ));
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
@@ -1345,10 +1379,9 @@ async fn event_stream(
                         };
                         return Some((
                             Ok(bytes::Bytes::from(control_line(encoding, &overflow))),
-                            // The receiver is dropped by returning `None` on
-                            // the next poll: `prelude` is exhausted and the
-                            // closed channel ends the stream.
-                            (receiver, prelude, u64::MAX, Vec::new(), encoding),
+                            // `None` receiver: the next poll ends the stream,
+                            // which is what "then end" means.
+                            (None, prelude, high_water, topics, encoding),
                         ));
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
