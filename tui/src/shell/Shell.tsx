@@ -167,13 +167,15 @@ export function Shell(props: ShellProps) {
     // nothing is logged — the exact §1.3-property-3 failure the rest of this
     // design works to prevent, reached through the one place effects leave the
     // pure core.
-    let effect: ReturnType<typeof takeEffect>[0] = null;
-    setState((s) => {
-      const next = applyIntent(s, intent, dimensions().width, clock());
-      const [drained, cleared] = takeEffect(next);
-      effect = drained;
-      return cleared;
-    });
+    // Reduced outside the setter rather than inside an updater function: an
+    // updater that assigns to an enclosing variable is a side effect in what
+    // is supposed to be a pure state transition, and it only works at all
+    // because Solid happens to call it synchronously. `snapshot` is the state
+    // read at the top of this handler, and a key handler is synchronous, so
+    // there is nothing to race with.
+    const next = applyIntent(snapshot, intent, dimensions().width, clock());
+    const [effect, cleared] = takeEffect(next);
+    setState(cleared);
     if (effect) void perform(effect);
   });
 
@@ -186,16 +188,50 @@ export function Shell(props: ShellProps) {
    * from anyone else does. Optimistically inserting it here would be a second
    * state machine to keep in agreement with that one, and [D-7]'s
    * provisional-id correlation is the daemon's job.
+   *
+   * **A rejected send must not be swallowed.** Dropping the rejection would
+   * reproduce, one layer down, the exact bug this drain exists to fix: the
+   * composer clears, nothing appears, and nothing says why. Restoring the text
+   * is the honest minimum — the operator keeps what they wrote and can see it
+   * did not go. Wave 1 has no error surface in `AppState` to render a reason
+   * into; when one lands, this is the one place that has the reason.
    */
   async function perform(
     effect: NonNullable<ReturnType<typeof takeEffect>[0]>,
   ) {
     switch (effect.kind) {
       case "send":
-        await props.client.send(effect.channelId, effect.content, {
-          ...(effect.replyTo ? { replyTo: effect.replyTo } : {}),
-          mentions: effect.mentions,
-        });
+        try {
+          await props.client.send(effect.channelId, effect.content, {
+            ...(effect.replyTo ? { replyTo: effect.replyTo } : {}),
+            mentions: effect.mentions,
+          });
+        } catch {
+          // Only restore into an untouched composer: the send is async, and
+          // clobbering a message the operator has since started writing would
+          // be a worse betrayal than the one being repaired.
+          setState((s) =>
+            s.composer.length === 0
+              ? {
+                  ...s,
+                  composer: effect.content,
+                  cursor: effect.content.length,
+                  mentions: effect.mentions,
+                }
+              : s,
+          );
+          // Swallowed **deliberately**, and this is the one place it is right
+          // to. `perform` is called fire-and-forget from a key handler, so a
+          // rethrow is an unhandled rejection — which under Bun's default can
+          // take the process down, turning a failed message into a lost
+          // session. Nor can the reason go to stderr: this process owns the
+          // terminal, and writing to it corrupts the frame.
+          //
+          // The restored text is therefore the whole signal, and it is a real
+          // one: the operator sees their message did not go and still has it.
+          // A *reason* needs an error surface in `AppState`, which Wave 1 does
+          // not have; when it lands, this catch is where it gets filled in.
+        }
         return;
       case "markRead":
         await props.client.markRead(effect.channelId);
