@@ -135,7 +135,7 @@ export function renderThread(
       time,
       Math.max(1, cols - 2 - indent.length - guide.length),
     );
-    // The author line is `name … time`, laid out by `truncateKeepingSuffix`,
+    // The author line is `name ·5 … time`, laid out by `truncateKeepingSuffix`,
     // so the stamp is the tail and the name is everything before it. Cutting
     // the finished string keeps the layout function the only place that
     // arithmetic lives (see `render/span.ts`).
@@ -143,13 +143,34 @@ export function renderThread(
     const [namePart, timePart] = head.endsWith(time)
       ? splitAt([plain(head)], displayWidth(head) - displayWidth(time))
       : [[plain(head)], []];
+    // `·5` is not part of the name — it is the depth the indent could not draw,
+    // §3.2's answer to a reply five levels down in a tree capped at three. Left
+    // inside the author span it reads as a suffix *on the person*, which at a
+    // glance is `matt ·5` the handle. It is positional metadata about the row,
+    // so it takes the same colour as the timestamp beside it.
+    //
+    // The marker sits at the end of the *label*, not the end of the span:
+    // `truncateKeepingSuffix` right-aligns the stamp, so `namePart` is
+    // `matt ·5` plus the gap it inserted. Measuring against the trimmed text is
+    // what finds the real boundary, and the gap rides along with the marker —
+    // it is padding, so its colour is unobservable either way.
+    const nameText = rowText(namePart);
+    const labelText = nameText.trimEnd();
+    const carriesOverflow = overflow.length > 0 && labelText.endsWith(overflow);
+    const [name, depthMark] = carriesOverflow
+      ? splitAt(
+          [plain(nameText)],
+          displayWidth(labelText) - displayWidth(overflow),
+        )
+      : [[plain(nameText)], []];
     rows.push(
       padRow(
         [
           styled(marker, selected ? FOCUS : {}),
           plain(` ${indent}`),
           styled(guide, CHROME),
-          styled(rowText(namePart), nameStyle),
+          styled(rowText(name), nameStyle),
+          ...(depthMark.length > 0 ? [styled(rowText(depthMark), META)] : []),
           ...(timePart.length > 0 ? [styled(rowText(timePart), META)] : []),
         ],
         cols,

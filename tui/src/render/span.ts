@@ -146,12 +146,22 @@ export function fillRow(
   cols: number,
   style: SpanStyle,
 ): StyledRow {
-  const padded = padRow(row, cols);
-  return padded.map((span) =>
-    span.text.trim().length === 0 && span.fg === undefined
-      ? { ...style, text: span.text }
-      : span,
-  );
+  // The style goes **under** every span, not only under the padding, and this
+  // is the whole function. An earlier version restyled only spans that were
+  // blank *and* carried no foreground — which reads plausibly and is wrong in
+  // the common case: `alignRight` and `truncateKeepingSuffix` already pad their
+  // rows to `cols`, so a list row usually has no trailing fill span at all and
+  // the highlight covered **zero columns**. Measured on real fixtures at 40 and
+  // 120 columns, home and channels both came back `bgCols=0`.
+  //
+  // It passed `span.test.ts` because both cases there use short content that
+  // leaves a genuine pad — the exact shape of test that proves a helper works
+  // on the input it was written against and nothing else.
+  //
+  // Spreading `style` first and the span second is what keeps recession from
+  // becoming erasure: a span that named its own `fg` (a status suffix, a
+  // mention count) keeps it and merely gains the background.
+  return padRow(row, cols).map((span) => ({ ...style, ...span }));
 }
 
 /**

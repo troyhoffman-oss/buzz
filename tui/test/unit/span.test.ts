@@ -91,6 +91,12 @@ describe("padRow does not bleed style into the padding", () => {
 });
 
 describe("fillRow is the opt-in full-width band", () => {
+  /** Columns actually covered by the fill's background. */
+  const covered = (row: StyledRow): number =>
+    row
+      .filter((span) => span.bg !== undefined)
+      .reduce((sum, span) => sum + displayWidth(span.text), 0);
+
   test("the padding carries the requested style", () => {
     // A selected row whose highlight stops at the end of its text reads as a
     // highlighted *word*, not a selected *row*. This is the one case that
@@ -100,13 +106,37 @@ describe("fillRow is the opt-in full-width band", () => {
     expect(row.at(-1)?.bg).toBe("backgroundElement");
   });
 
+  test("the fill covers EVERY column, not only the trailing pad", () => {
+    // **The case the two above cannot see.** Both use short content, so they
+    // are satisfied by a fill that only styles the padding — and the first
+    // implementation did exactly that, restyling spans that were blank *and*
+    // had no foreground.
+    //
+    // Real list rows are not short. `alignRight` and `truncateKeepingSuffix`
+    // pad to `cols` themselves, so a selected home or channel row arrives here
+    // with **no trailing blank span at all** and the highlight covered zero
+    // columns — the owner's "selection is hard to see", reintroduced by the
+    // very helper written to fix it. Measuring coverage rather than probing
+    // one span is what makes this assertion honest.
+    const already = [plain("  "), styled("#engineering        8 · @2", {})];
+    for (const cols of [28, 40, 120]) {
+      const row = fillRow(already, cols, { bg: "backgroundElement" });
+      expect(displayWidth(rowText(row))).toBe(cols);
+      expect(covered(row)).toBe(cols);
+    }
+  });
+
   test("spans that named their own colour keep it", () => {
     const row = fillRow(
       [plain("  "), styled("8 unread", { fg: "primary" })],
       20,
       { bg: "backgroundElement" },
     );
-    expect(row.find((s) => s.text === "8 unread")?.fg).toBe("primary");
+    // Recession must not be erasure: the count keeps its meaning and merely
+    // gains the selected row's background.
+    const count = row.find((s) => s.text === "8 unread");
+    expect(count?.fg).toBe("primary");
+    expect(count?.bg).toBe("backgroundElement");
   });
 });
 
